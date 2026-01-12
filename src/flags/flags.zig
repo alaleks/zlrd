@@ -68,7 +68,7 @@ inline fn levelBit(l: Level) LevelMask {
 /// Public API (used by main)
 /// =======================
 pub fn parseArgs(allocator: std.mem.Allocator) ParseError!Args {
-    var it = std.process.ArgIterator.init();
+    var it = try std.process.ArgIterator.initWithAllocator(allocator);
     defer it.deinit();
 
     return parseArgsFromIter(allocator, &it);
