@@ -38,7 +38,7 @@ jobs:
       - name: Build
         run: |
           zig build \
-            -Drelease-fast \
+            -Doptimize=ReleaseFast \
             -Dtarget=${{ matrix.target }}
 
       - name: Prepare artifact
