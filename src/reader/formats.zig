@@ -137,8 +137,8 @@ pub fn handleLine(line: []const u8, args: flags.Args) void {
     }
 
     // фильтр по search
-    if (args.search) |needle| {
-        if (!containsIgnoreCase(line, needle))
+    if (args.search) |expr| {
+        if (!matchSearch(line, expr))
             return;
     }
 
@@ -155,6 +155,33 @@ pub fn handleLine(line: []const u8, args: flags.Args) void {
     } else {
         std.debug.print("{s}\n", .{line});
     }
+}
+
+fn matchSearch(line: []const u8, expr: []const u8) bool {
+    // OR: a|b|c
+    if (std.mem.indexOfScalar(u8, expr, '|') != null) {
+        var it = std.mem.splitScalar(u8, expr, '|');
+        while (it.next()) |part| {
+            if (part.len == 0) continue;
+            if (containsIgnoreCase(line, part))
+                return true;
+        }
+        return false;
+    }
+
+    // AND: a&b&c
+    if (std.mem.indexOfScalar(u8, expr, '&') != null) {
+        var it = std.mem.splitScalar(u8, expr, '&');
+        while (it.next()) |part| {
+            if (part.len == 0) continue;
+            if (!containsIgnoreCase(line, part))
+                return false;
+        }
+        return true;
+    }
+
+    // simple search
+    return containsIgnoreCase(line, expr);
 }
 
 fn matchLevel(line: []const u8, mask: flags.LevelMask) bool {

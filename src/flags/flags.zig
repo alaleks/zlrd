@@ -15,6 +15,11 @@ pub const Level = enum(u8) {
 
 pub const LevelMask = u8;
 
+inline fn levelBit(l: Level) LevelMask {
+    const shift: u3 = @intCast(@intFromEnum(l));
+    return @as(LevelMask, 1) << shift;
+}
+
 /// =======================
 /// Args
 /// =======================
@@ -42,6 +47,16 @@ pub const ParseError = error{
     UnknownArgument,
 };
 
+/// =======================
+/// Public API (used by main)
+/// =======================
+pub fn parseArgs(allocator: std.mem.Allocator) ParseError!Args {
+    var it = try std.process.ArgIterator.initWithAllocator(allocator);
+    defer it.deinit();
+
+    return parseArgsFromIter(allocator, &it);
+}
+
 pub fn printHelp() void {
     std.debug.print(
         \\Usage:
@@ -57,21 +72,6 @@ pub fn printHelp() void {
         \\  -h, --help               Show help
         \\
     , .{});
-}
-
-inline fn levelBit(l: Level) LevelMask {
-    const shift: u3 = @intCast(@intFromEnum(l));
-    return @as(LevelMask, 1) << shift;
-}
-
-/// =======================
-/// Public API (used by main)
-/// =======================
-pub fn parseArgs(allocator: std.mem.Allocator) ParseError!Args {
-    var it = try std.process.ArgIterator.initWithAllocator(allocator);
-    defer it.deinit();
-
-    return parseArgsFromIter(allocator, &it);
 }
 
 /// =======================
