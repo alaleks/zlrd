@@ -9,8 +9,23 @@ permissions:
   contents: write
 
 jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create.outputs.upload_url }}
+
+    steps:
+      - name: Create GitHub Release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+
   build:
     name: Build ${{ matrix.target }}
+    needs: release
     runs-on: ubuntu-latest
 
     strategy:
@@ -18,20 +33,18 @@ jobs:
       matrix:
         include:
           - target: x86_64-linux
-            os: linux
+            ext: ""
           - target: x86_64-windows
-            os: windows
+            ext: ".exe"
           - target: x86_64-macos
-            os: macos
+            ext: ""
           - target: aarch64-macos
-            os: macos
+            ext: ""
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+      - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.2
 
@@ -44,13 +57,10 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            cp zig-out/bin/zlrd.exe dist/zlrd-${{ matrix.target }}.exe
-          else
-            cp zig-out/bin/zlrd dist/zlrd-${{ matrix.target }}
-          fi
+          cp zig-out/bin/zlrd${{ matrix.ext }} \
+             dist/zlrd-${{ matrix.target }}${{ matrix.ext }}
 
-      - name: Upload to GitHub Release
+      - name: Upload artifact to release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
