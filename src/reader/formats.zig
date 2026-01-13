@@ -347,18 +347,27 @@ fn extractJsonLevel(line: []const u8) ?flags.Level {
 
 /// Extract log level from logfmt "level" field.
 fn extractLogfmtLevel(line: []const u8) ?flags.Level {
-    const key = "level=";
-    const pos = std.mem.indexOf(u8, line, key) orelse return null;
+    const keys = [_][]const u8{
+        "level=",
+        "lvl=",
+        "severity=",
+    };
 
-    var i = pos + key.len;
-    if (i >= line.len) return null;
+    inline for (keys) |key| {
+        if (std.mem.indexOf(u8, line, key)) |pos| {
+            var i = pos + key.len;
+            if (i >= line.len) return null;
 
-    const start = i;
+            const start = i;
 
-    // level value ends at space or end of line
-    while (i < line.len and line[i] != ' ' and line[i] != '\t') : (i += 1) {}
+            // value ends at space or end of line
+            while (i < line.len and line[i] != ' ') : (i += 1) {}
 
-    return parseLevelInsensitive(line[start..i]);
+            return parseLevelInsensitive(line[start..i]);
+        }
+    }
+
+    return null;
 }
 
 /// Print JSON log line with syntax highlighting.
