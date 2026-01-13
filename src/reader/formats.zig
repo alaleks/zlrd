@@ -149,66 +149,69 @@ pub fn readStreaming(
     // Variables for paging functionality
     var total_lines: usize = 0;
     var shown_lines: usize = 0;
-    const num_lines = if (args.num_lines > 0) args.num_lines else std.math.maxInt(usize);
+    const use_pagination = args.num_lines > 0;
+    const num_lines = if (use_pagination) args.num_lines else std.math.maxInt(usize);
     var current_batch_count: usize = 0;
     var first_batch = true;
 
     // First pass: count total lines (for accurate pagination info)
-    // We need to know total number of filtered lines
-    var count_file = try std.fs.cwd().openFile(path, .{});
-    defer count_file.close();
+    // Only needed when pagination is enabled
+    if (use_pagination) {
+        var count_file = try std.fs.cwd().openFile(path, .{});
+        defer count_file.close();
 
-    var count_buf: [65536]u8 = undefined;
-    var count_carry = std.ArrayList(u8){};
-    defer count_carry.deinit(arena);
-    try count_carry.ensureTotalCapacity(arena, 256);
+        var count_buf: [65536]u8 = undefined;
+        var count_carry = std.ArrayList(u8){};
+        defer count_carry.deinit(arena);
+        try count_carry.ensureTotalCapacity(arena, 256);
 
-    // Count total filtered lines
-    while (true) {
-        const bytes_read = try count_file.read(&count_buf);
-        if (bytes_read == 0) break;
+        // Count total filtered lines
+        while (true) {
+            const bytes_read = try count_file.read(&count_buf);
+            if (bytes_read == 0) break;
 
-        var slice = count_buf[0..bytes_read];
+            var slice = count_buf[0..bytes_read];
 
-        if (count_carry.items.len > 0) {
-            try count_carry.appendSlice(arena, slice);
-            slice = count_carry.items;
-        }
-
-        var line_start: usize = 0;
-        var line_end: usize = 0;
-
-        while (line_end < slice.len) {
-            if (slice[line_end] == '\n') {
-                const line = slice[line_start..line_end];
-                if (line.len > 0) {
-                    // Check if this line would pass filters
-                    if (checkLinePassesFilters(line, args, has_date_filter, date_range)) {
-                        total_lines += 1;
-                    }
-                }
-                line_start = line_end + 1;
+            if (count_carry.items.len > 0) {
+                try count_carry.appendSlice(arena, slice);
+                slice = count_carry.items;
             }
-            line_end += 1;
+
+            var line_start: usize = 0;
+            var line_end: usize = 0;
+
+            while (line_end < slice.len) {
+                if (slice[line_end] == '\n') {
+                    const line = slice[line_start..line_end];
+                    if (line.len > 0) {
+                        // Check if this line would pass filters
+                        if (checkLinePassesFilters(line, args, has_date_filter, date_range)) {
+                            total_lines += 1;
+                        }
+                    }
+                    line_start = line_end + 1;
+                }
+                line_end += 1;
+            }
+
+            if (line_start < slice.len) {
+                const partial_line = slice[line_start..];
+                count_carry.clearRetainingCapacity();
+                try count_carry.appendSlice(arena, partial_line);
+            } else {
+                count_carry.clearRetainingCapacity();
+            }
         }
 
-        if (line_start < slice.len) {
-            const partial_line = slice[line_start..];
-            count_carry.clearRetainingCapacity();
-            try count_carry.appendSlice(arena, partial_line);
-        } else {
-            count_carry.clearRetainingCapacity();
-        }
+        // Reset file position for actual reading
+        try file.seekTo(0);
     }
-
-    // Reset file position for actual reading
-    try file.seekTo(0);
 
     // Reset carry buffer
     carry.clearRetainingCapacity();
     try carry.ensureTotalCapacity(arena, 256);
 
-    // Now read and display with pagination
+    // Now read and display with optional pagination
     while (true) {
         const bytes_read = try file.read(&buf);
         if (bytes_read == 0) break;
@@ -234,8 +237,8 @@ pub fn readStreaming(
                         shown_lines += 1;
                         current_batch_count += 1;
 
-                        // Check if we need to wait for user input
-                        if (args.num_lines > 0 and current_batch_count >= num_lines) {
+                        // Check if we need to wait for user input (only when pagination enabled)
+                        if (use_pagination and current_batch_count >= num_lines) {
                             const left = if (total_lines > shown_lines)
                                 total_lines - shown_lines
                             else
@@ -279,8 +282,8 @@ pub fn readStreaming(
         }
     }
 
-    // Show final pagination info if in paging mode
-    if (args.num_lines > 0 and shown_lines < total_lines) {
+    // Show final pagination info if in paging mode and there are lines left
+    if (use_pagination and shown_lines < total_lines) {
         showPaginationInfo(shown_lines, total_lines, true);
     }
 }
