@@ -51,7 +51,7 @@ pub const Args = struct {
     help: bool = false,
 
     /// Number of lines to display (`-n`).
-    num_lines: usize = 10,
+    num_lines: usize = 0,
 
     /// Free allocated memory.
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {

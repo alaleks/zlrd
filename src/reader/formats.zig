@@ -264,7 +264,7 @@ fn readWithPagination(
 
                         // Check if we need to wait for user input
                         if (current_batch_count >= num_lines) {
-                            std.debug.print("\n{s}--- Batch {d}, shown: {d} lines --- Press Enter to continue...{s}\n", .{ Color.dim, batch_number, current_batch_count, Color.reset });
+                            std.debug.print("\n{s}--- Batch {d}, shown: {d} lines \n--- Press Enter to continue...{s}\n", .{ Color.dim, batch_number, current_batch_count, Color.reset });
 
                             waitForEnter();
                             clearScreen();
@@ -367,19 +367,7 @@ fn checkLinePassesFilters(
     return true;
 }
 
-/// Show pagination information
-fn showPaginationInfo(shown: usize, total: usize, is_final: bool) void {
-    const remaining = if (total > shown) total - shown else 0;
-
-    if (is_final) {
-        std.debug.print("\n{s}=== Total records: {d} ==={s}\n", .{ Color.dim, total, Color.reset });
-    } else {
-        std.debug.print("\n{s}--- Shown: {d} of {d} (left: {d}) --- Press Enter to continue...{s}\n", .{ Color.dim, shown, total, remaining, Color.reset });
-    }
-}
-
 /// Wait for Enter key press
-/// Wait for Enter key press (оптимизированная версия)
 fn waitForEnter() void {
     const stdin = std.fs.File.stdin();
 
