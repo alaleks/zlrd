@@ -14,6 +14,13 @@ const Color = struct {
     pub const dim = "\x1b[38;5;67m";
 };
 
+/// LevelRange is a range of log levels.
+const LevelRange = struct {
+    start: usize,
+    end: usize,
+    level: flags.Level,
+};
+
 /// Represents a date range for filtering logs.
 /// Both bounds are optional to support open-ended ranges like "2024-01-01.." or "..2024-12-31".
 const DateRange = struct {
@@ -201,10 +208,30 @@ pub fn handleLine(line: []const u8, args: flags.Args) void {
     if (line[0] == '{') {
         // JSON logs get special styling
         printJsonStyled(line, lvl);
-    } else if (lvl) |l| {
+    } else if (lvl != null) {
         // Plain text with level gets colored
-        const color = levelColor(l);
-        std.debug.print("{s}{s}{s}\n", .{ color, line, Color.reset });
+        const range = extractLevelRange(line);
+
+        if (range) |r| {
+            const color = levelColor(r.level);
+
+            // before level
+            std.debug.print("{s}", .{line[0..r.start]});
+
+            // level itself (bold + color)
+            std.debug.print(
+                "{s}{s}{s}{s}",
+                .{
+                    Color.bold,
+                    color,
+                    line[r.start..r.end],
+                    Color.reset,
+                },
+            );
+
+            // after level
+            std.debug.print("{s}\n", .{line[r.end..]});
+        }
     } else {
         // Plain text without level
         std.debug.print("{s}\n", .{line});
@@ -364,6 +391,47 @@ fn extractLogfmtLevel(line: []const u8) ?flags.Level {
             while (i < line.len and line[i] != ' ') : (i += 1) {}
 
             return parseLevelInsensitive(line[start..i]);
+        }
+    }
+
+    return null;
+}
+
+/// Extract log level range from logfmt "level" field.
+fn extractLevelRange(line: []const u8) ?LevelRange {
+    if (line.len == 0) return null;
+
+    // JSON handled elsewhere
+    if (line[0] == '{') return null;
+
+    // [WARN]
+    if (line[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, line, ']') orelse return null;
+        const lvl = parseLevelInsensitive(line[1..end]) orelse return null;
+        return .{
+            .start = 1,
+            .end = end,
+            .level = lvl,
+        };
+    }
+
+    // logfmt: level=warn | lvl=warn | severity=warn
+    const keys = [_][]const u8{ "level=", "lvl=", "severity=" };
+
+    inline for (keys) |key| {
+        if (std.mem.indexOf(u8, line, key)) |pos| {
+            var i = pos + key.len;
+            const start = i;
+
+            while (i < line.len and line[i] != ' ') : (i += 1) {}
+
+            const lvl = parseLevelInsensitive(line[start..i]) orelse return null;
+
+            return .{
+                .start = start,
+                .end = i,
+                .level = lvl,
+            };
         }
     }
 
