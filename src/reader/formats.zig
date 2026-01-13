@@ -179,6 +179,7 @@ fn readWithoutPagination(
         while (line_end < slice.len) {
             if (slice[line_end] == '\n') {
                 // Found complete line
+                // Found complete line
                 const line = slice[line_start..line_end];
                 if (line.len > 0) {
                     _ = handleLineWithPrecomputed(line, args, has_date_filter, date_range);
@@ -231,66 +232,11 @@ fn readWithPagination(
     const date_range = if (has_date_filter) parseDateRange(args.date.?) else undefined;
 
     // Variables for paging functionality
-    var total_lines: usize = 0;
     var shown_lines: usize = 0;
     const num_lines = args.num_lines;
     var current_batch_count: usize = 0;
+    var batch_number: usize = 1;
 
-    // First pass: count total lines (for accurate pagination info)
-    var count_file = try std.fs.cwd().openFile(path, .{});
-    defer count_file.close();
-
-    var count_buf: [65536]u8 = undefined;
-    var count_carry = std.ArrayList(u8){};
-    defer count_carry.deinit(arena);
-    try count_carry.ensureTotalCapacity(arena, 256);
-
-    // Count total filtered lines
-    while (true) {
-        const bytes_read = try count_file.read(&count_buf);
-        if (bytes_read == 0) break;
-
-        var slice = count_buf[0..bytes_read];
-
-        if (count_carry.items.len > 0) {
-            try count_carry.appendSlice(arena, slice);
-            slice = count_carry.items;
-        }
-
-        var line_start: usize = 0;
-        var line_end: usize = 0;
-
-        while (line_end < slice.len) {
-            if (slice[line_end] == '\n') {
-                const line = slice[line_start..line_end];
-                if (line.len > 0) {
-                    // Check if this line would pass filters
-                    if (checkLinePassesFilters(line, args, has_date_filter, date_range)) {
-                        total_lines += 1;
-                    }
-                }
-                line_start = line_end + 1;
-            }
-            line_end += 1;
-        }
-
-        if (line_start < slice.len) {
-            const partial_line = slice[line_start..];
-            count_carry.clearRetainingCapacity();
-            try count_carry.appendSlice(arena, partial_line);
-        } else {
-            count_carry.clearRetainingCapacity();
-        }
-    }
-
-    // Reset file position for actual reading
-    try file.seekTo(0);
-
-    // Reset carry buffer
-    carry.clearRetainingCapacity();
-    try carry.ensureTotalCapacity(arena, 256);
-
-    // Now read and display with pagination
     while (true) {
         const bytes_read = try file.read(&buf);
         if (bytes_read == 0) break;
@@ -312,27 +258,19 @@ fn readWithPagination(
                 // Found complete line
                 const line = slice[line_start..line_end];
                 if (line.len > 0) {
-                    if (handleLineWithPrecomputedBool(line, args, has_date_filter, date_range)) {
+                    if (handleLineWithPrecomputed(line, args, has_date_filter, date_range)) {
                         shown_lines += 1;
                         current_batch_count += 1;
 
                         // Check if we need to wait for user input
                         if (current_batch_count >= num_lines) {
-                            const left = if (total_lines > shown_lines)
-                                total_lines - shown_lines
-                            else
-                                0;
+                            std.debug.print("\n{s}--- Batch {d}, shown: {d} lines --- Press Enter to continue...{s}\n", .{ Color.dim, batch_number, current_batch_count, Color.reset });
 
-                            if (left == 0) {
-                                showPaginationInfo(shown_lines, total_lines, true);
-                                return;
-                            }
-
-                            showPaginationInfo(shown_lines, total_lines, false);
                             waitForEnter();
                             clearScreen();
 
                             current_batch_count = 0;
+                            batch_number += 1;
                         }
                     }
                 }
@@ -354,15 +292,15 @@ fn readWithPagination(
 
     // Process any final partial line
     if (carry.items.len > 0) {
-        if (handleLineWithPrecomputedBool(carry.items, args, has_date_filter, date_range)) {
+        if (handleLineWithPrecomputed(carry.items, args, has_date_filter, date_range)) {
             shown_lines += 1;
             current_batch_count += 1;
         }
     }
 
-    // Show final pagination info if there are lines left
-    if (shown_lines < total_lines) {
-        showPaginationInfo(shown_lines, total_lines, true);
+    // Show final summary
+    if (shown_lines > 0) {
+        std.debug.print("\n{s}=== Total records shown: {d} ==={s}\n", .{ Color.dim, shown_lines, Color.reset });
     }
 }
 
@@ -441,30 +379,33 @@ fn showPaginationInfo(shown: usize, total: usize, is_final: bool) void {
 }
 
 /// Wait for Enter key press
+/// Wait for Enter key press (оптимизированная версия)
 fn waitForEnter() void {
     const stdin = std.fs.File.stdin();
-    var buffer: [1]u8 = undefined;
 
-    const bytes_read = stdin.read(&buffer) catch {
-        std.debug.print("\n", .{});
-        return;
-    };
+    // Используем небольшой буфер для чтения
+    var buffer: [128]u8 = undefined;
 
-    if (bytes_read == 0) {
-        std.debug.print("\n", .{});
-        return;
-    }
+    // Читаем до символа новой строки или конца ввода
+    while (true) {
+        const bytes_read = stdin.read(&buffer) catch {
+            std.debug.print("\n", .{});
+            return;
+        };
 
-    if (buffer[0] != '\n' and buffer[0] != '\r') {
-        while (true) {
-            const next_bytes = stdin.read(&buffer) catch break;
-            if (next_bytes == 0 or buffer[0] == '\n' or buffer[0] == '\r') {
-                break;
+        if (bytes_read == 0) {
+            std.debug.print("\n", .{});
+            return;
+        }
+
+        // Проверяем, есть ли в прочитанных данных символ новой строки
+        for (buffer[0..bytes_read]) |c| {
+            if (c == '\n' or c == '\r') {
+                std.debug.print("\n", .{});
+                return;
             }
         }
     }
-
-    std.debug.print("\n", .{});
 }
 
 /// Optimized version of handleLine with pre-computed filter state.
