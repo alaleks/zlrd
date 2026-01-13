@@ -10,7 +10,7 @@ const Color = struct {
     pub const green = "\x1b[32m";
     pub const blue = "\x1b[34m";
     pub const gray = "\x1b[90m";
-    pub const cyan = "\x1b[36m";
+    pub const dim = "\x1b[38;5;67m";
 };
 
 const DateRange = struct {
@@ -129,10 +129,9 @@ pub fn handleLine(line: []const u8, args: flags.Args) void {
     }
 
     // фильтр по уровню
-    if (args.levels != 0) {
+    if (args.levels != null) {
         const l = lvl orelse return;
-        const shift: u3 = @intCast(@intFromEnum(l));
-        if ((args.levels & (@as(flags.LevelMask, 1) << shift)) == 0)
+        if (!args.isLevelEnabled(l))
             return;
     }
 
@@ -340,8 +339,8 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
                     if (string_start == r.start and i == r.end) {
                         const color = levelColor(lvl.?);
                         std.debug.print(
-                            "{s}\"{s}\"{s}",
-                            .{ color, str, Color.reset },
+                            "{s}{s}\"{s}\"{s}",
+                            .{ Color.bold, color, str, Color.reset },
                         );
                         continue;
                     }
@@ -349,8 +348,8 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
 
                 if (is_key) {
                     std.debug.print(
-                        "{s}{s}\"{s}\"{s}",
-                        .{ Color.bold, Color.cyan, str, Color.reset },
+                        "{s}\"{s}\"{s}",
+                        .{ Color.dim, str, Color.reset },
                     );
                 } else {
                     std.debug.print("\"{s}\"", .{str});
