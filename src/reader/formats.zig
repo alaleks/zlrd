@@ -328,10 +328,10 @@ fn showPaginationInfo(shown: usize, total: usize, is_final: bool) void {
 
 /// Wait for Enter key press
 fn waitForEnter() void {
-    var stdin_file = std.fs.File{ .handle = 0 };
+    const stdin = std.fs.File.stdin();
     var buffer: [1]u8 = undefined;
 
-    const bytes_read = stdin_file.read(&buffer) catch {
+    const bytes_read = stdin.read(&buffer) catch {
         std.debug.print("\n", .{});
         return;
     };
@@ -343,7 +343,7 @@ fn waitForEnter() void {
 
     if (buffer[0] != '\n' and buffer[0] != '\r') {
         while (true) {
-            const next_bytes = stdin_file.read(&buffer) catch break;
+            const next_bytes = stdin.read(&buffer) catch break;
             if (next_bytes == 0 or buffer[0] == '\n' or buffer[0] == '\r') {
                 break;
             }
