@@ -126,6 +126,90 @@ pub fn readStreaming(
     path: []const u8,
     args: flags.Args,
 ) !void {
+    const use_pagination = args.num_lines > 0;
+
+    if (use_pagination) {
+        try readWithPagination(allocator, path, args);
+    } else {
+        try readWithoutPagination(allocator, path, args);
+    }
+}
+
+fn readWithoutPagination(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    args: flags.Args,
+) !void {
+    var file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    // 64KB buffer for better I/O performance with large files
+    var buf: [65536]u8 = undefined;
+
+    // Create arena allocator for temporary allocations
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Carry buffer for incomplete lines (256 bytes initial, grows as needed)
+    var carry = std.ArrayList(u8){};
+    defer carry.deinit(arena);
+    try carry.ensureTotalCapacity(arena, 256);
+
+    // Pre-compute filters to avoid repeated checks
+    const has_date_filter = !args.tail_mode and args.date != null;
+    const date_range = if (has_date_filter) parseDateRange(args.date.?) else undefined;
+
+    while (true) {
+        const bytes_read = try file.read(&buf);
+        if (bytes_read == 0) break;
+
+        var slice = buf[0..bytes_read];
+
+        // Prepend any carried-over partial line
+        if (carry.items.len > 0) {
+            try carry.appendSlice(arena, slice);
+            slice = carry.items;
+        }
+
+        // Process complete lines in this chunk
+        var line_start: usize = 0;
+        var line_end: usize = 0;
+
+        while (line_end < slice.len) {
+            if (slice[line_end] == '\n') {
+                // Found complete line
+                const line = slice[line_start..line_end];
+                if (line.len > 0) {
+                    _ = handleLineWithPrecomputed(line, args, has_date_filter, date_range);
+                }
+                line_start = line_end + 1;
+            }
+            line_end += 1;
+        }
+
+        // Handle remaining partial line
+        if (line_start < slice.len) {
+            const partial_line = slice[line_start..];
+            carry.clearRetainingCapacity();
+            try carry.appendSlice(arena, partial_line);
+        } else {
+            // All data was processed, clear carry
+            carry.clearRetainingCapacity();
+        }
+    }
+
+    // Process any final partial line
+    if (carry.items.len > 0) {
+        _ = handleLineWithPrecomputed(carry.items, args, has_date_filter, date_range);
+    }
+}
+
+fn readWithPagination(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    args: flags.Args,
+) !void {
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
@@ -149,69 +233,64 @@ pub fn readStreaming(
     // Variables for paging functionality
     var total_lines: usize = 0;
     var shown_lines: usize = 0;
-    const use_pagination = args.num_lines > 0;
-    const num_lines = if (use_pagination) args.num_lines else std.math.maxInt(usize);
+    const num_lines = args.num_lines;
     var current_batch_count: usize = 0;
-    var first_batch = true;
 
     // First pass: count total lines (for accurate pagination info)
-    // Only needed when pagination is enabled
-    if (use_pagination) {
-        var count_file = try std.fs.cwd().openFile(path, .{});
-        defer count_file.close();
+    var count_file = try std.fs.cwd().openFile(path, .{});
+    defer count_file.close();
 
-        var count_buf: [65536]u8 = undefined;
-        var count_carry = std.ArrayList(u8){};
-        defer count_carry.deinit(arena);
-        try count_carry.ensureTotalCapacity(arena, 256);
+    var count_buf: [65536]u8 = undefined;
+    var count_carry = std.ArrayList(u8){};
+    defer count_carry.deinit(arena);
+    try count_carry.ensureTotalCapacity(arena, 256);
 
-        // Count total filtered lines
-        while (true) {
-            const bytes_read = try count_file.read(&count_buf);
-            if (bytes_read == 0) break;
+    // Count total filtered lines
+    while (true) {
+        const bytes_read = try count_file.read(&count_buf);
+        if (bytes_read == 0) break;
 
-            var slice = count_buf[0..bytes_read];
+        var slice = count_buf[0..bytes_read];
 
-            if (count_carry.items.len > 0) {
-                try count_carry.appendSlice(arena, slice);
-                slice = count_carry.items;
-            }
-
-            var line_start: usize = 0;
-            var line_end: usize = 0;
-
-            while (line_end < slice.len) {
-                if (slice[line_end] == '\n') {
-                    const line = slice[line_start..line_end];
-                    if (line.len > 0) {
-                        // Check if this line would pass filters
-                        if (checkLinePassesFilters(line, args, has_date_filter, date_range)) {
-                            total_lines += 1;
-                        }
-                    }
-                    line_start = line_end + 1;
-                }
-                line_end += 1;
-            }
-
-            if (line_start < slice.len) {
-                const partial_line = slice[line_start..];
-                count_carry.clearRetainingCapacity();
-                try count_carry.appendSlice(arena, partial_line);
-            } else {
-                count_carry.clearRetainingCapacity();
-            }
+        if (count_carry.items.len > 0) {
+            try count_carry.appendSlice(arena, slice);
+            slice = count_carry.items;
         }
 
-        // Reset file position for actual reading
-        try file.seekTo(0);
+        var line_start: usize = 0;
+        var line_end: usize = 0;
+
+        while (line_end < slice.len) {
+            if (slice[line_end] == '\n') {
+                const line = slice[line_start..line_end];
+                if (line.len > 0) {
+                    // Check if this line would pass filters
+                    if (checkLinePassesFilters(line, args, has_date_filter, date_range)) {
+                        total_lines += 1;
+                    }
+                }
+                line_start = line_end + 1;
+            }
+            line_end += 1;
+        }
+
+        if (line_start < slice.len) {
+            const partial_line = slice[line_start..];
+            count_carry.clearRetainingCapacity();
+            try count_carry.appendSlice(arena, partial_line);
+        } else {
+            count_carry.clearRetainingCapacity();
+        }
     }
+
+    // Reset file position for actual reading
+    try file.seekTo(0);
 
     // Reset carry buffer
     carry.clearRetainingCapacity();
     try carry.ensureTotalCapacity(arena, 256);
 
-    // Now read and display with optional pagination
+    // Now read and display with pagination
     while (true) {
         const bytes_read = try file.read(&buf);
         if (bytes_read == 0) break;
@@ -233,12 +312,12 @@ pub fn readStreaming(
                 // Found complete line
                 const line = slice[line_start..line_end];
                 if (line.len > 0) {
-                    if (handleLineWithPrecomputed(line, args, has_date_filter, date_range)) {
+                    if (handleLineWithPrecomputedBool(line, args, has_date_filter, date_range)) {
                         shown_lines += 1;
                         current_batch_count += 1;
 
-                        // Check if we need to wait for user input (only when pagination enabled)
-                        if (use_pagination and current_batch_count >= num_lines) {
+                        // Check if we need to wait for user input
+                        if (current_batch_count >= num_lines) {
                             const left = if (total_lines > shown_lines)
                                 total_lines - shown_lines
                             else
@@ -254,7 +333,6 @@ pub fn readStreaming(
                             clearScreen();
 
                             current_batch_count = 0;
-                            first_batch = false;
                         }
                     }
                 }
@@ -276,16 +354,49 @@ pub fn readStreaming(
 
     // Process any final partial line
     if (carry.items.len > 0) {
-        if (handleLineWithPrecomputed(carry.items, args, has_date_filter, date_range)) {
+        if (handleLineWithPrecomputedBool(carry.items, args, has_date_filter, date_range)) {
             shown_lines += 1;
             current_batch_count += 1;
         }
     }
 
-    // Show final pagination info if in paging mode and there are lines left
-    if (use_pagination and shown_lines < total_lines) {
+    // Show final pagination info if there are lines left
+    if (shown_lines < total_lines) {
         showPaginationInfo(shown_lines, total_lines, true);
     }
+}
+
+/// Optimized version of handleLine with pre-computed filter state.
+/// Returns true if line was printed, false if filtered out.
+fn handleLineWithPrecomputedBool(
+    line: []const u8,
+    args: flags.Args,
+    has_date_filter: bool,
+    date_range: DateRange,
+) bool {
+    if (line.len == 0) return false;
+
+    const lvl = extractLevel(line);
+
+    // Apply date filter if present
+    if (has_date_filter) {
+        if (!matchDateRange(line, date_range)) return false;
+    }
+
+    // Apply level filter
+    if (args.levels != null) {
+        const l = lvl orelse return false;
+        if (!args.isLevelEnabled(l)) return false;
+    }
+
+    // Apply search filter
+    if (args.search) |expr| {
+        if (!matchSearch(line, expr)) return false;
+    }
+
+    // Output with appropriate formatting
+    printStyledLine(line, lvl);
+    return true;
 }
 
 /// Check if line passes filters without printing
