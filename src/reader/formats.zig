@@ -14,26 +14,21 @@ const Color = struct {
     pub const dim = "\x1b[38;5;67m";
 };
 
-/// LevelRange is a range of log levels.
+/// Range of log levels within a line for coloring.
 const LevelRange = struct {
     start: usize,
     end: usize,
     level: flags.Level,
 };
 
-/// Represents a date range for filtering logs.
-/// Both bounds are optional to support open-ended ranges like "2024-01-01.." or "..2024-12-31".
+/// Date range for filtering logs with optional boundaries.
 const DateRange = struct {
     from: ?[]const u8,
     to: ?[]const u8,
 };
 
-/// Parse a date range string in the format "YYYY-MM-DD..YYYY-MM-DD".
-/// Supports:
-/// - Single date: "2024-01-15" (same as "2024-01-15..2024-01-15")
-/// - Open start: "..2024-12-31"
-/// - Open end: "2024-01-01.."
-/// - Full range: "2024-01-01..2024-12-31"
+/// Parse date range from string with ".." separator.
+/// Supports single dates, open ranges, and full ranges.
 fn parseDateRange(s: []const u8) DateRange {
     if (std.mem.indexOf(u8, s, "..")) |pos| {
         const left = s[0..pos];
@@ -45,15 +40,14 @@ fn parseDateRange(s: []const u8) DateRange {
         };
     }
 
-    // Single date means both from and to are the same.
+    // Single date: treat as both from and to
     return .{
         .from = s,
         .to = s,
     };
 }
 
-/// Check if a log line's date falls within the specified range.
-/// Uses lexicographic comparison which works for ISO 8601 dates (YYYY-MM-DD).
+/// Check if log line date falls within specified range using lexicographic comparison.
 fn matchDateRange(line: []const u8, range: DateRange) bool {
     const date = extractDate(line) orelse return false;
 
@@ -70,8 +64,7 @@ fn matchDateRange(line: []const u8, range: DateRange) bool {
     return true;
 }
 
-/// Extract date from a log line.
-/// Supports both JSON logs (with "time" field) and plain text logs (YYYY-MM-DD prefix).
+/// Extract date from log line, supporting JSON and plain text formats.
 fn extractDate(line: []const u8) ?[]const u8 {
     if (line.len == 0) return null;
 
@@ -80,16 +73,18 @@ fn extractDate(line: []const u8) ?[]const u8 {
         return extractJsonDate(line);
     }
 
-    // Plain text format: 2024-01-15 10:30:45 [INFO] ...
-    if (line.len >= 10) {
-        return line[0..10];
+    // Plain text format: YYYY-MM-DD at start
+    if (line.len >= 10 and std.ascii.isDigit(line[0])) {
+        // Quick validation for date pattern
+        if (line[4] == '-' and line[7] == '-') {
+            return line[0..10];
+        }
     }
 
     return null;
 }
 
-/// Extract date from JSON "time" field.
-/// Expects ISO 8601 format: "2024-01-15T10:30:45Z"
+/// Extract date from JSON "time" field (ISO 8601 format).
 fn extractJsonDate(line: []const u8) ?[]const u8 {
     const key = "\"time\"";
     const pos = std.mem.indexOf(u8, line, key) orelse return null;
@@ -98,17 +93,21 @@ fn extractJsonDate(line: []const u8) ?[]const u8 {
 
     // Skip whitespace and colon
     while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-
     if (i >= line.len or line[i] != '"') return null;
-    i += 1;
+    i += 1; // Skip opening quote
 
-    // Extract YYYY-MM-DD (first 10 characters of ISO 8601 date)
+    // Extract YYYY-MM-DD (first 10 chars of ISO date)
     if (i + 10 > line.len) return null;
 
-    return line[i .. i + 10];
+    // Validate format quickly
+    if (line[i + 4] == '-' and line[i + 7] == '-') {
+        return line[i .. i + 10];
+    }
+
+    return null;
 }
 
-/// Get ANSI color code for a log level.
+/// Get ANSI color for log level.
 fn levelColor(lvl: flags.Level) []const u8 {
     return switch (lvl) {
         .Error, .Fatal, .Panic => Color.red,
@@ -119,8 +118,8 @@ fn levelColor(lvl: flags.Level) []const u8 {
     };
 }
 
-/// Read and process a log file in streaming mode with fixed buffer.
-/// This approach minimizes memory allocation by reusing a stack buffer.
+/// Read and process large files efficiently with minimal allocations.
+/// Uses a larger buffer for better I/O performance and optimized line processing.
 pub fn readStreaming(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -129,122 +128,175 @@ pub fn readStreaming(
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    // 8KB buffer for reading chunks
-    var buf: [8192]u8 = undefined;
+    // 64KB buffer for better I/O performance with large files
+    var buf: [65536]u8 = undefined;
 
-    // Carry buffer for incomplete lines at chunk boundaries
-    var carry = try std.ArrayList(u8).initCapacity(allocator, 256);
-    defer carry.deinit(allocator);
+    // Create arena allocator for temporary allocations
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Carry buffer for incomplete lines (256 bytes initial, grows as needed)
+    var carry = std.ArrayList(u8){};
+    defer carry.deinit(arena);
+    try carry.ensureTotalCapacity(arena, 256);
+
+    // Pre-compute filters to avoid repeated checks
+    const has_date_filter = !args.tail_mode and args.date != null;
+    const date_range = if (has_date_filter) parseDateRange(args.date.?) else undefined;
 
     while (true) {
-        const n = try file.read(&buf);
-        if (n == 0) break;
+        const bytes_read = try file.read(&buf);
+        if (bytes_read == 0) break;
 
-        var slice = buf[0..n];
+        var slice = buf[0..bytes_read];
 
-        // If we have leftover data from previous chunk, prepend it
-        if (carry.items.len != 0) {
-            try carry.appendSlice(allocator, slice);
+        // Prepend any carried-over partial line
+        if (carry.items.len > 0) {
+            try carry.appendSlice(arena, slice);
             slice = carry.items;
         }
 
-        var it = std.mem.splitScalar(u8, slice, '\n');
-        while (it.next()) |line| {
-            // Last fragment without newline? Save for next iteration
-            if (it.peek() == null and slice[slice.len - 1] != '\n') {
-                // Clear and reuse carry buffer
-                if (slice.ptr != carry.items.ptr) {
-                    carry.clearRetainingCapacity();
-                    try carry.appendSlice(allocator, line);
+        // Process complete lines in this chunk
+        var line_start: usize = 0;
+        var line_end: usize = 0;
+
+        while (line_end < slice.len) {
+            if (slice[line_end] == '\n') {
+                // Found complete line
+                const line = slice[line_start..line_end];
+                if (line.len > 0) {
+                    handleLineWithPrecomputed(line, args, has_date_filter, date_range);
                 }
-                break;
+                line_start = line_end + 1;
             }
-            handleLine(line, args);
+            line_end += 1;
         }
 
-        // Clear carry if we consumed it
-        if (slice.ptr == carry.items.ptr) {
+        // Handle remaining partial line
+        if (line_start < slice.len) {
+            const partial_line = slice[line_start..];
+            carry.clearRetainingCapacity();
+            try carry.appendSlice(arena, partial_line);
+        } else {
+            // All data was processed, clear carry
             carry.clearRetainingCapacity();
         }
     }
 
-    // Process any remaining data
-    if (carry.items.len != 0) {
-        handleLine(carry.items, args);
+    // Process any final partial line
+    if (carry.items.len > 0) {
+        handleLineWithPrecomputed(carry.items, args, has_date_filter, date_range);
     }
 }
 
-/// Process and print a single log line with filtering and styling.
-/// Applies filters in order: date, level, search expression.
-pub fn handleLine(line: []const u8, args: flags.Args) void {
-    // Skip empty lines early
+/// Optimized version of handleLine with pre-computed filter state.
+fn handleLineWithPrecomputed(
+    line: []const u8,
+    args: flags.Args,
+    has_date_filter: bool,
+    date_range: DateRange,
+) void {
     if (line.len == 0) return;
 
     const lvl = extractLevel(line);
 
-    // Date filter (skip in tail mode to avoid unnecessary parsing)
+    // Apply date filter if present
+    if (has_date_filter) {
+        if (!matchDateRange(line, date_range)) return;
+    }
+
+    // Apply level filter
+    if (args.levels != null) {
+        const l = lvl orelse return;
+        if (!args.isLevelEnabled(l)) return;
+    }
+
+    // Apply search filter
+    if (args.search) |expr| {
+        if (!matchSearch(line, expr)) return;
+    }
+
+    // Output with appropriate formatting
+    printStyledLine(line, lvl);
+}
+
+/// Main line processing with all filters applied.
+pub fn handleLine(line: []const u8, args: flags.Args) void {
+    if (line.len == 0) return;
+
+    const lvl = extractLevel(line);
+
+    // Date filter (skip in tail mode)
     if (!args.tail_mode) {
         if (args.date) |date_arg| {
             const range = parseDateRange(date_arg);
-            if (!matchDateRange(line, range))
-                return;
+            if (!matchDateRange(line, range)) return;
         }
     }
 
     // Level filter
     if (args.levels != null) {
         const l = lvl orelse return;
-        if (!args.isLevelEnabled(l))
-            return;
+        if (!args.isLevelEnabled(l)) return;
     }
 
-    // Search expression filter
+    // Search filter
     if (args.search) |expr| {
-        if (!matchSearch(line, expr))
-            return;
+        if (!matchSearch(line, expr)) return;
     }
 
-    // Print with appropriate formatting
+    printStyledLine(line, lvl);
+}
+
+/// Print line with appropriate styling based on format and level.
+fn printStyledLine(line: []const u8, lvl: ?flags.Level) void {
     if (line[0] == '{') {
-        // JSON logs get special styling
         printJsonStyled(line, lvl);
     } else if (lvl != null) {
-        // Plain text with level gets colored
-        const range = extractLevelRange(line);
-
-        if (range) |r| {
-            const color = levelColor(r.level);
-
-            // before level
-            std.debug.print("{s}", .{line[0..r.start]});
-
-            // level itself (bold + color)
-            std.debug.print(
-                "{s}{s}{s}{s}",
-                .{
-                    Color.bold,
-                    color,
-                    line[r.start..r.end],
-                    Color.reset,
-                },
-            );
-
-            // after level
-            std.debug.print("{s}\n", .{line[r.end..]});
-        }
+        printPlainTextWithLevel(line);
     } else {
-        // Plain text without level
         std.debug.print("{s}\n", .{line});
     }
 }
 
-/// Match search expression against a line.
-/// Supports:
-/// - Simple search: "error"
-/// - OR expression: "error|warning|critical"
-/// - AND expression: "user&login&failed"
+/// Print plain text log line with level coloring.
+fn printPlainTextWithLevel(line: []const u8) void {
+    const range = extractLevelRange(line);
+
+    if (range) |r| {
+        const color = levelColor(r.level);
+
+        // Print before level
+        if (r.start > 0) {
+            std.debug.print("{s}", .{line[0..r.start]});
+        }
+
+        // Print level with color
+        std.debug.print(
+            "{s}{s}{s}{s}",
+            .{
+                Color.bold,
+                color,
+                line[r.start..r.end],
+                Color.reset,
+            },
+        );
+
+        // Print after level
+        if (r.end < line.len) {
+            std.debug.print("{s}\n", .{line[r.end..]});
+        } else {
+            std.debug.print("\n", .{});
+        }
+    } else {
+        std.debug.print("{s}\n", .{line});
+    }
+}
+
+/// Match search expression against line with OR/AND support.
 fn matchSearch(line: []const u8, expr: []const u8) bool {
-    // OR expression: match any term
+    // OR expression
     if (std.mem.indexOfScalar(u8, expr, '|')) |_| {
         var it = std.mem.splitScalar(u8, expr, '|');
         while (it.next()) |part| {
@@ -255,7 +307,7 @@ fn matchSearch(line: []const u8, expr: []const u8) bool {
         return false;
     }
 
-    // AND expression: match all terms
+    // AND expression
     if (std.mem.indexOfScalar(u8, expr, '&')) |_| {
         var it = std.mem.splitScalar(u8, expr, '&');
         while (it.next()) |part| {
@@ -266,59 +318,50 @@ fn matchSearch(line: []const u8, expr: []const u8) bool {
         return true;
     }
 
-    // Simple substring search
+    // Simple substring
     return containsIgnoreCase(line, expr);
 }
 
-/// Case-insensitive substring search.
-/// Optimized with early bailout for impossible matches.
+/// Optimized case-insensitive substring search.
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
 
-    // Optimize: convert needle to lowercase once
-    var needle_lower: [256]u8 = undefined;
-    if (needle.len > 256) {
-        // Fallback to O(n*m) for very long needles
-        return containsIgnoreCaseSlow(haystack, needle);
-    }
-
-    for (needle, 0..) |c, i| {
-        needle_lower[i] = std.ascii.toLower(c);
-    }
-    const needle_slice = needle_lower[0..needle.len];
-
-    // Slide window and compare
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var matches = true;
-        for (needle_slice, 0..) |nc, j| {
-            if (std.ascii.toLower(haystack[i + j]) != nc) {
-                matches = false;
-                break;
-            }
+    // Pre-compute lowercase needle for small needles
+    if (needle.len <= 256) {
+        var needle_lower: [256]u8 = undefined;
+        for (needle, 0..) |c, i| {
+            needle_lower[i] = std.ascii.toLower(c);
         }
-        if (matches) return true;
+        const needle_slice = needle_lower[0..needle.len];
+
+        // Slide window with early exit on mismatch
+        var i: usize = 0;
+        const max_i = haystack.len - needle.len;
+        while (i <= max_i) : (i += 1) {
+            var j: usize = 0;
+            while (j < needle.len) : (j += 1) {
+                if (std.ascii.toLower(haystack[i + j]) != needle_slice[j]) {
+                    break;
+                }
+            }
+            if (j == needle.len) return true;
+        }
+        return false;
     }
 
-    return false;
-}
-
-/// Fallback for very long search strings.
-fn containsIgnoreCaseSlow(haystack: []const u8, needle: []const u8) bool {
+    // Fallback for very long needles
     var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(
-            haystack[i .. i + needle.len],
-            needle,
-        )) {
+    const max_i = haystack.len - needle.len;
+    while (i <= max_i) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) {
             return true;
         }
     }
     return false;
 }
 
-/// Parse log level from string, case-insensitive.
+/// Parse log level from string (case-insensitive).
 fn parseLevelInsensitive(s: []const u8) ?flags.Level {
     inline for (std.meta.fields(flags.Level)) |f| {
         if (std.ascii.eqlIgnoreCase(s, f.name)) {
@@ -328,25 +371,34 @@ fn parseLevelInsensitive(s: []const u8) ?flags.Level {
     return null;
 }
 
-/// Extract log level from a line.
-/// Supports both JSON logs and plain text logs with [Level] format.
+/// Extract log level from line (JSON, plain text, or logfmt).
 fn extractLevel(line: []const u8) ?flags.Level {
     if (line.len == 0) return null;
 
-    // JSON format: {"level":"error",...}
+    // JSON format
     if (line[0] == '{') {
         return extractJsonLevel(line);
     }
 
-    // Plain text format: [ERROR] or [Error]
+    // Plain text format: [LEVEL]
     if (line[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, line, ']') orelse return null;
-        return parseLevelInsensitive(line[1..end]);
+        if (std.mem.indexOfScalar(u8, line, ']')) |end| {
+            return parseLevelInsensitive(line[1..end]);
+        }
     }
 
-    // Logfmt format: level=error
-    if (std.mem.indexOf(u8, line, "level=") != null) {
-        return extractLogfmtLevel(line);
+    // Logfmt format: level=value
+    if (std.mem.indexOf(u8, line, "level=")) |pos| {
+        return extractLogfmtField(line, pos + 6);
+    }
+
+    // Alternative logfmt fields
+    if (std.mem.indexOf(u8, line, "lvl=")) |pos| {
+        return extractLogfmtField(line, pos + 4);
+    }
+
+    if (std.mem.indexOf(u8, line, "severity=")) |pos| {
+        return extractLogfmtField(line, pos + 9);
     }
 
     return null;
@@ -358,12 +410,9 @@ fn extractJsonLevel(line: []const u8) ?flags.Level {
     const pos = std.mem.indexOf(u8, line, key) orelse return null;
 
     var i = pos + key.len;
-
-    // Skip whitespace and colon
     while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-
     if (i >= line.len or line[i] != '"') return null;
-    i += 1;
+    i += 1; // Skip opening quote
 
     const start = i;
     while (i < line.len and line[i] != '"') : (i += 1) {}
@@ -372,61 +421,49 @@ fn extractJsonLevel(line: []const u8) ?flags.Level {
     return parseLevelInsensitive(line[start..i]);
 }
 
-/// Extract log level from logfmt "level" field.
-fn extractLogfmtLevel(line: []const u8) ?flags.Level {
-    const keys = [_][]const u8{
-        "level=",
-        "lvl=",
-        "severity=",
-    };
+/// Extract logfmt field value starting at position.
+fn extractLogfmtField(line: []const u8, start_pos: usize) ?flags.Level {
+    var i = start_pos;
+    const start = i;
 
-    inline for (keys) |key| {
-        if (std.mem.indexOf(u8, line, key)) |pos| {
-            var i = pos + key.len;
-            if (i >= line.len) return null;
+    // Find end of value (space or end of line)
+    while (i < line.len and line[i] != ' ') : (i += 1) {}
 
-            const start = i;
-
-            // value ends at space or end of line
-            while (i < line.len and line[i] != ' ') : (i += 1) {}
-
-            return parseLevelInsensitive(line[start..i]);
-        }
+    if (i > start) {
+        return parseLevelInsensitive(line[start..i]);
     }
 
     return null;
 }
 
-/// Extract log level range from logfmt "level" field.
+/// Extract level range for coloring in plain text logs.
 fn extractLevelRange(line: []const u8) ?LevelRange {
     if (line.len == 0) return null;
+    if (line[0] == '{') return null; // JSON handled elsewhere
 
-    // JSON handled elsewhere
-    if (line[0] == '{') return null;
-
-    // [WARN]
+    // [LEVEL] format
     if (line[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, line, ']') orelse return null;
-        const lvl = parseLevelInsensitive(line[1..end]) orelse return null;
-        return .{
-            .start = 1,
-            .end = end,
-            .level = lvl,
-        };
+        if (std.mem.indexOfScalar(u8, line, ']')) |end| {
+            const lvl = parseLevelInsensitive(line[1..end]) orelse return null;
+            return .{
+                .start = 1,
+                .end = end,
+                .level = lvl,
+            };
+        }
     }
 
-    // logfmt: level=warn | lvl=warn | severity=warn
-    const keys = [_][]const u8{ "level=", "lvl=", "severity=" };
+    // Check for logfmt level fields
+    const fields = [_][]const u8{ "level=", "lvl=", "severity=" };
 
-    inline for (keys) |key| {
-        if (std.mem.indexOf(u8, line, key)) |pos| {
-            var i = pos + key.len;
+    inline for (fields) |field| {
+        if (std.mem.indexOf(u8, line, field)) |pos| {
+            var i = pos + field.len;
             const start = i;
 
             while (i < line.len and line[i] != ' ') : (i += 1) {}
 
             const lvl = parseLevelInsensitive(line[start..i]) orelse return null;
-
             return .{
                 .start = start,
                 .end = i,
@@ -438,35 +475,34 @@ fn extractLevelRange(line: []const u8) ?LevelRange {
     return null;
 }
 
-/// Print JSON log line with syntax highlighting.
-/// Keys are dimmed, level values are colored based on severity.
+/// Print JSON log line with syntax highlighting and level coloring.
 fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
-    var i: usize = 0;
-    var in_string = false;
-    var string_start: usize = 0;
-
-    // Cache level value position to avoid re-parsing
+    // Pre-find level value position if available
     var level_range: ?struct { start: usize, end: usize } = null;
     if (lvl != null) {
         const key = "\"level\"";
         if (std.mem.indexOf(u8, line, key)) |pos| {
-            var j = pos + key.len;
-            while (j < line.len and (line[j] == ' ' or line[j] == ':')) : (j += 1) {}
-            if (j < line.len and line[j] == '"') {
-                j += 1;
-                const start = j;
-                while (j < line.len and line[j] != '"') : (j += 1) {}
-                if (j < line.len) {
-                    level_range = .{ .start = start, .end = j };
+            var i = pos + key.len;
+            while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
+            if (i < line.len and line[i] == '"') {
+                i += 1;
+                const start = i;
+                while (i < line.len and line[i] != '"') : (i += 1) {}
+                if (i < line.len) {
+                    level_range = .{ .start = start, .end = i };
                 }
             }
         }
     }
 
+    var i: usize = 0;
+    var in_string = false;
+    var string_start: usize = 0;
+
     while (i < line.len) : (i += 1) {
         const c = line[i];
 
-        // Toggle string state on unescaped quotes
+        // Handle string boundaries
         if (c == '"' and (i == 0 or line[i - 1] != '\\')) {
             if (!in_string) {
                 in_string = true;
@@ -474,11 +510,6 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
             } else {
                 in_string = false;
                 const str = line[string_start..i];
-
-                // Determine if this is a key (followed by colon)
-                var k = i + 1;
-                while (k < line.len and line[k] == ' ') : (k += 1) {}
-                const is_key = k < line.len and line[k] == ':';
 
                 // Check if this is the level value
                 if (level_range) |r| {
@@ -492,7 +523,12 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
                     }
                 }
 
-                // Style keys differently from values
+                // Check if this is a key (look ahead for colon)
+                var j = i + 1;
+                while (j < line.len and line[j] == ' ') : (j += 1) {}
+                const is_key = j < line.len and line[j] == ':';
+
+                // Style keys with dim color
                 if (is_key) {
                     std.debug.print(
                         "{s}\"{s}\"{s}",
@@ -505,10 +541,10 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
             continue;
         }
 
-        // Skip characters inside strings (already printed)
+        // Skip characters inside strings
         if (in_string) continue;
 
-        // Print structural characters as-is
+        // Print structural characters
         std.debug.print("{c}", .{c});
     }
 
