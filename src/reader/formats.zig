@@ -5,13 +5,14 @@ const flags = @import("../flags/flags.zig");
 const Color = struct {
     pub const reset = "\x1b[0m";
     pub const bold = "\x1b[1m";
+    pub const dim = "\x1b[2m";
 
     pub const red = "\x1b[31m";
     pub const yellow = "\x1b[33m";
     pub const green = "\x1b[32m";
     pub const blue = "\x1b[34m";
     pub const gray = "\x1b[90m";
-    pub const dim = "\x1b[38;5;67m";
+    pub const key = "\x1b[38;5;66m";
 };
 
 /// Range of log levels within a line for coloring.
@@ -145,6 +146,69 @@ pub fn readStreaming(
     const has_date_filter = !args.tail_mode and args.date != null;
     const date_range = if (has_date_filter) parseDateRange(args.date.?) else undefined;
 
+    // Variables for paging functionality
+    var total_lines: usize = 0;
+    var shown_lines: usize = 0;
+    const num_lines = if (args.num_lines > 0) args.num_lines else std.math.maxInt(usize);
+    var current_batch_count: usize = 0;
+    var first_batch = true;
+
+    // First pass: count total lines (for accurate pagination info)
+    // We need to know total number of filtered lines
+    var count_file = try std.fs.cwd().openFile(path, .{});
+    defer count_file.close();
+
+    var count_buf: [65536]u8 = undefined;
+    var count_carry = std.ArrayList(u8){};
+    defer count_carry.deinit(arena);
+    try count_carry.ensureTotalCapacity(arena, 256);
+
+    // Count total filtered lines
+    while (true) {
+        const bytes_read = try count_file.read(&count_buf);
+        if (bytes_read == 0) break;
+
+        var slice = count_buf[0..bytes_read];
+
+        if (count_carry.items.len > 0) {
+            try count_carry.appendSlice(arena, slice);
+            slice = count_carry.items;
+        }
+
+        var line_start: usize = 0;
+        var line_end: usize = 0;
+
+        while (line_end < slice.len) {
+            if (slice[line_end] == '\n') {
+                const line = slice[line_start..line_end];
+                if (line.len > 0) {
+                    // Check if this line would pass filters
+                    if (checkLinePassesFilters(line, args, has_date_filter, date_range)) {
+                        total_lines += 1;
+                    }
+                }
+                line_start = line_end + 1;
+            }
+            line_end += 1;
+        }
+
+        if (line_start < slice.len) {
+            const partial_line = slice[line_start..];
+            count_carry.clearRetainingCapacity();
+            try count_carry.appendSlice(arena, partial_line);
+        } else {
+            count_carry.clearRetainingCapacity();
+        }
+    }
+
+    // Reset file position for actual reading
+    try file.seekTo(0);
+
+    // Reset carry buffer
+    carry.clearRetainingCapacity();
+    try carry.ensureTotalCapacity(arena, 256);
+
+    // Now read and display with pagination
     while (true) {
         const bytes_read = try file.read(&buf);
         if (bytes_read == 0) break;
@@ -166,7 +230,30 @@ pub fn readStreaming(
                 // Found complete line
                 const line = slice[line_start..line_end];
                 if (line.len > 0) {
-                    handleLineWithPrecomputed(line, args, has_date_filter, date_range);
+                    if (handleLineWithPrecomputed(line, args, has_date_filter, date_range)) {
+                        shown_lines += 1;
+                        current_batch_count += 1;
+
+                        // Check if we need to wait for user input
+                        if (args.num_lines > 0 and current_batch_count >= num_lines) {
+                            const left = if (total_lines > shown_lines)
+                                total_lines - shown_lines
+                            else
+                                0;
+
+                            if (left == 0) {
+                                showPaginationInfo(shown_lines, total_lines, true);
+                                return;
+                            }
+
+                            showPaginationInfo(shown_lines, total_lines, false);
+                            waitForEnter();
+                            clearScreen();
+
+                            current_batch_count = 0;
+                            first_batch = false;
+                        }
+                    }
                 }
                 line_start = line_end + 1;
             }
@@ -186,39 +273,117 @@ pub fn readStreaming(
 
     // Process any final partial line
     if (carry.items.len > 0) {
-        handleLineWithPrecomputed(carry.items, args, has_date_filter, date_range);
+        if (handleLineWithPrecomputed(carry.items, args, has_date_filter, date_range)) {
+            shown_lines += 1;
+            current_batch_count += 1;
+        }
+    }
+
+    // Show final pagination info if in paging mode
+    if (args.num_lines > 0 and shown_lines < total_lines) {
+        showPaginationInfo(shown_lines, total_lines, true);
     }
 }
 
-/// Optimized version of handleLine with pre-computed filter state.
-fn handleLineWithPrecomputed(
+/// Check if line passes filters without printing
+fn checkLinePassesFilters(
     line: []const u8,
     args: flags.Args,
     has_date_filter: bool,
     date_range: DateRange,
-) void {
-    if (line.len == 0) return;
+) bool {
+    if (line.len == 0) return false;
 
     const lvl = extractLevel(line);
 
     // Apply date filter if present
     if (has_date_filter) {
-        if (!matchDateRange(line, date_range)) return;
+        if (!matchDateRange(line, date_range)) return false;
     }
 
     // Apply level filter
     if (args.levels != null) {
-        const l = lvl orelse return;
-        if (!args.isLevelEnabled(l)) return;
+        const l = lvl orelse return false;
+        if (!args.isLevelEnabled(l)) return false;
     }
 
     // Apply search filter
     if (args.search) |expr| {
-        if (!matchSearch(line, expr)) return;
+        if (!matchSearch(line, expr)) return false;
+    }
+
+    return true;
+}
+
+/// Show pagination information
+fn showPaginationInfo(shown: usize, total: usize, is_final: bool) void {
+    const remaining = if (total > shown) total - shown else 0;
+
+    if (is_final) {
+        std.debug.print("\n{s}=== Total records: {d} ==={s}\n", .{ Color.dim, total, Color.reset });
+    } else {
+        std.debug.print("\n{s}--- Shown: {d} of {d} (left: {d}) --- Press Enter to continue...{s}\n", .{ Color.dim, shown, total, remaining, Color.reset });
+    }
+}
+
+/// Wait for Enter key press
+fn waitForEnter() void {
+    var stdin_file = std.fs.File{ .handle = 0 };
+    var buffer: [1]u8 = undefined;
+
+    const bytes_read = stdin_file.read(&buffer) catch {
+        std.debug.print("\n", .{});
+        return;
+    };
+
+    if (bytes_read == 0) {
+        std.debug.print("\n", .{});
+        return;
+    }
+
+    if (buffer[0] != '\n' and buffer[0] != '\r') {
+        while (true) {
+            const next_bytes = stdin_file.read(&buffer) catch break;
+            if (next_bytes == 0 or buffer[0] == '\n' or buffer[0] == '\r') {
+                break;
+            }
+        }
+    }
+
+    std.debug.print("\n", .{});
+}
+
+/// Optimized version of handleLine with pre-computed filter state.
+/// Returns true if line was printed, false if filtered out.
+fn handleLineWithPrecomputed(
+    line: []const u8,
+    args: flags.Args,
+    has_date_filter: bool,
+    date_range: DateRange,
+) bool {
+    if (line.len == 0) return false;
+
+    const lvl = extractLevel(line);
+
+    // Apply date filter if present
+    if (has_date_filter) {
+        if (!matchDateRange(line, date_range)) return false;
+    }
+
+    // Apply level filter
+    if (args.levels != null) {
+        const l = lvl orelse return false;
+        if (!args.isLevelEnabled(l)) return false;
+    }
+
+    // Apply search filter
+    if (args.search) |expr| {
+        if (!matchSearch(line, expr)) return false;
     }
 
     // Output with appropriate formatting
     printStyledLine(line, lvl);
+    return true;
 }
 
 /// Main line processing with all filters applied.
@@ -532,7 +697,7 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
                 if (is_key) {
                     std.debug.print(
                         "{s}\"{s}\"{s}",
-                        .{ Color.dim, str, Color.reset },
+                        .{ Color.key, str, Color.reset },
                     );
                 } else {
                     std.debug.print("\"{s}\"", .{str});
@@ -549,4 +714,13 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
     }
 
     std.debug.print("\n", .{});
+}
+
+/// Clear the screen using ANSI escape codes.
+fn clearScreen() void {
+    const stdout = std.fs.File.stdout();
+
+    if (stdout.isTty()) {
+        std.debug.print("\x1b[2J\x1b[H", .{});
+    }
 }

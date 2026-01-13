@@ -50,6 +50,9 @@ pub const Args = struct {
     /// Show help and exit.
     help: bool = false,
 
+    /// Number of lines to display (`-n`).
+    num_lines: usize = 10,
+
     /// Free allocated memory.
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         allocator.free(self.files);
@@ -73,9 +76,11 @@ pub const ParseError = error{
     MissingSearch,
     MissingLevel,
     MissingDate,
+    MissingNumLines,
 
     /// Invalid value provided.
     InvalidLevel,
+    InvalidNumLines,
 
     /// Unknown or unsupported flag.
     UnknownArgument,
@@ -105,6 +110,7 @@ pub fn printHelp() void {
         \\                           Multiple: -l Error,Warn -l Fatal
         \\  -d, --date <date>        Date filter (YYYY-MM-DD)
         \\  -t, --tail               Tail mode
+        \\  -n, --num-lines <num>    Number of lines to display
         \\  -h, --help               Show help
         \\
     , .{});
@@ -210,6 +216,12 @@ fn parseLongFlag(
         return;
     }
 
+    if (std.mem.eql(u8, name, "num-lines")) {
+        const v = value orelse it.next() orelse return ParseError.MissingNumLines;
+        args.num_lines = std.fmt.parseUnsigned(u32, v, 10) catch return ParseError.InvalidNumLines;
+        return;
+    }
+
     return ParseError.UnknownArgument;
 }
 
@@ -253,6 +265,12 @@ fn parseShortFlags(
 
             'd' => {
                 args.date = valueOrNext(flags, &i, it) orelse return ParseError.MissingDate;
+                return;
+            },
+
+            'n' => {
+                const v = valueOrNext(flags, &i, it) orelse return ParseError.MissingNumLines;
+                args.num_lines = std.fmt.parseUnsigned(u32, v, 10) catch return ParseError.InvalidNumLines;
                 return;
             },
 
@@ -330,7 +348,7 @@ test "multiple files mixed positional and -f" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "-f", "a.log", "b.log", "-f", "c.log",
+        "zlrd", "-f", "a.log", "b.log", "-f", "c.log", "-n", "10",
     };
 
     var it = FakeIter{ .argv = &argv };
@@ -341,6 +359,7 @@ test "multiple files mixed positional and -f" {
     try testing.expectEqualStrings("a.log", args.files[0]);
     try testing.expectEqualStrings("b.log", args.files[1]);
     try testing.expectEqualStrings("c.log", args.files[2]);
+    try testing.expectEqual(@as(u32, 10), args.num_lines);
 }
 
 test "levels bitmask" {

@@ -114,12 +114,14 @@ fn printError(err: anyerror) void {
         error.NotOpenForReading => "not open for reading",
         error.OutOfMemory => "out of memory",
         error.InvalidArgument => "invalid argument",
+        error.InvalidNumLines => "invalid number of lines",
         error.MissingFile => "no input files specified",
         error.InvalidLevel => "invalid log level",
         error.UnknownArgument => "unknown argument",
         error.MissingSearch => "missing search value",
         error.MissingLevel => "missing level value",
         error.MissingDate => "missing date value",
+        error.MissingNumLines => "missing number of lines",
         else => @errorName(err),
     };
 
