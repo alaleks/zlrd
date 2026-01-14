@@ -1,5 +1,9 @@
+//! Log format detection, filtering, and colored output.
+//! This module handles multiple log formats (JSON, plain text with bracketed levels,
+//! logfmt) and provides streaming reading with filtering by date, level, and search.
 const std = @import("std");
 const flags = @import("../flags/flags.zig");
+const simd = @import("simd.zig");
 
 /// ANSI color codes for terminal output.
 const Color = struct {
@@ -13,22 +17,19 @@ const Color = struct {
     pub const blue = "\x1b[34m";
     pub const gray = "\x1b[90m";
     pub const key = "\x1b[38;5;66m";
+
+    pub const number = "\x1b[38;5;214m";
+    pub const boolean = "\x1b[38;5;135m";
+    pub const nullv = "\x1b[38;5;244m";
 };
 
-/// Cached level position in a log line for efficient coloring.
-const LevelRange = struct {
-    start: usize,
-    end: usize,
-    level: flags.Level,
-};
-
-/// Date range for filtering logs with optional boundaries.
+/// Inclusive date range for filtering.
 const DateRange = struct {
     from: ?[]const u8,
     to: ?[]const u8,
 };
 
-/// Pre-parsed filter state to avoid repeated string operations.
+/// Accumulated filter state derived from command-line arguments.
 const FilterState = struct {
     has_date_filter: bool,
     date_range: DateRange,
@@ -36,6 +37,7 @@ const FilterState = struct {
     has_search_filter: bool,
     search_expr: ?[]const u8,
 
+    /// Build filter state from parsed command-line arguments.
     fn init(args: flags.Args) FilterState {
         const has_date = !args.tail_mode and args.date != null;
         return .{
@@ -47,25 +49,22 @@ const FilterState = struct {
         };
     }
 
-    /// Fast path: check if line passes all filters.
-    /// Returns null if filtered out, level if passes.
+    /// Check whether a line passes all active filters.
+    /// Returns the extracted level if the line matches, `null` otherwise.
     fn checkLine(self: FilterState, line: []const u8, args: flags.Args) ?flags.Level {
         if (line.len == 0) return null;
 
         const lvl = extractLevel(line);
 
-        // Date filter
         if (self.has_date_filter) {
             if (!matchDateRange(line, self.date_range)) return null;
         }
 
-        // Level filter
         if (self.has_level_filter) {
             const l = lvl orelse return null;
             if (!args.isLevelEnabled(l)) return null;
         }
 
-        // Search filter
         if (self.has_search_filter) {
             if (!matchSearch(line, self.search_expr.?)) return null;
         }
@@ -74,14 +73,17 @@ const FilterState = struct {
     }
 };
 
-/// Statistics for processed logs.
+/// Reading statistics for non‑interactive mode.
 const Stats = struct {
     lines_read: usize = 0,
     lines_matched: usize = 0,
     bytes_read: usize = 0,
 };
 
-/// Parse date range from string with ".." separator.
+/// Parse a date range string of the form `FROM..TO` or a single date.
+/// If `..` is present, the left and right sides become `from` and `to`.
+/// A missing side is stored as `null`. If no `..` is found, the whole string
+/// is used for both `from` and `to` (exact match).
 fn parseDateRange(s: []const u8) DateRange {
     if (std.mem.indexOf(u8, s, "..")) |pos| {
         const left = s[0..pos];
@@ -94,7 +96,8 @@ fn parseDateRange(s: []const u8) DateRange {
     return .{ .from = s, .to = s };
 }
 
-/// Check if log line date falls within specified range.
+/// Test whether the date extracted from `line` lies within `range`.
+/// The comparison is lexicographic, which works for ISO‑8601 dates.
 fn matchDateRange(line: []const u8, range: DateRange) bool {
     const date = extractDate(line) orelse return false;
 
@@ -108,43 +111,24 @@ fn matchDateRange(line: []const u8, range: DateRange) bool {
     return true;
 }
 
-/// Extract date from log line (JSON or plain text).
+/// Extract a date prefix from a log line.
+/// Recognizes JSON lines (field `"time"`) and ISO‑8601 prefixes.
+/// Returns the first 10 characters (YYYY‑MM‑DD) or `null`.
 fn extractDate(line: []const u8) ?[]const u8 {
     if (line.len == 0) return null;
 
     if (line[0] == '{') {
-        return extractJsonField(line, "\"time\"", 10);
+        return simd.extractJsonField(line, "time", 10);
     }
 
-    // Plain text: YYYY-MM-DD at start
-    if (line.len >= 10 and line[4] == '-' and line[7] == '-') {
+    if (simd.isISODate(line)) {
         return line[0..10];
     }
 
     return null;
 }
 
-/// Generic JSON field extractor with max length.
-fn extractJsonField(line: []const u8, key: []const u8, max_len: usize) ?[]const u8 {
-    const pos = std.mem.indexOf(u8, line, key) orelse return null;
-    var i = pos + key.len;
-
-    // Skip whitespace and colon
-    while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-    if (i >= line.len or line[i] != '"') return null;
-    i += 1;
-
-    const start = i;
-    const end = @min(i + max_len, line.len);
-
-    // Find closing quote within limit
-    while (i < end and line[i] != '"') : (i += 1) {}
-    if (i >= line.len) return null;
-
-    return line[start..i];
-}
-
-/// Get ANSI color for log level.
+/// Map a log level to its corresponding terminal color.
 inline fn levelColor(lvl: flags.Level) []const u8 {
     return switch (lvl) {
         .Error, .Fatal, .Panic => Color.red,
@@ -155,7 +139,8 @@ inline fn levelColor(lvl: flags.Level) []const u8 {
     };
 }
 
-/// Main entry point for reading log files.
+/// Read a log file with filtering and colored output.
+/// If `args.num_lines > 0`, paginates the output; otherwise streams continuously.
 pub fn readStreaming(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -168,7 +153,7 @@ pub fn readStreaming(
     }
 }
 
-/// Read entire file without pagination (optimized hot path).
+/// Read and filter lines continuously, printing matches as they appear.
 fn readContinuous(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -177,85 +162,58 @@ fn readContinuous(
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    // Large buffer for fewer syscalls (128KB)
-    const buffer_size = 128 * 1024;
-    const buffer = try allocator.alloc(u8, buffer_size);
+    const buffer = try allocator.alloc(u8, 128 * 1024);
     defer allocator.free(buffer);
 
-    // Carry buffer for incomplete lines
     var carry = std.ArrayList(u8){};
     defer carry.deinit(allocator);
-    try carry.ensureTotalCapacity(allocator, 256);
 
-    // Pre-compute filter state once
     const filter_state = FilterState.init(args);
-
     var stats = Stats{};
 
     while (true) {
-        const bytes_read = try file.read(buffer);
-        if (bytes_read == 0) break;
+        const n = try file.read(buffer);
+        if (n == 0) break;
 
-        stats.bytes_read += bytes_read;
-        var slice = buffer[0..bytes_read];
+        stats.bytes_read += n;
+        var slice = buffer[0..n];
 
-        // Prepend carried-over data
         if (carry.items.len > 0) {
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
 
-        // Process lines with optimized scanning
-        try processLines(allocator, slice, &carry, filter_state, args, &stats);
+        var start: usize = 0;
+        var pos = start;
+
+        while (true) {
+            const nl = simd.findByte(slice, pos, '\n') orelse break;
+            const line = slice[start..nl];
+            stats.lines_read += 1;
+
+            if (filter_state.checkLine(line, args)) |lvl| {
+                printStyledLine(line, lvl);
+                stats.lines_matched += 1;
+            }
+
+            start = nl + 1;
+            pos = start;
+        }
+
+        carry.clearRetainingCapacity();
+        if (start < slice.len) {
+            try carry.appendSlice(allocator, slice[start..]);
+        }
     }
 
-    // Process final partial line
     if (carry.items.len > 0) {
         if (filter_state.checkLine(carry.items, args)) |lvl| {
             printStyledLine(carry.items, lvl);
-            stats.lines_matched += 1;
         }
     }
 }
 
-/// Process lines from a buffer slice.
-fn processLines(
-    allocator: std.mem.Allocator,
-    slice: []const u8,
-    carry: *std.ArrayList(u8),
-    filter_state: FilterState,
-    args: flags.Args,
-    stats: *Stats,
-) !void {
-    var start: usize = 0;
-    var i: usize = 0;
-
-    while (i < slice.len) : (i += 1) {
-        if (slice[i] == '\n') {
-            const line = slice[start..i];
-            stats.lines_read += 1;
-
-            if (line.len > 0) {
-                if (filter_state.checkLine(line, args)) |lvl| {
-                    printStyledLine(line, lvl);
-                    stats.lines_matched += 1;
-                }
-            }
-            start = i + 1;
-        }
-    }
-
-    // Save partial line
-    if (start < slice.len) {
-        const partial = slice[start..];
-        carry.clearRetainingCapacity();
-        try carry.appendSlice(allocator, partial);
-    } else {
-        carry.clearRetainingCapacity();
-    }
-}
-
-/// Read file with pagination support.
+/// Read with pagination: show `args.num_lines` at a time, wait for Enter.
 fn readWithPagination(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -264,107 +222,135 @@ fn readWithPagination(
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    const buffer_size = 128 * 1024;
-    const buffer = try allocator.alloc(u8, buffer_size);
+    const buffer = try allocator.alloc(u8, 128 * 1024);
     defer allocator.free(buffer);
 
     var carry = std.ArrayList(u8){};
     defer carry.deinit(allocator);
-    try carry.ensureTotalCapacity(allocator, 256);
 
     const filter_state = FilterState.init(args);
 
-    var shown_lines: usize = 0;
-    var batch_count: usize = 0;
-    var batch_num: usize = 1;
-    const page_size = args.num_lines;
+    var shown: usize = 0;
+    var batch: usize = 0;
+    var page: usize = 1;
 
     while (true) {
-        const bytes_read = try file.read(buffer);
-        if (bytes_read == 0) break;
+        const n = try file.read(buffer);
+        if (n == 0) break;
 
-        var slice = buffer[0..bytes_read];
-
+        var slice = buffer[0..n];
         if (carry.items.len > 0) {
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
 
         var start: usize = 0;
-        var i: usize = 0;
+        var pos = start;
 
-        while (i < slice.len) : (i += 1) {
-            if (slice[i] == '\n') {
-                const line = slice[start..i];
+        while (true) {
+            const nl = simd.findByte(slice, pos, '\n') orelse break;
+            const line = slice[start..nl];
 
-                if (line.len > 0) {
-                    if (filter_state.checkLine(line, args)) |lvl| {
-                        printStyledLine(line, lvl);
-                        shown_lines += 1;
-                        batch_count += 1;
+            if (filter_state.checkLine(line, args)) |lvl| {
+                printStyledLine(line, lvl);
+                shown += 1;
+                batch += 1;
 
-                        if (batch_count >= page_size) {
-                            printPaginationPrompt(batch_num, batch_count);
-                            waitForEnter();
-                            clearScreen();
-                            batch_count = 0;
-                            batch_num += 1;
-                        }
-                    }
+                if (batch >= args.num_lines) {
+                    printPaginationPrompt(page, batch);
+                    waitForEnter();
+                    clearScreen();
+                    batch = 0;
+                    page += 1;
                 }
-                start = i + 1;
             }
+
+            start = nl + 1;
+            pos = start;
         }
 
+        carry.clearRetainingCapacity();
         if (start < slice.len) {
-            const partial = slice[start..];
-            carry.clearRetainingCapacity();
-            try carry.appendSlice(allocator, partial);
-        } else {
-            carry.clearRetainingCapacity();
+            try carry.appendSlice(allocator, slice[start..]);
         }
     }
+}
 
-    // Final partial line
-    if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items, args)) |lvl| {
-            printStyledLine(carry.items, lvl);
-            shown_lines += 1;
+/// Extract the log level from a line, regardless of format.
+/// Recognizes JSON (`"level": "..."`), bracketed (`[LEVEL]`), and logfmt
+/// (`level=...`, `severity=...`, `lvl=...`).
+/// Returns `null` if no level field is found.
+fn extractLevel(line: []const u8) ?flags.Level {
+    if (line.len == 0) return null;
+
+    if (line[0] == '{') {
+        if (simd.extractJsonField(line, "level", 16)) |v|
+            return parseLevelInsensitive(v);
+        return null;
+    }
+
+    if (line[0] == '[') {
+        if (simd.findBracketedLevel(line)) |r|
+            return parseLevelInsensitive(line[r.start..r.end]);
+    }
+
+    if (simd.findLogfmtLevel(line)) |r| {
+        return parseLevelInsensitive(line[r.start..r.end]);
+    }
+
+    return null;
+}
+
+/// Check whether a byte is a decimal digit.
+inline fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Check if `word` appears at position `pos` in `line`.
+fn matchWord(line: []const u8, pos: usize, comptime word: []const u8) bool {
+    return pos + word.len <= line.len and
+        std.mem.eql(u8, line[pos .. pos + word.len], word);
+}
+
+/// Locate the JSON `"level"` value and return its byte range (without quotes).
+/// Used for coloring the level value inside a JSON line.
+fn extractJsonLevelPos(line: []const u8) ?struct { start: usize, end: usize } {
+    var i: usize = 0;
+
+    while (true) {
+        const q = simd.findByte(line, i, '"') orelse return null;
+
+        if (q + 7 < line.len and
+            std.mem.eql(u8, line[q + 1 .. q + 6], "level") and
+            line[q + 6] == '"')
+        {
+            i = q + 7;
+            break;
         }
+
+        i = q + 1;
     }
 
-    if (shown_lines > 0) {
-        std.debug.print(
-            "\n{s}=== Total: {d} lines ==={s}\n",
-            .{ Color.dim, shown_lines, Color.reset },
-        );
+    // skip whitespace + colon
+    while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
+    if (i >= line.len or line[i] != '"') return null;
+
+    const start = i + 1;
+    const end = simd.findByte(line, start, '"') orelse return null;
+
+    return .{ .start = start, .end = end };
+}
+
+/// Parse a level string case‑insensitively.
+inline fn parseLevelInsensitive(s: []const u8) ?flags.Level {
+    inline for (std.meta.fields(flags.Level)) |f| {
+        if (std.ascii.eqlIgnoreCase(s, f.name))
+            return @enumFromInt(f.value);
     }
+    return null;
 }
 
-/// Print pagination prompt.
-inline fn printPaginationPrompt(batch: usize, count: usize) void {
-    std.debug.print(
-        "\n{s}--- Batch {d}: {d} lines | Press Enter to continue...{s}\n",
-        .{ Color.dim, batch, count, Color.reset },
-    );
-}
-
-/// Wait for Enter key with timeout support.
-fn waitForEnter() void {
-    const stdin = std.fs.File.stdin();
-    var buf: [1]u8 = undefined;
-    _ = stdin.read(&buf) catch return;
-}
-
-/// Clear screen using ANSI escape codes.
-fn clearScreen() void {
-    const stdout = std.fs.File.stdout();
-    if (stdout.isTty()) {
-        std.debug.print("\x1b[2J\x1b[H", .{});
-    }
-}
-
-/// Print line with appropriate styling.
+/// Print a line with appropriate styling based on its format and extracted level.
 fn printStyledLine(line: []const u8, lvl: ?flags.Level) void {
     if (line.len == 0) return;
 
@@ -377,214 +363,39 @@ fn printStyledLine(line: []const u8, lvl: ?flags.Level) void {
     }
 }
 
-/// Print plain text log with colored level.
+/// Print a plain‑text line with a colored level.
+/// If the level appears inside brackets, only the bracketed part is colored.
 fn printPlainTextWithLevel(line: []const u8, level: flags.Level) void {
-    const range = findLevelInLine(line);
-    const color = levelColor(level);
-
-    if (range) |r| {
-        // Print: before + colored_level + after
-        if (r.start > 0) {
-            std.debug.print("{s}", .{line[0..r.start]});
-        }
-        std.debug.print(
-            "{s}{s}{s}{s}",
-            .{ Color.bold, color, line[r.start..r.end], Color.reset },
-        );
-        if (r.end < line.len) {
-            std.debug.print("{s}", .{line[r.end..]});
-        }
-        std.debug.print("\n", .{});
-    } else {
-        // Fallback: color entire line
-        std.debug.print("{s}{s}{s}\n", .{ color, line, Color.reset });
+    if (simd.findBracketedLevel(line)) |r| {
+        std.debug.print("{s}{s}{s}{s}\n", .{
+            line[0..r.start],
+            Color.bold,
+            levelColor(level),
+            line[r.start..r.end],
+        });
+        return;
     }
+
+    std.debug.print("{s}{s}{s}\n", .{
+        levelColor(level),
+        line,
+        Color.reset,
+    });
 }
 
-/// Find level text position in line for coloring.
-fn findLevelInLine(line: []const u8) ?struct { start: usize, end: usize } {
-    if (line.len == 0) return null;
-
-    // [LEVEL] format
-    if (line[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, line, ']') orelse return null;
-        return .{ .start = 1, .end = end };
-    }
-
-    // logfmt: level=VALUE
-    const patterns = [_][]const u8{ "level=", "lvl=", "severity=" };
-    inline for (patterns) |pattern| {
-        if (std.mem.indexOf(u8, line, pattern)) |pos| {
-            const start = pos + pattern.len;
-            var end = start;
-            while (end < line.len and line[end] != ' ') : (end += 1) {}
-            return .{ .start = start, .end = end };
-        }
-    }
-
-    return null;
-}
-
-/// Match search expression with OR/AND support.
-fn matchSearch(line: []const u8, expr: []const u8) bool {
-    // OR: a|b|c
-    if (std.mem.indexOfScalar(u8, expr, '|')) |_| {
-        var it = std.mem.splitScalar(u8, expr, '|');
-        while (it.next()) |part| {
-            if (part.len > 0 and containsIgnoreCase(line, part))
-                return true;
-        }
-        return false;
-    }
-
-    // AND: a&b&c
-    if (std.mem.indexOfScalar(u8, expr, '&')) |_| {
-        var it = std.mem.splitScalar(u8, expr, '&');
-        while (it.next()) |part| {
-            if (part.len > 0 and !containsIgnoreCase(line, part))
-                return false;
-        }
-        return true;
-    }
-
-    return containsIgnoreCase(line, expr);
-}
-
-/// Optimized case-insensitive substring search.
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    // Fast path: use Boyer-Moore-Horspool for long needles
-    if (needle.len > 8) {
-        return containsIgnoreCaseBMH(haystack, needle);
-    }
-
-    // Inline path for short needles
-    const max_i = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= max_i) : (i += 1) {
-        var match = true;
-        for (needle, 0..) |nc, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return true;
-    }
-    return false;
-}
-
-/// Boyer-Moore-Horspool for long search strings.
-fn containsIgnoreCaseBMH(haystack: []const u8, needle: []const u8) bool {
-    // Build skip table
-    var skip: [256]usize = undefined;
-    @memset(&skip, needle.len);
-
-    for (needle[0 .. needle.len - 1], 0..) |c, i| {
-        const lower = std.ascii.toLower(c);
-        const upper = std.ascii.toUpper(c);
-        skip[lower] = needle.len - 1 - i;
-        skip[upper] = needle.len - 1 - i;
-    }
-
-    var i: usize = 0;
-    while (i <= haystack.len - needle.len) {
-        var j: usize = needle.len - 1;
-
-        while (j > 0 and std.ascii.toLower(haystack[i + j]) == std.ascii.toLower(needle[j])) {
-            j -= 1;
-        }
-
-        if (std.ascii.toLower(haystack[i]) == std.ascii.toLower(needle[0])) {
-            return true;
-        }
-
-        i += skip[haystack[i + needle.len - 1]];
-    }
-
-    return false;
-}
-
-/// Parse log level from string (case-insensitive).
-inline fn parseLevelInsensitive(s: []const u8) ?flags.Level {
-    inline for (std.meta.fields(flags.Level)) |f| {
-        if (std.ascii.eqlIgnoreCase(s, f.name)) {
-            return @enumFromInt(f.value);
-        }
-    }
-    return null;
-}
-
-/// Extract log level from line (optimized with early exits).
-fn extractLevel(line: []const u8) ?flags.Level {
-    if (line.len == 0) return null;
-
-    // JSON format (most common in production)
-    if (line[0] == '{') {
-        return extractJsonLevel(line);
-    }
-
-    // [LEVEL] format (second most common)
-    if (line[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, line, ']') orelse return null;
-        return parseLevelInsensitive(line[1..end]);
-    }
-
-    // logfmt format (check common fields)
-    if (std.mem.indexOf(u8, line, "level=")) |pos| {
-        return extractLogfmtLevel(line, pos + 6);
-    }
-    if (std.mem.indexOf(u8, line, "lvl=")) |pos| {
-        return extractLogfmtLevel(line, pos + 4);
-    }
-
-    return null;
-}
-
-/// Extract level from JSON "level" field.
-fn extractJsonLevel(line: []const u8) ?flags.Level {
-    const value = extractJsonField(line, "\"level\"", 16) orelse return null;
-    return parseLevelInsensitive(value);
-}
-
-/// Extract level from logfmt field.
-fn extractLogfmtLevel(line: []const u8, start: usize) ?flags.Level {
-    var end = start;
-    while (end < line.len and line[end] != ' ') : (end += 1) {}
-    if (end > start) {
-        return parseLevelInsensitive(line[start..end]);
-    }
-    return null;
-}
-
-/// Print JSON with syntax highlighting.
+/// Print a JSON line with syntax‑highlighted keys, strings, numbers, and booleans.
+/// The `"level"` value is additionally colored according to its severity.
 fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
-    // Find level value position once
-    var level_pos: ?struct { start: usize, end: usize } = null;
-    if (lvl != null) {
-        if (std.mem.indexOf(u8, line, "\"level\"")) |pos| {
-            var i = pos + 7; // len("\"level\"")
-            while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-            if (i < line.len and line[i] == '"') {
-                i += 1;
-                const start = i;
-                while (i < line.len and line[i] != '"') : (i += 1) {}
-                if (i < line.len) {
-                    level_pos = .{ .start = start, .end = i };
-                }
-            }
-        }
-    }
+    const level_pos = if (lvl != null) extractJsonLevelPos(line) else null;
 
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
 
-    while (i < line.len) : (i += 1) {
+    while (i < line.len) {
         const c = line[i];
 
+        // ---------- strings ----------
         if (c == '"' and (i == 0 or line[i - 1] != '\\')) {
             if (!in_string) {
                 in_string = true;
@@ -593,38 +404,158 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
                 in_string = false;
                 const str = line[str_start..i];
 
-                // Check if level value
+                // level value
                 if (level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
-                        const color = levelColor(lvl.?);
-                        std.debug.print("{s}{s}\"{s}\"{s}", .{
-                            Color.bold, color, str, Color.reset,
-                        });
+                        std.debug.print(
+                            "{s}{s}\"{s}\"{s}",
+                            .{ Color.bold, levelColor(lvl.?), str, Color.reset },
+                        );
+                        i += 1;
                         continue;
                     }
                 }
 
-                // Check if key
+                // key
                 var j = i + 1;
                 while (j < line.len and line[j] == ' ') : (j += 1) {}
-
                 if (j < line.len and line[j] == ':') {
-                    std.debug.print("{s}\"{s}\"{s}", .{ Color.key, str, Color.reset });
+                    std.debug.print("{s}\"{s}\"{s}", .{
+                        Color.key, str, Color.reset,
+                    });
                 } else {
                     std.debug.print("\"{s}\"", .{str});
                 }
             }
+            i += 1;
             continue;
         }
 
-        if (in_string) continue;
-        std.debug.print("{c}", .{c});
+        if (in_string) {
+            i += 1;
+            continue;
+        }
+
+        // ---------- literals ----------
+        if (isDigit(c) or c == '-') {
+            const start = i;
+            i += 1;
+            while (i < line.len and
+                (isDigit(line[i]) or line[i] == '.' or
+                    line[i] == 'e' or line[i] == 'E' or
+                    line[i] == '+' or line[i] == '-'))
+            {
+                i += 1;
+            }
+
+            std.debug.print("{s}{s}{s}", .{
+                Color.number,
+                line[start..i],
+                Color.reset,
+            });
+            continue;
+        }
+
+        if (matchWord(line, i, "true")) {
+            std.debug.print("{s}true{s}", .{ Color.boolean, Color.reset });
+            i += 4;
+            continue;
+        }
+        if (matchWord(line, i, "false")) {
+            std.debug.print("{s}false{s}", .{ Color.boolean, Color.reset });
+            i += 5;
+            continue;
+        }
+        if (matchWord(line, i, "null")) {
+            std.debug.print("{s}null{s}", .{ Color.nullv, Color.reset });
+            i += 4;
+            continue;
+        }
+
+        // ---------- structure ----------
+        switch (c) {
+            '{', '}' => std.debug.print("{s}{c}{s}", .{
+                Color.dim, c, Color.reset,
+            }),
+            ':' => std.debug.print("{s}:{s}", .{
+                Color.gray, Color.reset,
+            }),
+            else => std.debug.print("{c}", .{c}),
+        }
+
+        i += 1;
     }
 
     std.debug.print("\n", .{});
 }
 
-/// Backward compatibility wrapper.
+/// Print a pagination prompt after each batch.
+inline fn printPaginationPrompt(batch: usize, count: usize) void {
+    std.debug.print(
+        "\n{s}--- Batch {d}: {d} lines | Press Enter...{s}\n",
+        .{ Color.dim, batch, count, Color.reset },
+    );
+}
+
+/// Wait for the user to press Enter.
+fn waitForEnter() void {
+    var buf: [1]u8 = undefined;
+    _ = std.fs.File.stdin().read(&buf) catch {};
+}
+
+/// Clear the terminal screen if stdout is a TTY.
+fn clearScreen() void {
+    if (std.fs.File.stdout().isTty())
+        std.debug.print("\x1b[2J\x1b[H", .{});
+}
+
+/// ============================================================
+/// Search
+/// ============================================================
+/// Match a line against a search expression.
+/// Supports `|` (OR) and `&` (AND) operators. If neither is present,
+/// the expression is treated as a simple substring.
+fn matchSearch(line: []const u8, expr: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, expr, '|')) |_| {
+        var it = std.mem.splitScalar(u8, expr, '|');
+        while (it.next()) |p| {
+            if (p.len > 0 and containsIgnoreCase(line, p)) return true;
+        }
+        return false;
+    }
+
+    if (std.mem.indexOfScalar(u8, expr, '&')) |_| {
+        var it = std.mem.splitScalar(u8, expr, '&');
+        while (it.next()) |p| {
+            if (p.len > 0 and !containsIgnoreCase(line, p)) return false;
+        }
+        return true;
+    }
+
+    return containsIgnoreCase(line, expr);
+}
+
+/// Case‑insensitive substring search.
+fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > hay.len) return false;
+
+    const max = hay.len - needle.len;
+    var i: usize = 0;
+    while (i <= max) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(hay[i + j]) != std.ascii.toLower(c)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+/// Backward-compatible wrapper (used by tail.zig)
+/// Filter and print a single line according to the given arguments.
 pub fn handleLine(line: []const u8, args: flags.Args) void {
     const filter_state = FilterState.init(args);
     if (filter_state.checkLine(line, args)) |lvl| {
