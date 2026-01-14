@@ -366,21 +366,64 @@ fn printStyledLine(line: []const u8, lvl: ?flags.Level) void {
 /// Print a plain‑text line with a colored level.
 /// If the level appears inside brackets, only the bracketed part is colored.
 fn printPlainTextWithLevel(line: []const u8, level: flags.Level) void {
+    const color = levelColor(level);
+
+    // [LEVEL] format
     if (simd.findBracketedLevel(line)) |r| {
-        std.debug.print("{s}{s}{s}{s}\n", .{
-            line[0..r.start],
-            Color.bold,
-            levelColor(level),
-            line[r.start..r.end],
-        });
+        // before [
+        if (r.start > 0) {
+            std.debug.print("{s}", .{line[0..r.start]});
+        }
+
+        // LEVEL
+        std.debug.print(
+            "{s}{s}{s}{s}",
+            .{
+                Color.bold,
+                color,
+                line[r.start..r.end],
+                Color.reset,
+            },
+        );
+
+        // after ]
+        if (r.end < line.len) {
+            std.debug.print("{s}", .{line[r.end..]});
+        }
+
+        std.debug.print("\n", .{});
         return;
     }
 
-    std.debug.print("{s}{s}{s}\n", .{
-        levelColor(level),
-        line,
-        Color.reset,
-    });
+    // logfmt: level= / severity= / lvl=
+    if (simd.findLogfmtLevel(line)) |r| {
+        // before value
+        if (r.start > 0) {
+            std.debug.print("{s}", .{line[0..r.start]});
+        }
+
+        // value
+        std.debug.print(
+            "{s}{s}{s}{s}",
+            .{
+                Color.bold,
+                color,
+                line[r.start..r.end],
+                Color.reset,
+            },
+        );
+
+        // after value
+        if (r.end < line.len) {
+            std.debug.print("{s}", .{line[r.end..]});
+        }
+
+        std.debug.print("\n", .{});
+        return;
+    }
+
+    // fallback: no level detected → print as-is
+    std.debug.print("{s}\n", .{line});
 }
 
 /// Print a JSON line with syntax‑highlighted keys, strings, numbers, and booleans.
