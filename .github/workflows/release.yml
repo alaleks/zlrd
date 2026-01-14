@@ -9,23 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Create release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create.outputs.upload_url }}
-
-    steps:
-      - name: Create GitHub Release
-        id: create
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          prerelease: false
-
-  build:
-    name: Build ${{ matrix.target }}
-    needs: release
+  build-and-release:
+    name: Build & Release (${{ matrix.target }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -60,7 +45,5 @@ jobs:
           cp zig-out/bin/zlrd${{ matrix.ext }} \
              dist/zlrd-${{ matrix.target }}${{ matrix.ext }}
 
-      - name: Upload artifact to release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
