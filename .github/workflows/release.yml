@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build & Release (${{ matrix.target }})
+  build:
+    name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -45,5 +45,27 @@ jobs:
           cp zig-out/bin/zlrd${{ matrix.ext }} \
              dist/zlrd-${{ matrix.target }}${{ matrix.ext }}
 
-      - name: Upload to GitHub Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlrd-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List release files (debug)
+        run: ls -R dist
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
