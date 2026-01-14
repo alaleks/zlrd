@@ -41,7 +41,7 @@ pub const Args = struct {
     /// `null` means "all levels enabled".
     levels: ?LevelMask = null,
 
-    /// Date filter (`YYYY-MM-DD` or range).
+    /// Date filter (`YYYY-MM-DD` or range 'YYYY-MM-DD..YYYY-MM-DD').
     date: ?[]const u8 = null,
 
     /// Enable tail mode (`-t`).
@@ -247,29 +247,29 @@ fn parseShortFlags(
             't' => args.tail_mode = true,
 
             'f' => {
-                const f = valueOrNext(flags, &i, it) orelse return ParseError.MissingFile;
-                try files.append(allocator, f);
+                const v = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
+                try files.append(allocator, v);
                 return;
             },
 
             's' => {
-                args.search = valueOrNext(flags, &i, it) orelse return ParseError.MissingSearch;
+                args.search = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
                 return;
             },
 
             'l' => {
-                const v = valueOrNext(flags, &i, it) orelse return ParseError.MissingLevel;
+                const v = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
                 try addLevels(&args.levels, v);
                 return;
             },
 
             'd' => {
-                args.date = valueOrNext(flags, &i, it) orelse return ParseError.MissingDate;
+                args.date = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
                 return;
             },
 
             'n' => {
-                const v = valueOrNext(flags, &i, it) orelse return ParseError.MissingNumLines;
+                const v = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
                 args.num_lines = std.fmt.parseUnsigned(u32, v, 10) catch return ParseError.InvalidNumLines;
                 return;
             },
@@ -281,15 +281,14 @@ fn parseShortFlags(
 
 /// Returns an inline value from grouped flags (`-fvalue`)
 /// or consumes the next argv element.
-inline fn valueOrNext(
+inline fn valueOrNextStrict(
     flags: []const u8,
     index: *usize,
     it: anytype,
 ) ?[]const u8 {
+    // value inline разрешено ТОЛЬКО если это последний флаг
     if (index.* + 1 < flags.len) {
-        const v = flags[index.* + 1 ..];
-        index.* = flags.len;
-        return v;
+        return null; // ошибка: значение в группе
     }
     return it.next();
 }
@@ -315,6 +314,7 @@ fn addLevels(mask: *?LevelMask, value: []const u8) ParseError!void {
 /// Tests
 const testing = std.testing;
 
+/// Iterator for testing
 const FakeIter = struct {
     argv: []const []const u8,
     index: usize = 0,
@@ -348,7 +348,7 @@ test "multiple files mixed positional and -f" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "-f", "a.log", "b.log", "-f", "c.log", "-n", "10",
+        "zlrd", "-f", "a.log", "b.log", "-f", "c.log", "-n", "10", "-s", "test", "-d", "2025-01-01..2025-12-31", "-t",
     };
 
     var it = FakeIter{ .argv = &argv };
@@ -360,6 +360,66 @@ test "multiple files mixed positional and -f" {
     try testing.expectEqualStrings("b.log", args.files[1]);
     try testing.expectEqualStrings("c.log", args.files[2]);
     try testing.expectEqual(@as(u32, 10), args.num_lines);
+    try testing.expectEqualStrings("test", args.search.?);
+    try testing.expectEqualStrings("2025-01-01..2025-12-31", args.date.?);
+    try testing.expectEqual(true, args.tail_mode);
+}
+
+test "multiple long flags" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "--file=a.log", "--num-lines=10", "--search=test", "--date=2025-01-01", "--tail",
+    };
+
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), args.files.len);
+    try testing.expectEqualStrings("a.log", args.files[0]);
+    try testing.expectEqual(@as(u32, 10), args.num_lines);
+    try testing.expectEqualStrings("test", args.search.?);
+    try testing.expectEqualStrings("2025-01-01", args.date.?);
+    try testing.expectEqual(true, args.tail_mode);
+}
+
+test "mixed flags" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "-f", "a.log", "--level=Fatal",
+    };
+
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), args.files.len);
+    try testing.expectEqualStrings("a.log", args.files[0]);
+    try testing.expect((args.levels.? & levelBit(.Fatal)) != 0);
+}
+
+test "mixed flags with grouping" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "-f", "a.log", "-l", "Error", "-n", "10", "-s", "test", "--date=2025-01-01", "--tail",
+    };
+
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), args.files.len);
+    try testing.expectEqualStrings("a.log", args.files[0]);
+    try testing.expectEqual(@as(u32, 10), args.num_lines);
+    try testing.expectEqualStrings("test", args.search.?);
+    try testing.expectEqualStrings("2025-01-01", args.date.?);
+    try testing.expectEqual(true, args.tail_mode);
 }
 
 test "levels bitmask" {
@@ -377,7 +437,7 @@ test "gnu short flags grouping" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "-tl", "Error", "log.txt",
+        "zlrd", "-tl", "Error", "-n", "10", "-s", "test", "log.txt",
     };
 
     var it = FakeIter{ .argv = &argv };
@@ -388,6 +448,8 @@ test "gnu short flags grouping" {
     const m = args.levels.?;
     try testing.expect((m & levelBit(.Error)) != 0);
     try testing.expectEqual(@as(usize, 1), args.files.len);
+    try testing.expectEqual(@as(u32, 10), args.num_lines);
+    try testing.expectEqualStrings("test", args.search.?);
 }
 
 test "help flag stops parsing" {
@@ -410,13 +472,27 @@ test "memory cleanup on error" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "-l",
+        "zlrd", "-f", "a.log", "-l",
     };
 
     var it = FakeIter{ .argv = &argv };
     const result = parseArgsFromIter(arena.allocator(), &it);
 
     try testing.expectError(ParseError.MissingLevel, result);
+}
+
+test "empty file list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd",
+    };
+
+    var it = FakeIter{ .argv = &argv };
+    const result = parseArgsFromIter(arena.allocator(), &it);
+
+    try testing.expectError(ParseError.MissingFile, result);
 }
 
 test "levels with whitespace" {
