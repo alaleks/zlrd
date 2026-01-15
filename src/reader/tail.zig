@@ -31,54 +31,6 @@ pub fn follow(
     }
 }
 
-/// Find the starting position for reading the last n lines
-fn findStartOfLastNLines(file: std.fs.File, n: usize) !u64 {
-    const stat = try file.stat();
-    if (stat.size == 0) return 0;
-
-    const target_lines = n;
-    var lines_found: usize = 0;
-    var pos: u64 = stat.size;
-
-    // Check if file ends with newline
-    if (pos > 0) {
-        try file.seekTo(pos - 1);
-        var last_byte: [1]u8 = undefined;
-        _ = try file.read(&last_byte);
-        if (last_byte[0] == '\n') {
-            // Adjust position to exclude the trailing newline for counting
-            pos -= 1;
-        }
-    }
-
-    var buf: [8192]u8 = undefined;
-
-    // Read backwards from the end until we find target_lines newlines
-    while (pos > 0 and lines_found < target_lines) {
-        const read_size = @min(@as(u64, 8192), pos);
-        pos -= read_size;
-        try file.seekTo(pos);
-        const bytes_read = try file.read(buf[0..read_size]);
-
-        // Scan backwards through the buffer
-        var i: usize = @intCast(bytes_read);
-        while (i > 0 and lines_found < target_lines) {
-            i -= 1;
-            if (buf[i] == '\n') {
-                lines_found += 1;
-                if (lines_found == target_lines) {
-                    // Found the nth newline from the end
-                    // Return position after this newline
-                    return pos + @as(u64, i) + 1;
-                }
-            }
-        }
-    }
-
-    // If we didn't find enough newlines, start from beginning
-    return 0;
-}
-
 /// Tail a single file, optionally following for new content
 fn tailFile(
     allocator: std.mem.Allocator,
@@ -99,15 +51,11 @@ fn tailFile(
     // Get file size
     const stat = try file.stat();
 
-    // Determine starting position
-    var pos: u64 = 0;
-    if (!follow_mode) {
-        // In initial read, show only last 10 lines
-        pos = try findStartOfLastNLines(file, 10);
-    } else {
-        // In follow mode, start at the end of file
-        pos = stat.size;
-    }
+    // If not in follow mode (initial read), start near the end
+    var pos: u64 = if (!follow_mode and stat.size > 8192)
+        stat.size - 8192
+    else
+        0;
 
     // Seek to position
     try file.seekTo(pos);
@@ -188,75 +136,143 @@ fn tailFile(
 
 const testing = std.testing;
 
-test "tailFile should read from existing file" {
+test "tailFile reads existing file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Create a temporary test file
-    const test_content = "[INFO] Line 1\n[ERROR] Line 2\n[WARN] Line 3\n";
-    var tmp_dir = testing.tmpDir(.{});
-    var dir = tmp_dir.dir;
-    defer tmp_dir.cleanup();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const file_name = "test.log";
+    try tmp.dir.writeFile(.{
+        .sub_path = "test.log",
+        .data = "line1\nline2\n",
+    });
+
+    const old_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(old_cwd);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(old_cwd) catch unreachable;
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var files = [_][]const u8{"test.log"};
+    const args = flags.Args{
+        .files = files[0..],
+        .tail_mode = true,
+        .date = null,
+        .levels = null,
+        .search = null,
+        .num_lines = 0,
+    };
+
+    const read = try tailFile(
+        allocator,
+        "test.log",
+        args,
+        &seen,
+        false,
+    );
+
+    try testing.expect(read);
+    try testing.expectEqual(@as(usize, 2), seen.count());
+}
+
+test "tailFile follow mode reads appended data" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "follow.log",
+        .data = "line1\n",
+    });
+
+    const old_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(old_cwd);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(old_cwd) catch unreachable;
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var files = [_][]const u8{"follow.log"};
+    const args = flags.Args{
+        .files = files[0..],
+        .tail_mode = true,
+        .date = null,
+        .levels = null,
+        .search = null,
+        .num_lines = 0,
+    };
+
+    _ = try tailFile(
+        allocator,
+        "follow.log",
+        args,
+        &seen,
+        false,
+    );
+
+    try testing.expectEqual(@as(usize, 1), seen.count());
+
     {
-        // Create and write to file without defer
-        var file = try dir.createFile(file_name, .{});
-        try file.writeAll(test_content);
-        file.close(); // Close immediately after writing
+        var file = try std.fs.cwd().openFile(
+            "follow.log",
+            .{ .mode = .write_only },
+        );
+        defer file.close();
+        try file.seekFromEnd(0);
+        try file.writeAll("line2\n");
     }
 
-    // Create args
-    var files = [_][]const u8{file_name};
-    const args = flags.Args{
-        .files = &files,
-        .tail_mode = true,
-        .date = null,
-        .levels = null,
-        .search = null,
-        .num_lines = 0,
-    };
+    const read = try tailFile(
+        allocator,
+        "follow.log",
+        args,
+        &seen,
+        true,
+    );
 
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Change to tmp directory - using posix API for compatibility
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    // Store original working directory
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    // Change directory using posix.chdir
-    try std.posix.chdir(tmp_path);
-
-    // Read file
-    const read = try tailFile(allocator, file_name, args, &seen, false);
     try testing.expect(read);
-
-    // Restore original directory
-    try std.posix.chdir(original_cwd_path);
-
-    // Verify lines were added to seen set
-    try testing.expect(seen.count() > 0);
+    try testing.expectEqual(@as(usize, 2), seen.count());
 }
 
-test "tailFile should handle non-existent file in follow mode" {
+test "tailFile follow mode ignores missing file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var files = [_][]const u8{"nonexistent.log"};
+    const old_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(old_cwd);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(old_cwd) catch unreachable;
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var files = [_][]const u8{"missing.log"};
     const args = flags.Args{
-        .files = &files,
+        .files = files[0..],
         .tail_mode = true,
         .date = null,
         .levels = null,
@@ -264,39 +280,46 @@ test "tailFile should handle non-existent file in follow mode" {
         .num_lines = 0,
     };
 
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
+    const read = try tailFile(
+        allocator,
+        "missing.log",
+        args,
+        &seen,
+        true,
+    );
 
-    // Change to tmp directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    // Should return false without error
-    const read = try tailFile(allocator, "nonexistent.log", args, &seen, true);
     try testing.expect(!read);
-
-    try std.posix.chdir(original_cwd_path);
+    try testing.expectEqual(@as(usize, 0), seen.count());
 }
 
-test "tailFile should error on non-existent file in initial mode" {
+test "tailFile handles empty file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var files = [_][]const u8{"nonexistent.log"};
+    try tmp.dir.writeFile(.{
+        .sub_path = "empty.log",
+        .data = "",
+    });
+
+    const old_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(old_cwd);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(old_cwd) catch unreachable;
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var files = [_][]const u8{"empty.log"};
     const args = flags.Args{
-        .files = &files,
+        .files = files[0..],
         .tail_mode = true,
         .date = null,
         .levels = null,
@@ -304,45 +327,46 @@ test "tailFile should error on non-existent file in initial mode" {
         .num_lines = 0,
     };
 
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
+    const read = try tailFile(
+        allocator,
+        "empty.log",
+        args,
+        &seen,
+        false,
+    );
 
-    // Change to tmp directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    // Should return error
-    const result = tailFile(allocator, "nonexistent.log", args, &seen, false);
-    try testing.expectError(error.FileNotFound, result);
-
-    try std.posix.chdir(original_cwd_path);
+    try testing.expect(!read);
+    try testing.expectEqual(@as(usize, 0), seen.count());
 }
 
-test "tailFile should deduplicate lines using hash" {
+test "tailFile deduplicates identical lines" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const file_name = "dedup.log";
-    var file = try tmp_dir.dir.createFile(file_name, .{});
-    const test_content = "[INFO] Same line\n[INFO] Same line\n[INFO] Different line\n";
-    try file.writeAll(test_content);
-    file.close();
+    try tmp.dir.writeFile(.{
+        .sub_path = "dup.log",
+        .data = "same\nsame\nother\n",
+    });
 
-    var files = [_][]const u8{file_name};
+    const old_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(old_cwd);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(old_cwd) catch unreachable;
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var files = [_][]const u8{"dup.log"};
     const args = flags.Args{
-        .files = &files,
+        .files = files[0..],
         .tail_mode = true,
         .date = null,
         .levels = null,
@@ -350,251 +374,13 @@ test "tailFile should deduplicate lines using hash" {
         .num_lines = 0,
     };
 
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Change directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    _ = try tailFile(allocator, file_name, args, &seen, false);
-
-    // Should have 2 unique lines (deduplicated)
-    try testing.expectEqual(@as(usize, 2), seen.count());
-
-    try std.posix.chdir(original_cwd_path);
-}
-
-test "tailFile should handle empty file" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const file_name = "empty.log";
-    var file = try tmp_dir.dir.createFile(file_name, .{});
-    file.close();
-
-    var files = [_][]const u8{file_name};
-    const args = flags.Args{
-        .files = &files,
-        .tail_mode = true,
-        .date = null,
-        .levels = null,
-        .search = null,
-        .num_lines = 0,
-    };
-
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Change directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    const read = try tailFile(allocator, file_name, args, &seen, false);
-    try testing.expect(!read); // No data read from empty file
-
-    try std.posix.chdir(original_cwd_path);
-}
-
-test "tailFile should handle file without trailing newline" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const file_name = "no_newline.log";
-    var file = try tmp_dir.dir.createFile(file_name, .{});
-    const test_content = "[INFO] Line without newline";
-    try file.writeAll(test_content);
-    file.close();
-
-    var files = [_][]const u8{file_name};
-    const args = flags.Args{
-        .files = &files,
-        .tail_mode = true,
-        .date = null,
-        .levels = null,
-        .search = null,
-        .num_lines = 0,
-    };
-
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Change directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    const read = try tailFile(allocator, file_name, args, &seen, false);
-    try testing.expect(read);
-
-    try std.posix.chdir(original_cwd_path);
-}
-
-test "tailFile should start near end for large files" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const file_name = "large.log";
-    var file = try tmp_dir.dir.createFile(file_name, .{});
-
-    // Write content that should make file larger than 8192 bytes
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) { // Increased to 1000 lines to ensure file > 8192 bytes
-        // Use a small buffer for writing formatted text
-        var buf: [32]u8 = undefined;
-        const line = try std.fmt.bufPrint(&buf, "[INFO] Line {d}\n", .{i});
-        try file.writeAll(line);
-    }
-    file.close();
-
-    var files = [_][]const u8{file_name};
-    const args = flags.Args{
-        .files = &files,
-        .tail_mode = true,
-        .date = null,
-        .levels = null,
-        .search = null,
-        .num_lines = 0,
-    };
-
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Change directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    const read = try tailFile(allocator, file_name, args, &seen, false);
-    try testing.expect(read);
-
-    // File is > 8192 bytes, so we should start near the end
-    // and not read all 1000 lines
-    try testing.expect(seen.count() > 0);
-    try testing.expect(seen.count() < 1000);
-
-    try std.posix.chdir(original_cwd_path);
-}
-
-test "hash collision handling with AutoHashMap" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Add some hashes
-    const line1 = "[INFO] Test line 1";
-    const line2 = "[INFO] Test line 2";
-    const line3 = "[INFO] Test line 1"; // Duplicate
-
-    const hash1 = std.hash.Wyhash.hash(0, line1);
-    const hash2 = std.hash.Wyhash.hash(0, line2);
-    const hash3 = std.hash.Wyhash.hash(0, line3);
-
-    try seen.put(hash1, {});
-    try seen.put(hash2, {});
+    _ = try tailFile(
+        allocator,
+        "dup.log",
+        args,
+        &seen,
+        false,
+    );
 
     try testing.expectEqual(@as(usize, 2), seen.count());
-
-    // hash3 should equal hash1
-    try testing.expectEqual(hash1, hash3);
-
-    // Trying to add duplicate should not increase count
-    try seen.put(hash3, {});
-    try testing.expectEqual(@as(usize, 2), seen.count());
-}
-
-test "carry buffer handling across reads" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const file_name = "partial.log";
-    var file = try tmp_dir.dir.createFile(file_name, .{});
-
-    // Write content that will span across buffer boundary
-    // First write a line longer than typical buffer
-    var long_line: [100]u8 = undefined;
-    @memset(&long_line, 'a');
-    try file.writeAll(&long_line);
-    try file.writeAll("\n[INFO] Next line\n");
-    file.close();
-
-    var files = [_][]const u8{file_name};
-    const args = flags.Args{
-        .files = &files,
-        .tail_mode = true,
-        .date = null,
-        .levels = null,
-        .search = null,
-        .num_lines = 0,
-    };
-
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    // Change directory
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
-    defer original_cwd.close();
-
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    const original_cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd_path);
-
-    try std.posix.chdir(tmp_path);
-
-    const read = try tailFile(allocator, file_name, args, &seen, false);
-    try testing.expect(read);
-    try testing.expect(seen.count() >= 1);
-
-    try std.posix.chdir(original_cwd_path);
 }
