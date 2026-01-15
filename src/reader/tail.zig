@@ -31,6 +31,54 @@ pub fn follow(
     }
 }
 
+/// Find the starting position for reading the last n lines
+fn findStartOfLastNLines(file: std.fs.File, n: usize) !u64 {
+    const stat = try file.stat();
+    if (stat.size == 0) return 0;
+
+    const target_lines = n;
+    var lines_found: usize = 0;
+    var pos: u64 = stat.size;
+
+    // Check if file ends with newline
+    if (pos > 0) {
+        try file.seekTo(pos - 1);
+        var last_byte: [1]u8 = undefined;
+        _ = try file.read(&last_byte);
+        if (last_byte[0] == '\n') {
+            // Adjust position to exclude the trailing newline for counting
+            pos -= 1;
+        }
+    }
+
+    var buf: [8192]u8 = undefined;
+
+    // Read backwards from the end until we find target_lines newlines
+    while (pos > 0 and lines_found < target_lines) {
+        const read_size = @min(@as(u64, 8192), pos);
+        pos -= read_size;
+        try file.seekTo(pos);
+        const bytes_read = try file.read(buf[0..read_size]);
+
+        // Scan backwards through the buffer
+        var i: usize = @intCast(bytes_read);
+        while (i > 0 and lines_found < target_lines) {
+            i -= 1;
+            if (buf[i] == '\n') {
+                lines_found += 1;
+                if (lines_found == target_lines) {
+                    // Found the nth newline from the end
+                    // Return position after this newline
+                    return pos + @as(u64, i) + 1;
+                }
+            }
+        }
+    }
+
+    // If we didn't find enough newlines, start from beginning
+    return 0;
+}
+
 /// Tail a single file, optionally following for new content
 fn tailFile(
     allocator: std.mem.Allocator,
@@ -51,11 +99,15 @@ fn tailFile(
     // Get file size
     const stat = try file.stat();
 
-    // If not in follow mode (initial read), start near the end
-    var pos: u64 = if (!follow_mode and stat.size > 8192)
-        stat.size - 8192
-    else
-        0;
+    // Determine starting position
+    var pos: u64 = 0;
+    if (!follow_mode) {
+        // In initial read, show only last 10 lines
+        pos = try findStartOfLastNLines(file, 10);
+    } else {
+        // In follow mode, start at the end of file
+        pos = stat.size;
+    }
 
     // Seek to position
     try file.seekTo(pos);
