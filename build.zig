@@ -86,6 +86,21 @@ pub fn build(b: *std.Build) void {
     const run_formats_tests = b.addRunArtifact(formats_tests);
     test_step.dependOn(&run_formats_tests.step);
 
+    // Create tail mode test module with flags dependency
+    const tail_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/reader/tail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    tail_test_mod.addImport("../flags/flags.zig", flags_mod);
+
+    const tail_tests = b.addTest(.{
+        .root_module = tail_test_mod,
+    });
+    const run_tail_tests = b.addRunArtifact(tail_tests);
+    test_step.dependOn(&run_tail_tests.step);
+
     // Add a check step to verify the code compiles without building.
     // This is useful for CI/CD pipelines.
     const check = b.step("check", "Check if code compiles");
