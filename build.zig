@@ -38,7 +38,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zlrd");
     run_step.dependOn(&run_cmd.step);
 
-    // Add unit tests for the flags module.
+    // Create test step
+    const test_step = b.step("test", "Run unit tests");
+
+    // Test flags module (standalone, no dependencies)
     const flags_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/flags/flags.zig"),
@@ -46,11 +49,42 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-
     const run_flags_tests = b.addRunArtifact(flags_tests);
-
-    const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_flags_tests.step);
+
+    // Test simd module (standalone, no dependencies)
+    const simd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/reader/simd.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_simd_tests = b.addRunArtifact(simd_tests);
+    test_step.dependOn(&run_simd_tests.step);
+
+    // Test formats module (needs flags as dependency)
+    // Create flags module for import
+    const flags_mod = b.createModule(.{
+        .root_source_file = b.path("src/flags/flags.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Create formats test module with flags dependency
+    const formats_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/reader/formats.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    formats_test_mod.addImport("../flags/flags.zig", flags_mod);
+
+    const formats_tests = b.addTest(.{
+        .root_module = formats_test_mod,
+    });
+    const run_formats_tests = b.addRunArtifact(formats_tests);
+    test_step.dependOn(&run_formats_tests.step);
 
     // Add a check step to verify the code compiles without building.
     // This is useful for CI/CD pipelines.

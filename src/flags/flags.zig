@@ -22,7 +22,7 @@ pub fn allLevelsMask() LevelMask {
 }
 
 /// Returns a bitmask with a single bit set for the given level.
-inline fn levelBit(l: Level) LevelMask {
+pub inline fn levelBit(l: Level) LevelMask {
     const shift: u3 = @intCast(@intFromEnum(l));
     return @as(LevelMask, 1) << shift;
 }
@@ -311,7 +311,9 @@ fn addLevels(mask: *?LevelMask, value: []const u8) ParseError!void {
     mask.* = new_mask;
 }
 
-/// Tests
+// ============================================================================
+// Unit Tests
+// ============================================================================
 const testing = std.testing;
 
 /// Iterator for testing

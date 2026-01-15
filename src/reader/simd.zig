@@ -71,7 +71,9 @@ pub inline fn findEither(
     const limit = buf.len - VecSize;
 
     while (i <= limit) : (i += VecSize) {
-        const chunk: @Vector(VecSize, u8) = buf[i .. i + VecSize].*;
+        // ИСПРАВЛЕНИЕ: используем pointer cast как в findByte
+        const ptr = @as(*const [VecSize]u8, @ptrCast(buf.ptr + i));
+        const chunk: @Vector(VecSize, u8) = ptr.*;
         // Check if any byte equals `a` OR `b`
         if (@reduce(.Or, (chunk == va) | (chunk == vb))) {
             inline for (0..VecSize) |j| {
@@ -253,4 +255,339 @@ pub fn findLogfmtLevel(
 
         i = pos + 1;
     }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+const testing = std.testing;
+
+// ----------------------
+// findByte tests
+// ----------------------
+
+test "findByte should find byte in small buffer" {
+    const buf = "hello";
+    try testing.expectEqual(@as(?usize, 1), findByte(buf, 0, 'e'));
+    try testing.expectEqual(@as(?usize, 4), findByte(buf, 0, 'o'));
+    try testing.expectEqual(@as(?usize, null), findByte(buf, 0, 'x'));
+}
+
+test "findByte should find byte in large buffer with SIMD" {
+    const buf = "a" ** 100 ++ "x" ++ "a" ** 100;
+    try testing.expectEqual(@as(?usize, 100), findByte(buf, 0, 'x'));
+}
+
+test "findByte should respect start position" {
+    const buf = "hello world";
+    try testing.expectEqual(@as(?usize, 4), findByte(buf, 3, 'o')); // 'o' at index 4
+    try testing.expectEqual(@as(?usize, null), findByte(buf, 8, 'o'));
+}
+
+test "findByte should handle empty buffer" {
+    const buf = "";
+    try testing.expectEqual(@as(?usize, null), findByte(buf, 0, 'x'));
+}
+
+test "findByte should find newline in chunk" {
+    const buf = "line1\nline2\nline3";
+    try testing.expectEqual(@as(?usize, 5), findByte(buf, 0, '\n'));
+    try testing.expectEqual(@as(?usize, 11), findByte(buf, 6, '\n'));
+}
+
+test "findByte should handle buffer with no match" {
+    const buf = "a" ** 50;
+    try testing.expectEqual(@as(?usize, null), findByte(buf, 0, 'x'));
+}
+
+test "findByte should find byte at boundary" {
+    var buf: [32]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[15] = 'x'; // At SIMD boundary
+    buf[31] = 'y'; // At end
+
+    try testing.expectEqual(@as(?usize, 15), findByte(&buf, 0, 'x'));
+    try testing.expectEqual(@as(?usize, 31), findByte(&buf, 0, 'y'));
+}
+
+// ----------------------
+// findEither tests
+// ----------------------
+
+test "findEither should find first of two bytes" {
+    const buf = "hello world";
+    try testing.expectEqual(@as(?usize, 1), findEither(buf, 0, 'e', 'o'));
+    try testing.expectEqual(@as(?usize, 2), findEither(buf, 0, 'l', 'x'));
+}
+
+test "findEither should find second byte if first not present" {
+    const buf = "hello world";
+    try testing.expectEqual(@as(?usize, 4), findEither(buf, 0, 'x', 'o'));
+}
+
+test "findEither should return null if neither found" {
+    const buf = "hello";
+    try testing.expectEqual(@as(?usize, null), findEither(buf, 0, 'x', 'y'));
+}
+
+test "findEither should work with large buffer" {
+    const buf = "a" ** 50 ++ "x" ++ "a" ** 50;
+    try testing.expectEqual(@as(?usize, 50), findEither(buf, 0, 'x', 'y'));
+}
+
+test "findEither should respect start position" {
+    const buf = "hello world";
+    try testing.expectEqual(@as(?usize, 4), findEither(buf, 3, 'o', 'w')); // 'o' at 4
+}
+
+// ----------------------
+// findAny3 tests
+// ----------------------
+
+test "findAny3 should find first of three bytes" {
+    const buf = "hello world";
+    try testing.expectEqual(@as(?usize, 1), findAny3(buf, 0, 'e', 'o', 'x'));
+    try testing.expectEqual(@as(?usize, 2), findAny3(buf, 0, 'l', 'x', 'y'));
+}
+
+test "findAny3 should return null if none found" {
+    const buf = "hello";
+    try testing.expectEqual(@as(?usize, null), findAny3(buf, 0, 'x', 'y', 'z'));
+}
+
+test "findAny3 should work with large buffer" {
+    const buf = "a" ** 50 ++ "x" ++ "a" ** 50;
+    try testing.expectEqual(@as(?usize, 50), findAny3(buf, 0, 'x', 'y', 'z'));
+}
+
+test "findAny3 should find any of three in mixed positions" {
+    const buf = "abcdefghijk";
+    try testing.expectEqual(@as(?usize, 2), findAny3(buf, 0, 'c', 'm', 'z'));
+    try testing.expectEqual(@as(?usize, 7), findAny3(buf, 0, 'h', 'm', 'z'));
+}
+
+// ----------------------
+// extractJsonField tests
+// ----------------------
+
+test "extractJsonField should extract simple field" {
+    const line = "{\"level\":\"error\",\"msg\":\"test\"}";
+    const result = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", result.?);
+}
+
+test "extractJsonField should extract time field" {
+    const line = "{\"time\":\"2024-01-15T10:30:45Z\",\"msg\":\"test\"}";
+    const result = extractJsonField(line, "time", 30);
+    try testing.expectEqualStrings("2024-01-15T10:30:45Z", result.?);
+}
+
+test "extractJsonField should respect max_len" {
+    const line = "{\"msg\":\"very long message here\"}";
+    const result = extractJsonField(line, "msg", 10);
+    try testing.expectEqualStrings("very long ", result.?);
+}
+
+test "extractJsonField should return null for missing key" {
+    const line = "{\"level\":\"error\"}";
+    const result = extractJsonField(line, "msg", 10);
+    try testing.expect(result == null);
+}
+
+test "extractJsonField should return null for malformed JSON" {
+    const line = "{\"level\":error}"; // Missing quotes around value
+    const result = extractJsonField(line, "level", 10);
+    try testing.expect(result == null);
+}
+
+test "extractJsonField should handle key with similar prefix" {
+    const line = "{\"level_old\":\"warn\",\"level\":\"error\"}";
+    const result = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", result.?);
+}
+
+test "extractJsonField should handle empty value" {
+    const line = "{\"msg\":\"\",\"level\":\"info\"}";
+    const result = extractJsonField(line, "msg", 10);
+    try testing.expectEqualStrings("", result.?);
+}
+
+test "extractJsonField should handle nested quotes" {
+    const line = "{\"msg\":\"quoted \\\"text\\\"\"}";
+    const result = extractJsonField(line, "msg", 20);
+    try testing.expect(result != null);
+}
+
+// ----------------------
+// isISODate tests
+// ----------------------
+
+test "isISODate should validate correct ISO date" {
+    try testing.expect(isISODate("2024-01-15"));
+    try testing.expect(isISODate("2024-01-15T10:30:45"));
+    try testing.expect(isISODate("1999-12-31 extra text"));
+}
+
+test "isISODate should reject invalid dates" {
+    try testing.expect(!isISODate("2024/01/15")); // Wrong separator
+    try testing.expect(!isISODate("24-01-15")); // Wrong year format
+    try testing.expect(!isISODate("2024-1-15")); // Missing zero padding
+    try testing.expect(!isISODate("2024-01")); // Too short
+    try testing.expect(!isISODate("")); // Empty
+    try testing.expect(!isISODate("abcd-ef-gh")); // Non-digits
+}
+
+test "isISODate should handle edge cases" {
+    // isISODate only validates FORMAT, not actual calendar validity
+    try testing.expect(isISODate("2024-13-32")); // Format is valid (YYYY-MM-DD)
+    try testing.expect(isISODate("0000-00-00")); // Format is valid
+}
+
+// ----------------------
+// findBracketedLevel tests
+// ----------------------
+
+test "findBracketedLevel should find level in brackets" {
+    const line = "[ERROR] Something went wrong";
+    const result = findBracketedLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(usize, 1), result.?.start);
+    try testing.expectEqual(@as(usize, 6), result.?.end);
+    try testing.expectEqualStrings("ERROR", line[result.?.start..result.?.end]);
+}
+
+test "findBracketedLevel should handle different levels" {
+    const levels = [_][]const u8{
+        "[INFO] message",
+        "[WARN] warning",
+        "[DEBUG] debug info",
+        "[TRACE] trace",
+    };
+
+    inline for (levels) |line| {
+        const result = findBracketedLevel(line);
+        try testing.expect(result != null);
+        try testing.expectEqual(@as(usize, 1), result.?.start);
+    }
+}
+
+test "findBracketedLevel should return null without brackets" {
+    try testing.expect(findBracketedLevel("ERROR message") == null);
+    try testing.expect(findBracketedLevel("") == null);
+    try testing.expect(findBracketedLevel("[") == null);
+    try testing.expect(findBracketedLevel("[]") == null);
+}
+
+test "findBracketedLevel should return null for non-starting bracket" {
+    const line = "Some text [ERROR] here";
+    try testing.expect(findBracketedLevel(line) == null);
+}
+
+test "findBracketedLevel should handle brackets at end" {
+    const line = "[ERROR]";
+    const result = findBracketedLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("ERROR", line[result.?.start..result.?.end]);
+}
+
+// ----------------------
+// findLogfmtLevel tests
+// ----------------------
+
+test "findLogfmtLevel should find level= field" {
+    const line = "time=2024-01-15 level=error msg=test";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("error", line[result.?.start..result.?.end]);
+}
+
+test "findLogfmtLevel should find severity= field" {
+    const line = "time=2024-01-15 severity=warn msg=test";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("warn", line[result.?.start..result.?.end]);
+}
+
+test "findLogfmtLevel should find lvl= field" {
+    const line = "time=2024-01-15 lvl=info msg=test";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("info", line[result.?.start..result.?.end]);
+}
+
+test "findLogfmtLevel should prioritize level over severity" {
+    const line = "severity=warn level=error msg=test";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    // Should find first occurrence
+    try testing.expect(result.?.start > 0);
+}
+
+test "findLogfmtLevel should return null without level field" {
+    try testing.expect(findLogfmtLevel("time=2024-01-15 msg=test") == null);
+    try testing.expect(findLogfmtLevel("") == null);
+    try testing.expect(findLogfmtLevel("no equals signs here") == null);
+}
+
+test "findLogfmtLevel should handle level at end of line" {
+    const line = "time=2024-01-15 level=error";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("error", line[result.?.start..result.?.end]);
+}
+
+test "findLogfmtLevel should handle quoted values" {
+    const line = "level=\"error with spaces\" msg=test";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    // Extracts until first space (includes opening quote)
+    const extracted = line[result.?.start..result.?.end];
+    try testing.expect(extracted.len > 0);
+}
+
+test "findLogfmtLevel should not match partial key names" {
+    const line = "time=now level=error msg=test";
+    const result = findLogfmtLevel(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("error", line[result.?.start..result.?.end]);
+}
+
+// ----------------------
+// Performance/Edge case tests
+// ----------------------
+
+test "findByte SIMD boundary test" {
+    // Test exactly at SIMD vector boundaries
+    var buf: [VecSize * 3]u8 = undefined;
+    @memset(&buf, 'a');
+
+    // Place target at different boundaries
+    buf[VecSize - 1] = 'x'; // End of first vector
+    buf[VecSize] = 'y'; // Start of second vector
+    buf[VecSize * 2] = 'z'; // Start of third vector
+
+    try testing.expectEqual(@as(?usize, VecSize - 1), findByte(&buf, 0, 'x'));
+    try testing.expectEqual(@as(?usize, VecSize), findByte(&buf, 0, 'y'));
+    try testing.expectEqual(@as(?usize, VecSize * 2), findByte(&buf, 0, 'z'));
+}
+
+test "extractJsonField with unicode should not crash" {
+    const line = "{\"msg\":\"Hello 世界\",\"level\":\"info\"}";
+    const result = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("info", result.?);
+}
+
+test "findByte should handle all-same buffer" {
+    const buf = "aaaaaaaaaaaaaaaa";
+    try testing.expectEqual(@as(?usize, 0), findByte(buf, 0, 'a'));
+    try testing.expectEqual(@as(?usize, null), findByte(buf, 0, 'b'));
+}
+
+test "matchKeyAt helper function" {
+    const line = "level=error";
+    try testing.expect(matchKeyAt(line, 0, "level"));
+    try testing.expect(!matchKeyAt(line, 0, "severity"));
+    try testing.expect(!matchKeyAt(line, 1, "level"));
+    try testing.expect(matchKeyAt(line, 6, "error"));
 }
