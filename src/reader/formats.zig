@@ -4,6 +4,69 @@
 const std = @import("std");
 const flags = @import("../flags/flags.zig");
 const simd = @import("simd.zig");
+/// Cached analysis of a log line.
+const LineInfo = struct {
+    /// Format type of the line.
+    format: enum {
+        json,
+        plain_bracketed,
+        plain_logfmt,
+        plain_unknown,
+    },
+    /// Extracted log level, if any.
+    level: ?flags.Level,
+    /// Position of the level value within the line for coloring.
+    level_pos: ?LevelPos,
+    /// Extracted date prefix (YYYY-MM-DD), if any.
+    date: ?[]const u8,
+    /// Whether the line starts with '{' (JSON).
+    is_json: bool,
+    /// Whether the line starts with '[' (bracketed level).
+    starts_with_bracket: bool,
+};
+
+/// Analyze a line once and cache the results.
+fn analyzeLine(line: []const u8) LineInfo {
+    var info: LineInfo = .{
+        .format = .plain_unknown,
+        .level = null,
+        .level_pos = null,
+        .date = null,
+        .is_json = false,
+        .starts_with_bracket = false,
+    };
+
+    if (line.len == 0) return info;
+
+    info.is_json = line[0] == '{';
+    info.starts_with_bracket = line[0] == '[';
+
+    // Extract date
+    info.date = extractDate(line);
+
+    // Determine format and extract level
+    if (info.is_json) {
+        info.format = .json;
+        if (simd.extractJsonField(line, "level", 16)) |v| {
+            info.level = parseLevelInsensitive(v);
+            if (extractJsonLevelPos(line)) |pos| {
+                info.level_pos = pos;
+            }
+        }
+    } else if (info.starts_with_bracket) {
+        info.format = .plain_bracketed;
+        if (simd.findBracketedLevel(line)) |r| {
+            info.level = parseLevelInsensitive(line[r.start..r.end]);
+            info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+        }
+    } else if (simd.findLogfmtLevel(line)) |r| {
+        info.format = .plain_logfmt;
+        info.level = parseLevelInsensitive(line[r.start..r.end]);
+        info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+    }
+
+    return info;
+}
 
 /// ANSI color codes for terminal output.
 const Color = struct {
@@ -21,6 +84,12 @@ const Color = struct {
     pub const number = "\x1b[38;5;214m";
     pub const boolean = "\x1b[38;5;135m";
     pub const nullv = "\x1b[38;5;244m";
+};
+
+/// Position of a level value within a line.
+const LevelPos = struct {
+    start: usize,
+    end: usize,
 };
 
 /// Inclusive date range for filtering.
@@ -50,9 +119,12 @@ const FilterState = struct {
     }
 
     /// Check whether a line passes all active filters.
-    /// Returns the extracted level if the line matches, `null` otherwise.
-    fn checkLine(self: FilterState, line: []const u8, args: flags.Args) ?flags.Level {
+    /// Returns cached line analysis if the line matches, `null` otherwise.
+    fn checkLine(self: FilterState, line: []const u8, args: flags.Args) ?LineInfo {
         if (line.len == 0) return null;
+
+        // Analyze line once and cache the results
+        const info = analyzeLine(line);
 
         // Search filter check
         if (self.has_search_filter) {
@@ -60,21 +132,18 @@ const FilterState = struct {
         }
 
         // Level filter check
-        var lvl: ?flags.Level = null;
-
         if (self.has_level_filter) {
-            lvl = extractLevel(line);
-            const l = lvl orelse return null;
-            if (!args.isLevelEnabled(l)) return null;
+            const lvl = info.level orelse return null;
+            if (!args.isLevelEnabled(lvl)) return null;
         }
 
         // Date filter check
         if (self.has_date_filter) {
-            if (!matchDateRange(line, self.date_range)) return null;
+            if (!matchDateRangeWithDate(info.date, self.date_range)) return null;
         }
 
-        // Return level (extract it now if we haven't already)
-        return if (lvl) |l| l else extractLevel(line);
+        // Return cached analysis
+        return info;
     }
 };
 
@@ -139,12 +208,18 @@ fn parseDateRange(s: []const u8) DateRange {
 /// The comparison is lexicographic, which works for ISO‑8601 dates.
 fn matchDateRange(line: []const u8, range: DateRange) bool {
     const date = extractDate(line) orelse return false;
+    return matchDateRangeWithDate(date, range);
+}
+
+/// Test whether a pre‑extracted date lies within `range`.
+fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
+    const d = date orelse return false;
 
     if (range.from) |from| {
-        if (std.mem.order(u8, date, from) == .lt) return false;
+        if (std.mem.order(u8, d, from) == .lt) return false;
     }
     if (range.to) |to| {
-        if (std.mem.order(u8, date, to) == .gt) return false;
+        if (std.mem.order(u8, d, to) == .gt) return false;
     }
 
     return true;
@@ -253,8 +328,8 @@ fn readContinuous(
             const line = slice[start..nl];
             stats.lines_read += 1;
 
-            if (filter_state.checkLine(line, args)) |lvl| {
-                printStyledLine(line, lvl);
+            if (filter_state.checkLine(line, args)) |info| {
+                printStyledLine(line, info);
                 stats.lines_matched += 1;
             }
 
@@ -271,8 +346,8 @@ fn readContinuous(
 
     // Process final line if exists
     if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items, args)) |lvl| {
-            printStyledLine(carry.items, lvl);
+        if (filter_state.checkLine(carry.items, args)) |info| {
+            printStyledLine(carry.items, info);
         }
     }
 }
@@ -316,8 +391,8 @@ fn readWithPagination(
             const nl = simd.findByte(slice, pos, '\n') orelse break;
             const line = slice[start..nl];
 
-            if (filter_state.checkLine(line, args)) |lvl| {
-                printStyledLine(line, lvl);
+            if (filter_state.checkLine(line, args)) |info| {
+                printStyledLine(line, info);
                 shown += 1;
                 batch += 1;
 
@@ -379,7 +454,7 @@ fn matchWord(line: []const u8, pos: usize, comptime word: []const u8) bool {
 
 /// Locate the JSON `"level"` value and return its byte range (without quotes).
 /// Used for coloring the level value inside a JSON line.
-fn extractJsonLevelPos(line: []const u8) ?struct { start: usize, end: usize } {
+fn extractJsonLevelPos(line: []const u8) ?LevelPos {
     var i: usize = 0;
 
     while (true) {
@@ -403,7 +478,7 @@ fn extractJsonLevelPos(line: []const u8) ?struct { start: usize, end: usize } {
     const start = i + 1;
     const end = simd.findByte(line, start, '"') orelse return null;
 
-    return .{ .start = start, .end = end };
+    return LevelPos{ .start = start, .end = end };
 }
 
 /// Parse a level string case‑insensitively.
@@ -416,26 +491,26 @@ inline fn parseLevelInsensitive(s: []const u8) ?flags.Level {
 }
 
 /// Print a line with appropriate styling based on its format and extracted level.
-fn printStyledLine(line: []const u8, lvl: ?flags.Level) void {
+fn printStyledLine(line: []const u8, info: LineInfo) void {
     if (line.len == 0) return;
 
-    if (line[0] == '{') {
-        printJsonStyled(line, lvl);
-    } else if (lvl) |l| {
-        printPlainTextWithLevel(line, l);
+    if (info.is_json) {
+        printJsonStyled(line, info);
+    } else if (info.level) |_| {
+        printPlainTextWithLevel(line, info);
     } else {
         std.debug.print("{s}\n", .{line});
     }
 }
 
 /// Buffered version of printStyledLine
-fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, lvl: ?flags.Level) !void {
+fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
     if (line.len == 0) return;
 
-    if (line[0] == '{') {
-        try printJsonStyledBuffered(output, line, lvl);
-    } else if (lvl) |l| {
-        try printPlainTextWithLevelBuffered(output, line, l);
+    if (info.is_json) {
+        try printJsonStyledBuffered(output, line, info);
+    } else if (info.level) |_| {
+        try printPlainTextWithLevelBuffered(output, line, info);
     } else {
         try output.print("{s}\n", .{line});
     }
@@ -443,11 +518,11 @@ fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, lvl: ?flags.
 
 /// Print a plain‑text line with a colored level.
 /// If the level appears inside brackets, only the bracketed part is colored.
-fn printPlainTextWithLevel(line: []const u8, level: flags.Level) void {
-    const color = levelColor(level);
+fn printPlainTextWithLevel(line: []const u8, info: LineInfo) void {
+    const color = levelColor(info.level.?);
 
-    // [LEVEL] format
-    if (simd.findBracketedLevel(line)) |r| {
+    // Use cached level position if available
+    if (info.level_pos) |r| {
         if (r.start > 0) {
             std.debug.print("{s}", .{line[0..r.start]});
         }
@@ -462,48 +537,16 @@ fn printPlainTextWithLevel(line: []const u8, level: flags.Level) void {
         return;
     }
 
-    // logfmt: level= / severity= / lvl=
-    if (simd.findLogfmtLevel(line)) |r| {
-        if (r.start > 0) {
-            std.debug.print("{s}", .{line[0..r.start]});
-        }
-        std.debug.print(
-            "{s}{s}{s}{s}",
-            .{ Color.bold, color, line[r.start..r.end], Color.reset },
-        );
-        if (r.end < line.len) {
-            std.debug.print("{s}", .{line[r.end..]});
-        }
-        std.debug.print("\n", .{});
-        return;
-    }
-
-    // fallback: no level detected → print as-is
+    // fallback: no level position cached → print as-is
     std.debug.print("{s}\n", .{line});
 }
 
 /// Buffered version of printPlainTextWithLevel
-fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, level: flags.Level) !void {
-    const color = levelColor(level);
+fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
+    const color = levelColor(info.level.?);
 
-    // [LEVEL] format
-    if (simd.findBracketedLevel(line)) |r| {
-        if (r.start > 0) {
-            try output.print("{s}", .{line[0..r.start]});
-        }
-        try output.print(
-            "{s}{s}{s}{s}",
-            .{ Color.bold, color, line[r.start..r.end], Color.reset },
-        );
-        if (r.end < line.len) {
-            try output.print("{s}", .{line[r.end..]});
-        }
-        try output.print("\n", .{});
-        return;
-    }
-
-    // logfmt: level= / severity= / lvl=
-    if (simd.findLogfmtLevel(line)) |r| {
+    // Use cached level position if available
+    if (info.level_pos) |r| {
         if (r.start > 0) {
             try output.print("{s}", .{line[0..r.start]});
         }
@@ -524,9 +567,7 @@ fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, leve
 
 /// Print a JSON line with syntax‑highlighted keys, strings, numbers, and booleans.
 /// The `"level"` value is additionally colored according to its severity.
-fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
-    const level_pos = if (lvl != null) extractJsonLevelPos(line) else null;
-
+fn printJsonStyled(line: []const u8, info: LineInfo) void {
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
@@ -544,11 +585,11 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
                 const str = line[str_start..i];
 
                 // level value
-                if (level_pos) |lp| {
+                if (info.level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
                         std.debug.print(
                             "{s}{s}\"{s}\"{s}",
-                            .{ Color.bold, levelColor(lvl.?), str, Color.reset },
+                            .{ Color.bold, levelColor(info.level.?), str, Color.reset },
                         );
                         i += 1;
                         continue;
@@ -629,9 +670,7 @@ fn printJsonStyled(line: []const u8, lvl: ?flags.Level) void {
 }
 
 /// Buffered version of printJsonStyled
-fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, lvl: ?flags.Level) !void {
-    const level_pos = if (lvl != null) extractJsonLevelPos(line) else null;
-
+fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
@@ -647,11 +686,11 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, lvl: ?flags.
                 in_string = false;
                 const str = line[str_start..i];
 
-                if (level_pos) |lp| {
+                if (info.level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
                         try output.print(
                             "{s}{s}\"{s}\"{s}",
-                            .{ Color.bold, levelColor(lvl.?), str, Color.reset },
+                            .{ Color.bold, levelColor(info.level.?), str, Color.reset },
                         );
                         i += 1;
                         continue;
@@ -794,8 +833,8 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
 /// Filter and print a single line according to the given arguments.
 pub fn handleLine(line: []const u8, args: flags.Args) void {
     const filter_state = FilterState.init(args);
-    if (filter_state.checkLine(line, args)) |lvl| {
-        printStyledLine(line, lvl);
+    if (filter_state.checkLine(line, args)) |info| {
+        printStyledLine(line, info);
     }
 }
 
@@ -981,7 +1020,7 @@ test "FilterState.checkLine should filter by level" {
     const state = FilterState.init(args);
 
     const error_line = "[ERROR] Something went wrong";
-    try std.testing.expectEqual(flags.Level.Error, state.checkLine(error_line, args).?);
+    try std.testing.expectEqual(flags.Level.Error, state.checkLine(error_line, args).?.level.?);
 
     const info_line = "[INFO] Everything is fine";
     try std.testing.expect(state.checkLine(info_line, args) == null);
