@@ -102,7 +102,8 @@ const DateRange = struct {
 
 /// Accumulated filter state derived from command-line arguments.
 /// Built once per file/session; `checkLine` uses only this struct.
-const FilterState = struct {
+/// Public so that tail.zig can build it once and reuse it across lines.
+pub const FilterState = struct {
     has_date_filter: bool,
     date_range: DateRange,
     has_level_filter: bool,
@@ -112,11 +113,10 @@ const FilterState = struct {
     search_expr: ?[]const u8,
 
     /// Build filter state from parsed command-line arguments.
-    fn init(args: flags.Args) FilterState {
+    pub fn init(args: flags.Args) FilterState {
         const has_date = !args.tail_mode and args.date != null;
         return .{
             .has_date_filter = has_date,
-            // FIX: was `undefined` when has_date=false — potential UB if ever read.
             .date_range = if (has_date) parseDateRange(args.date.?) else .{ .from = null, .to = null },
             .has_level_filter = args.levels != null,
             .enabled_levels = args.levels,
@@ -127,8 +127,7 @@ const FilterState = struct {
 
     /// Check whether a line passes all active filters.
     /// Returns cached line analysis if the line matches, `null` otherwise.
-    /// FIX: no longer takes `args` — all needed state is cached in FilterState.
-    fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
+    pub fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
         if (line.len == 0) return null;
 
         // Analyze once; results are reused by all filters and by the printer.
@@ -151,6 +150,14 @@ const FilterState = struct {
         }
 
         return info;
+    }
+
+    /// Filter and print a single line.
+    /// Used by tail.zig so it doesn't need to import LineInfo or printStyledLine.
+    pub fn printIfMatch(self: FilterState, line: []const u8) void {
+        if (self.checkLine(line)) |info| {
+            printStyledLine(line, info);
+        }
     }
 };
 
