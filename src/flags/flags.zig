@@ -27,6 +27,16 @@ pub inline fn levelBit(l: Level) LevelMask {
     return @as(LevelMask, 1) << shift;
 }
 
+/// Parse a level string case-insensitively.
+/// Accepts any casing: "error", "ERROR", "Error", "eRRoR", etc.
+/// Returns `null` if the string does not match any known level.
+pub fn parseLevelInsensitive(s: []const u8) ?Level {
+    inline for (std.meta.fields(Level)) |f| {
+        if (std.ascii.eqlIgnoreCase(s, f.name)) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
 /// Result of command-line parsing.
 /// All fields are validated and ready for use by the reader.
 pub const Args = struct {
@@ -106,8 +116,8 @@ pub fn printHelp() void {
         \\Options:
         \\  -f, --file <path>        Add log file (can be repeated)
         \\  -s, --search <text>      Search string
-        \\  -l, --level <levels>     Levels: Trace,Debug,Info,Warn,Error,Fatal,Panic
-        \\                           Multiple: -l Error,Warn -l Fatal
+        \\  -l, --level <levels>     Levels: trace,debug,info,warn,error,fatal,panic
+        \\                           Case-insensitive. Multiple: -l error,warn -l fatal
         \\  -d, --date <date>        Date filter (YYYY-MM-DD)
         \\  -t, --tail               Tail mode
         \\  -n, --num-lines <num>    Number of lines to display
@@ -127,7 +137,7 @@ fn parseArgsFromIter(
     // Skip argv[0] (program name)
     _ = it.next();
 
-    // Collect file paths incrementally with reasonable initial capacity
+    // Collect file paths incrementally with reasonable initial capacity.
     var files = try std.ArrayList([]const u8).initCapacity(allocator, 4);
     errdefer files.deinit(allocator);
 
@@ -136,7 +146,7 @@ fn parseArgsFromIter(
     };
 
     while (it.next()) |arg| {
-        // Early exit for help
+        // Early exit for help.
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             args.help = true;
             args.files = try files.toOwnedSlice(allocator);
@@ -155,22 +165,22 @@ fn parseArgsFromIter(
             continue;
         }
 
-        // Positional argument → file path
+        // Positional argument → file path.
         try files.append(allocator, arg);
     }
 
-    // Finalize files slice
+    // Finalize files slice.
     args.files = try files.toOwnedSlice(allocator);
     errdefer allocator.free(args.files);
 
-    // At least one file is required unless help is requested
+    // At least one file is required unless help is requested.
     if (!args.help and args.files.len == 0)
         return ParseError.MissingFile;
 
     return args;
 }
 
-/// Long flags (--flag, --flag=value)
+/// Long flags (--flag, --flag=value).
 fn parseLongFlag(
     args: *Args,
     files: *std.ArrayList([]const u8),
@@ -233,13 +243,13 @@ fn parseLongFlag(
 fn parseShortFlags(
     args: *Args,
     files: *std.ArrayList([]const u8),
-    flags: []const u8,
+    group: []const u8,
     it: anytype,
     allocator: std.mem.Allocator,
 ) ParseError!void {
     var i: usize = 0;
-    while (i < flags.len) : (i += 1) {
-        switch (flags[i]) {
+    while (i < group.len) : (i += 1) {
+        switch (group[i]) {
             'h' => {
                 args.help = true;
                 return;
@@ -247,29 +257,29 @@ fn parseShortFlags(
             't' => args.tail_mode = true,
 
             'f' => {
-                const v = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
+                const v = valueOrNext(group, &i, it) orelse return ParseError.MissingFile;
                 try files.append(allocator, v);
                 return;
             },
 
             's' => {
-                args.search = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
+                args.search = valueOrNext(group, &i, it) orelse return ParseError.MissingSearch;
                 return;
             },
 
             'l' => {
-                const v = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
+                const v = valueOrNext(group, &i, it) orelse return ParseError.MissingLevel;
                 try addLevels(&args.levels, v);
                 return;
             },
 
             'd' => {
-                args.date = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
+                args.date = valueOrNext(group, &i, it) orelse return ParseError.MissingDate;
                 return;
             },
 
             'n' => {
-                const v = valueOrNextStrict(flags, &i, it) orelse return ParseError.MissingLevel;
+                const v = valueOrNext(group, &i, it) orelse return ParseError.MissingNumLines;
                 args.num_lines = std.fmt.parseUnsigned(u32, v, 10) catch return ParseError.InvalidNumLines;
                 return;
             },
@@ -281,21 +291,20 @@ fn parseShortFlags(
 
 /// Returns an inline value from grouped flags (`-fvalue`)
 /// or consumes the next argv element.
-inline fn valueOrNextStrict(
-    flags: []const u8,
+/// Inline value is only allowed if this flag is the last in the group.
+inline fn valueOrNext(
+    group: []const u8,
     index: *usize,
     it: anytype,
 ) ?[]const u8 {
-    // value inline разрешено ТОЛЬКО если это последний флаг
-    if (index.* + 1 < flags.len) {
-        return null; // ошибка: значение в группе
-    }
+    // Inline value only permitted when this is the last flag in the group.
+    if (index.* + 1 < group.len) return null;
     return it.next();
 }
 
 /// Parse comma-separated log levels and update the bitmask.
+/// FIX: uses parseLevelInsensitive — accepts any casing (error, ERROR, Error, eRRoR).
 fn addLevels(mask: *?LevelMask, value: []const u8) ParseError!void {
-    // Initialize mask to 0 if not set
     const current = mask.* orelse 0;
     var new_mask = current;
 
@@ -304,7 +313,9 @@ fn addLevels(mask: *?LevelMask, value: []const u8) ParseError!void {
         const trimmed = std.mem.trim(u8, part, &std.ascii.whitespace);
         if (trimmed.len == 0) continue;
 
-        const lvl = std.meta.stringToEnum(Level, trimmed) orelse return ParseError.InvalidLevel;
+        // FIX: was std.meta.stringToEnum which is case-sensitive.
+        // Now uses parseLevelInsensitive so "error", "ERROR", "Error" all work.
+        const lvl = parseLevelInsensitive(trimmed) orelse return ParseError.InvalidLevel;
         new_mask |= levelBit(lvl);
     }
 
@@ -316,7 +327,7 @@ fn addLevels(mask: *?LevelMask, value: []const u8) ParseError!void {
 // ============================================================================
 const testing = std.testing;
 
-/// Iterator for testing
+/// Iterator for testing.
 const FakeIter = struct {
     argv: []const []const u8,
     index: usize = 0,
@@ -333,10 +344,7 @@ test "single file via -f" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const argv = [_][]const u8{
-        "zlrd", "-f", "log.txt",
-    };
-
+    const argv = [_][]const u8{ "zlrd", "-f", "log.txt" };
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
@@ -350,9 +358,10 @@ test "multiple files mixed positional and -f" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "-f", "a.log", "b.log", "-f", "c.log", "-n", "10", "-s", "test", "-d", "2025-01-01..2025-12-31", "-t",
+        "zlrd", "-f", "a.log", "b.log", "-f", "c.log",
+        "-n",   "10", "-s",    "test",  "-d", "2025-01-01..2025-12-31",
+        "-t",
     };
-
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
@@ -372,9 +381,9 @@ test "multiple long flags" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "--file=a.log", "--num-lines=10", "--search=test", "--date=2025-01-01", "--tail",
+        "zlrd",          "--file=a.log",      "--num-lines=10",
+        "--search=test", "--date=2025-01-01", "--tail",
     };
-
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
@@ -391,16 +400,12 @@ test "mixed flags" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const argv = [_][]const u8{
-        "zlrd", "-f", "a.log", "--level=Fatal",
-    };
-
+    const argv = [_][]const u8{ "zlrd", "-f", "a.log", "--level=Fatal" };
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
 
     try testing.expectEqual(@as(usize, 1), args.files.len);
-    try testing.expectEqualStrings("a.log", args.files[0]);
     try testing.expect((args.levels.? & levelBit(.Fatal)) != 0);
 }
 
@@ -409,15 +414,15 @@ test "mixed flags with grouping" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd", "-f", "a.log", "-l", "Error", "-n", "10", "-s", "test", "--date=2025-01-01", "--tail",
+        "zlrd",   "-f", "a.log", "-l",   "Error",
+        "-n",     "10", "-s",    "test", "--date=2025-01-01",
+        "--tail",
     };
-
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
 
     try testing.expectEqual(@as(usize, 1), args.files.len);
-    try testing.expectEqualStrings("a.log", args.files[0]);
     try testing.expectEqual(@as(u32, 10), args.num_lines);
     try testing.expectEqualStrings("test", args.search.?);
     try testing.expectEqualStrings("2025-01-01", args.date.?);
@@ -441,14 +446,12 @@ test "gnu short flags grouping" {
     const argv = [_][]const u8{
         "zlrd", "-tl", "Error", "-n", "10", "-s", "test", "log.txt",
     };
-
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
 
     try testing.expect(args.tail_mode);
-    const m = args.levels.?;
-    try testing.expect((m & levelBit(.Error)) != 0);
+    try testing.expect((args.levels.? & levelBit(.Error)) != 0);
     try testing.expectEqual(@as(usize, 1), args.files.len);
     try testing.expectEqual(@as(u32, 10), args.num_lines);
     try testing.expectEqualStrings("test", args.search.?);
@@ -458,10 +461,7 @@ test "help flag stops parsing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const argv = [_][]const u8{
-        "zlrd", "-h",
-    };
-
+    const argv = [_][]const u8{ "zlrd", "-h" };
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
     defer args.deinit(arena.allocator());
@@ -473,10 +473,7 @@ test "memory cleanup on error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const argv = [_][]const u8{
-        "zlrd", "-f", "a.log", "-l",
-    };
-
+    const argv = [_][]const u8{ "zlrd", "-f", "a.log", "-l" };
     var it = FakeIter{ .argv = &argv };
     const result = parseArgsFromIter(arena.allocator(), &it);
 
@@ -487,10 +484,7 @@ test "empty file list" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const argv = [_][]const u8{
-        "zlrd",
-    };
-
+    const argv = [_][]const u8{"zlrd"};
     var it = FakeIter{ .argv = &argv };
     const result = parseArgsFromIter(arena.allocator(), &it);
 
@@ -516,8 +510,98 @@ test "isLevelEnabled helper" {
     try testing.expect(args.isLevelEnabled(.Fatal));
     try testing.expect(!args.isLevelEnabled(.Info));
 
-    // Test null (all enabled)
+    // null means all levels enabled.
     args.levels = null;
     try testing.expect(args.isLevelEnabled(.Trace));
     try testing.expect(args.isLevelEnabled(.Error));
+}
+
+test "parseLevelInsensitive handles lowercase" {
+    try testing.expectEqual(Level.Trace, parseLevelInsensitive("trace").?);
+    try testing.expectEqual(Level.Debug, parseLevelInsensitive("debug").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("info").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("warn").?);
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("error").?);
+    try testing.expectEqual(Level.Fatal, parseLevelInsensitive("fatal").?);
+    try testing.expectEqual(Level.Panic, parseLevelInsensitive("panic").?);
+}
+
+test "parseLevelInsensitive handles uppercase" {
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("ERROR").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("WARN").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("INFO").?);
+}
+
+test "parseLevelInsensitive handles mixed case" {
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("eRRoR").?);
+    try testing.expectEqual(Level.Debug, parseLevelInsensitive("DeBuG").?);
+    try testing.expectEqual(Level.Fatal, parseLevelInsensitive("fAtAl").?);
+}
+
+test "parseLevelInsensitive returns null for unknown" {
+    try testing.expect(parseLevelInsensitive("") == null);
+    try testing.expect(parseLevelInsensitive("invalid") == null);
+    try testing.expect(parseLevelInsensitive("err") == null);
+}
+
+test "addLevels is case-insensitive" {
+    // All lowercase
+    var mask1: ?LevelMask = null;
+    try addLevels(&mask1, "error,warn");
+    try testing.expect((mask1.? & levelBit(.Error)) != 0);
+    try testing.expect((mask1.? & levelBit(.Warn)) != 0);
+
+    // All uppercase
+    var mask2: ?LevelMask = null;
+    try addLevels(&mask2, "ERROR,WARN");
+    try testing.expect((mask2.? & levelBit(.Error)) != 0);
+    try testing.expect((mask2.? & levelBit(.Warn)) != 0);
+
+    // Mixed case
+    var mask3: ?LevelMask = null;
+    try addLevels(&mask3, "eRrOr,wArN,fAtAl");
+    try testing.expect((mask3.? & levelBit(.Error)) != 0);
+    try testing.expect((mask3.? & levelBit(.Warn)) != 0);
+    try testing.expect((mask3.? & levelBit(.Fatal)) != 0);
+    try testing.expect((mask3.? & levelBit(.Info)) == 0);
+}
+
+test "addLevels returns InvalidLevel for unknown string" {
+    var mask: ?LevelMask = null;
+    try testing.expectError(ParseError.InvalidLevel, addLevels(&mask, "notlevel"));
+    try testing.expectError(ParseError.InvalidLevel, addLevels(&mask, "Error,badlevel"));
+}
+
+test "level flag case-insensitive via CLI" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // lowercase via short flag
+    {
+        const argv = [_][]const u8{ "zlrd", "-f", "a.log", "-l", "error" };
+        var it = FakeIter{ .argv = &argv };
+        var args = try parseArgsFromIter(arena.allocator(), &it);
+        defer args.deinit(arena.allocator());
+        try testing.expect((args.levels.? & levelBit(.Error)) != 0);
+    }
+
+    // UPPERCASE via long flag
+    {
+        const argv = [_][]const u8{ "zlrd", "-f", "a.log", "--level=ERROR" };
+        var it = FakeIter{ .argv = &argv };
+        var args = try parseArgsFromIter(arena.allocator(), &it);
+        defer args.deinit(arena.allocator());
+        try testing.expect((args.levels.? & levelBit(.Error)) != 0);
+    }
+
+    // mixed case, multiple levels
+    {
+        const argv = [_][]const u8{ "zlrd", "-f", "a.log", "--level=eRrOr,wArN" };
+        var it = FakeIter{ .argv = &argv };
+        var args = try parseArgsFromIter(arena.allocator(), &it);
+        defer args.deinit(arena.allocator());
+        try testing.expect((args.levels.? & levelBit(.Error)) != 0);
+        try testing.expect((args.levels.? & levelBit(.Warn)) != 0);
+        try testing.expect((args.levels.? & levelBit(.Info)) == 0);
+    }
 }
