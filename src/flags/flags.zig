@@ -181,12 +181,9 @@ fn parseArgsFromIter(
     }
 
     // Finalize files slice.
+    // An empty list is valid — main.zig will fall back to *.log in the current directory.
     args.files = try files.toOwnedSlice(allocator);
     errdefer allocator.free(args.files);
-
-    // At least one file is required unless help is requested.
-    if (!args.help and args.files.len == 0)
-        return ParseError.MissingFile;
 
     return args;
 }

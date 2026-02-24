@@ -7,9 +7,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
         const leaked = gpa.deinit();
-        if (leaked == .leak) {
-            std.log.err("memory leak detected", .{});
-        }
+        if (leaked == .leak) std.log.err("memory leak detected", .{});
     }
     const allocator = gpa.allocator();
 
@@ -30,16 +28,77 @@ pub fn main() !void {
         return;
     }
 
+    // No files given — discover *.log in the current directory.
+    var discovered: ?[][]const u8 = null;
+    defer if (discovered) |d| {
+        for (d) |p| allocator.free(p);
+        allocator.free(d);
+    };
+
     if (args.files.len == 0) {
-        std.fs.File.stderr().writeAll("zlrd: no input files\n\n") catch {};
-        flags.printHelp();
-        std.process.exit(1);
+        discovered = findLogFiles(allocator) catch null;
+        if (discovered) |d| {
+            if (d.len == 0) {
+                std.fs.File.stderr().writeAll("zlrd: no *.log files found in current directory\n") catch {};
+                std.process.exit(1);
+            }
+            args.files = d;
+        } else {
+            std.fs.File.stderr().writeAll("zlrd: no input files and could not read current directory\n") catch {};
+            std.process.exit(1);
+        }
+    } else {
+        // Files were explicitly provided — verify each one exists and is readable.
+        var all_ok = true;
+        for (args.files) |path| {
+            std.fs.cwd().access(path, .{}) catch |err| {
+                var buf: [512]u8 = undefined;
+                const msg = switch (err) {
+                    error.FileNotFound => std.fmt.bufPrint(&buf, "zlrd: {s}: no such file\n", .{path}) catch "zlrd: no such file\n",
+                    error.AccessDenied => std.fmt.bufPrint(&buf, "zlrd: {s}: permission denied\n", .{path}) catch "zlrd: permission denied\n",
+                    else => std.fmt.bufPrint(&buf, "zlrd: {s}: {s}\n", .{ path, @errorName(err) }) catch "zlrd: error\n",
+                };
+                std.fs.File.stderr().writeAll(msg) catch {};
+                all_ok = false;
+            };
+        }
+        if (!all_ok) std.process.exit(1);
     }
 
     processFiles(allocator, args) catch |err| {
         printError(err);
         std.process.exit(1);
     };
+}
+
+/// Return sorted list of *.log files in the current directory.
+/// Caller owns the returned slice and each string within it.
+fn findLogFiles(allocator: std.mem.Allocator) ![][]const u8 {
+    var dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
+    defer dir.close();
+
+    // In Zig 0.15.2, ArrayList.init(gpa) does not exist — use empty init
+    // and pass the allocator explicitly to every method.
+    var list = std.ArrayList([]const u8){};
+    errdefer {
+        for (list.items) |p| allocator.free(p);
+        list.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
+        try list.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    return list.toOwnedSlice(allocator);
 }
 
 /// Process log files with memory-efficient strategy based on mode and file count.
