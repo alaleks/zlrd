@@ -60,6 +60,9 @@ pub const Args = struct {
     /// Show help and exit.
     help: bool = false,
 
+    /// Print version and exit (`-v` / `--version`).
+    version: bool = false,
+
     /// Number of lines to display (`-n`).
     num_lines: usize = 0,
 
@@ -121,6 +124,7 @@ pub fn printHelp() void {
         \\  -d, --date <date>        Date filter (YYYY-MM-DD)
         \\  -t, --tail               Tail mode
         \\  -n, --num-lines <num>    Number of lines to display
+        \\  -v, --version            Print version and exit
         \\  -h, --help               Show help
         \\
     , .{});
@@ -149,6 +153,13 @@ fn parseArgsFromIter(
         // Early exit for help.
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             args.help = true;
+            args.files = try files.toOwnedSlice(allocator);
+            return args;
+        }
+
+        // Early exit for version.
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
+            args.version = true;
             args.files = try files.toOwnedSlice(allocator);
             return args;
         }
@@ -196,6 +207,11 @@ fn parseLongFlag(
 
     if (std.mem.eql(u8, name, "help")) {
         args.help = true;
+        return;
+    }
+
+    if (std.mem.eql(u8, name, "version")) {
+        args.version = true;
         return;
     }
 
@@ -252,6 +268,10 @@ fn parseShortFlags(
         switch (group[i]) {
             'h' => {
                 args.help = true;
+                return;
+            },
+            'v' => {
+                args.version = true;
                 return;
             },
             't' => args.tail_mode = true,
@@ -515,6 +535,8 @@ test "isLevelEnabled helper" {
     try testing.expect(args.isLevelEnabled(.Trace));
     try testing.expect(args.isLevelEnabled(.Error));
 }
+
+// --- Case-insensitive level parsing tests ---
 
 test "parseLevelInsensitive handles lowercase" {
     try testing.expectEqual(Level.Trace, parseLevelInsensitive("trace").?);

@@ -1,10 +1,9 @@
 const std = @import("std");
 const flags = @import("flags/flags.zig");
 const reader = @import("reader/reader.zig");
+const build_options = @import("build_options");
 
 pub fn main() !void {
-    // Use GPA as the backing allocator for better performance with small allocations.
-    // page_allocator would be inefficient here as it allocates minimum 4KB per call.
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
         const leaked = gpa.deinit();
@@ -14,8 +13,6 @@ pub fn main() !void {
     }
     const allocator = gpa.allocator();
 
-    // Parse command-line arguments.
-    // The Args struct owns its memory and must be freed.
     var args = flags.parseArgs(allocator) catch |err| {
         printError(err);
         flags.printHelp();
@@ -23,21 +20,22 @@ pub fn main() !void {
     };
     defer args.deinit(allocator);
 
+    if (args.version) {
+        std.fs.File.stdout().writeAll("zlrd " ++ build_options.version ++ "\n") catch {};
+        return;
+    }
+
     if (args.help) {
         flags.printHelp();
         return;
     }
 
-    // Validate that at least one file was provided.
-    // This check is redundant if parseArgs already enforces it,
-    // but provides a clearer error message.
     if (args.files.len == 0) {
-        std.debug.print("zlrd: no input files\n\n", .{});
+        std.fs.File.stderr().writeAll("zlrd: no input files\n\n") catch {};
         flags.printHelp();
         std.process.exit(1);
     }
 
-    // Process files with optimal memory management strategy.
     processFiles(allocator, args) catch |err| {
         printError(err);
         std.process.exit(1);
@@ -55,36 +53,26 @@ fn processFiles(
     allocator: std.mem.Allocator,
     args: flags.Args,
 ) !void {
-    // Tail mode requires persistent memory across the program lifetime,
-    // so we use a single arena regardless of file count.
     if (args.tail_mode) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-
         try reader.readLogs(arena.allocator(), args);
         return;
     }
 
-    // For a single file, avoid the overhead of creating multiple arenas.
     if (args.files.len == 1) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-
         try reader.readLogs(arena.allocator(), args);
         return;
     }
 
-    // For multiple files, process each in its own arena to release memory
-    // after each file is processed. This prevents memory accumulation.
     for (args.files) |file_path| {
         try processFileWithArena(allocator, file_path, args);
     }
 }
 
 /// Process a single file in an isolated arena allocator.
-///
-/// Memory allocated during file processing is automatically freed when
-/// the arena is deinitialized, preventing memory accumulation across files.
 fn processFileWithArena(
     base_allocator: std.mem.Allocator,
     file_path: []const u8,
@@ -93,8 +81,6 @@ fn processFileWithArena(
     var arena = std.heap.ArenaAllocator.init(base_allocator);
     defer arena.deinit();
 
-    // Create a modified args struct with only the current file.
-    // This allows reusing the readLogs function while processing one file at a time.
     var single_file = [_][]const u8{file_path};
     var single_file_args = args;
     single_file_args.files = single_file[0..];
@@ -103,9 +89,6 @@ fn processFileWithArena(
 }
 
 /// Print user-friendly error messages to stderr.
-///
-/// Maps common errors to human-readable messages and falls back
-/// to the error name for unknown errors.
 fn printError(err: anyerror) void {
     const msg = switch (err) {
         error.FileNotFound => "file not found",
@@ -124,6 +107,7 @@ fn printError(err: anyerror) void {
         error.MissingNumLines => "missing number of lines",
         else => @errorName(err),
     };
-
-    std.debug.print("zlrd: {s}\n", .{msg});
+    std.fs.File.stderr().writeAll("zlrd: ") catch {};
+    std.fs.File.stderr().writeAll(msg) catch {};
+    std.fs.File.stderr().writeAll("\n") catch {};
 }
