@@ -29,11 +29,18 @@ pub fn main() !void {
     }
 
     // No files given — discover *.log in the current directory.
-    // discovered_files holds ownership of auto-found paths; freed after processFiles.
+    //
+    // Ownership note: discovered_files owns the heap strings.
+    // args.files may point to the same slice — before freeing discovered_files
+    // we reset args.files to &.{} so that the subsequent args.deinit defer
+    // (which runs after this one in LIFO order) does not double-free.
     var discovered_files: [][]const u8 = &.{};
     defer {
-        for (discovered_files) |p| allocator.free(p);
-        if (discovered_files.len > 0) allocator.free(discovered_files);
+        if (discovered_files.len > 0) {
+            args.files = &.{}; // prevent args.deinit from freeing this
+            for (discovered_files) |p| allocator.free(p);
+            allocator.free(discovered_files);
+        }
     }
 
     if (args.files.len == 0) {
@@ -45,8 +52,6 @@ pub fn main() !void {
             std.fs.File.stderr().writeAll("zlrd: no *.log files found in current directory\n") catch {};
             std.process.exit(1);
         }
-        // Point args.files at discovered_files — memory still owned by discovered_files,
-        // freed by the defer above AFTER processFiles returns.
         args.files = discovered_files;
     } else {
         // Files were explicitly provided — verify each one exists and is readable.

@@ -68,7 +68,9 @@ pub const Args = struct {
 
     /// Free allocated memory.
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
-        allocator.free(self.files);
+        // Only free if the slice was heap-allocated (len > 0 or ptr != undefined).
+        // An empty &.{} slice has an undefined pointer — freeing it is UB.
+        if (self.files.len > 0) allocator.free(self.files);
         self.* = undefined;
     }
 
