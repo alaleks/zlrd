@@ -29,24 +29,25 @@ pub fn main() !void {
     }
 
     // No files given — discover *.log in the current directory.
-    var discovered: ?[][]const u8 = null;
-    defer if (discovered) |d| {
-        for (d) |p| allocator.free(p);
-        allocator.free(d);
-    };
+    // discovered_files holds ownership of auto-found paths; freed after processFiles.
+    var discovered_files: [][]const u8 = &.{};
+    defer {
+        for (discovered_files) |p| allocator.free(p);
+        if (discovered_files.len > 0) allocator.free(discovered_files);
+    }
 
     if (args.files.len == 0) {
-        discovered = findLogFiles(allocator) catch null;
-        if (discovered) |d| {
-            if (d.len == 0) {
-                std.fs.File.stderr().writeAll("zlrd: no *.log files found in current directory\n") catch {};
-                std.process.exit(1);
-            }
-            args.files = d;
-        } else {
-            std.fs.File.stderr().writeAll("zlrd: no input files and could not read current directory\n") catch {};
+        discovered_files = findLogFiles(allocator) catch {
+            std.fs.File.stderr().writeAll("zlrd: could not read current directory\n") catch {};
+            std.process.exit(1);
+        };
+        if (discovered_files.len == 0) {
+            std.fs.File.stderr().writeAll("zlrd: no *.log files found in current directory\n") catch {};
             std.process.exit(1);
         }
+        // Point args.files at discovered_files — memory still owned by discovered_files,
+        // freed by the defer above AFTER processFiles returns.
+        args.files = discovered_files;
     } else {
         // Files were explicitly provided — verify each one exists and is readable.
         var all_ok = true;
