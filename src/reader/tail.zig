@@ -110,6 +110,11 @@ pub fn follow(
 /// prints matching ones via `filter_state`, and returns the file position
 /// after the last consumed byte.
 ///
+/// Scans backwards through the file in SCAN_CHUNK steps until N newlines
+/// are found or the beginning of the file is reached. This handles files of
+/// any size correctly — the old single-chunk approach missed lines when the
+/// last N lines spanned more than 8 KB.
+///
 /// `read_buf` is a caller-owned scratch buffer of at least READ_BUF_SIZE bytes,
 /// allowing the caller to reuse one allocation across multiple calls.
 pub fn readLastNLines(
@@ -122,34 +127,44 @@ pub fn readLastNLines(
 ) !u64 {
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
 
-    const chunk_size: u64 = @min(file_size, 8192);
-    const start_pos: u64 = file_size - chunk_size;
-    try file.seekTo(start_pos);
+    // Scan chunk size for the backwards pass — 64 KB matches READ_BUF_SIZE
+    // so one chunk is almost always enough for typical log lines.
+    const SCAN_CHUNK: u64 = 64 * 1024;
 
-    const buf = try allocator.alloc(u8, chunk_size);
-    defer allocator.free(buf);
+    const scan_buf = try allocator.alloc(u8, SCAN_CHUNK);
+    defer allocator.free(scan_buf);
 
-    const bytes_read = try file.read(buf[0..chunk_size]);
-
-    // Walk backwards counting newlines to locate the start of the N-line window.
-    // We need to skip N-1 separators: the Nth line from the end begins right
-    // after the (N-1)th newline from the end.
+    // Scan backwards in SCAN_CHUNK windows until we have found N newlines.
     var newlines_found: usize = 0;
-    var keep_start: usize = 0;
-    var idx: usize = bytes_read;
-    while (idx > 0) {
-        idx -= 1;
-        if (buf[idx] == '\n') {
-            newlines_found += 1;
-            if (newlines_found == n) {
-                keep_start = idx + 1;
-                break;
+    var read_from: u64 = 0; // absolute file offset to start forward reading from
+    var scan_end: u64 = file_size;
+
+    outer: while (scan_end > 0) {
+        const chunk_size: u64 = @min(scan_end, SCAN_CHUNK);
+        const chunk_start: u64 = scan_end - chunk_size;
+
+        try file.seekTo(chunk_start);
+        const bytes_read = try file.read(scan_buf[0..chunk_size]);
+
+        // Walk backwards through this chunk counting newlines.
+        var idx: usize = bytes_read;
+        while (idx > 0) {
+            idx -= 1;
+            if (scan_buf[idx] == '\n') {
+                newlines_found += 1;
+                if (newlines_found == n) {
+                    // The line after this newline is where we start reading.
+                    read_from = chunk_start + idx + 1;
+                    break :outer;
+                }
             }
         }
+
+        if (chunk_start == 0) break; // reached the beginning
+        scan_end = chunk_start;
     }
 
-    // If fewer than N newlines exist in the chunk, read from the very beginning.
-    const read_from: u64 = if (newlines_found >= n) start_pos + keep_start else 0;
+    // read_from stays 0 if fewer than N newlines exist in the entire file.
     try file.seekTo(read_from);
 
     var carry = try std.ArrayList(u8).initCapacity(allocator, 4096);
