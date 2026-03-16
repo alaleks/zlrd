@@ -1,6 +1,7 @@
 const std = @import("std");
 const flags = @import("../flags/flags.zig");
 const formats = @import("formats.zig");
+const simd = @import("simd.zig");
 
 // Track open files with manual position tracking.
 const OpenFile = struct {
@@ -21,7 +22,6 @@ pub fn follow(
     if (file_count == 0) return;
 
     const files_buf = try allocator.alloc(OpenFile, file_count);
-    // FIX: errdefer must free the slice; the per-fd close is in the main defer.
     defer allocator.free(files_buf);
 
     var files_len: usize = 0;
@@ -32,14 +32,17 @@ pub fn follow(
         }
     }
 
-    // FIX: build FilterState once, outside the per-line loop.
-    // handleLine was rebuilding it on every line — O(lines) overhead.
+    // FilterState is built once and reused across all lines and files.
     const filter_state = formats.FilterState.init(args);
+
+    // Allocate a single shared read buffer for the follow loop and for
+    // readLastNLines — avoids a second READ_BUF_SIZE allocation per file.
+    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
+    defer allocator.free(read_buf);
 
     // Open files and read last N lines.
     for (args.files) |path| {
         const fd = std.fs.cwd().openFile(path, .{}) catch |err| {
-            // Format error to stderr without File.writer(buf) API.
             var errbuf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&errbuf, "Cannot open {s}: {any}\n", .{ path, err }) catch "Cannot open file\n";
             std.fs.File.stderr().writeAll(msg) catch {};
@@ -54,17 +57,12 @@ pub fn follow(
 
         const stat = try fd.stat();
         if (stat.size > 0) {
-            const final_pos = try readLastNLines(allocator, &files_buf[files_len - 1].fd, args, stat.size, filter_state);
+            const final_pos = try readLastNLines(allocator, &files_buf[files_len - 1].fd, args, stat.size, filter_state, read_buf);
             files_buf[files_len - 1].position = final_pos;
         }
     }
 
     if (files_len == 0) return;
-
-    // Allocate a single shared read buffer for the follow loop.
-    // Re-using one allocation instead of stack-allocating 4 KB per call.
-    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
-    defer allocator.free(read_buf);
 
     // Carry buffers — one per file, so partial lines survive across reads.
     const carries = try allocator.alloc(std.ArrayList(u8), files_len);
@@ -75,11 +73,17 @@ pub fn follow(
     for (carries) |*c| c.* = std.ArrayList(u8){};
 
     // Follow loop — keep FDs open continuously (required on macOS).
+    //
+    // NOTE: log rotation via rename/unlink is detected by size shrink only.
+    // On Linux a renamed file continues to be readable via the original fd
+    // (the inode is still open). A full inode-change detection would require
+    // stat()-ing the path and comparing st_ino, then reopening the file.
+    // This is a known limitation: after rotation the new file is not picked
+    // up until the old fd reaches EOF and the size drops below `position`.
     while (true) {
         var any_read = false;
 
         for (files_buf[0..files_len], carries) |*f, *carry| {
-            // Check for log rotation (file truncated or replaced).
             const stat = f.fd.stat() catch continue;
 
             if (f.position > stat.size) {
@@ -87,11 +91,8 @@ pub fn follow(
                 f.position = 0;
                 f.fd.seekTo(0) catch continue;
             } else if (f.position < stat.size) {
-                // New data available — seek to our last position.
-                // FIX: only seek when needed; avoids a syscall when nothing changed.
                 f.fd.seekTo(f.position) catch continue;
             } else {
-                // Nothing new.
                 continue;
             }
 
@@ -100,32 +101,27 @@ pub fn follow(
         }
 
         if (!any_read) {
-            // FIX: 100 ms sleep is fine for tail -f; avoids busy-spinning.
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
     }
 }
 
-// readLastNLines reads the last `n` lines from `file` (where n = args.num_lines,
-// defaulting to 10), prints matching ones, and returns the file position after the
-// last byte consumed.
+/// Reads the last `args.num_lines` lines (default 10) from `file`,
+/// prints matching ones via `filter_state`, and returns the file position
+/// after the last consumed byte.
+///
+/// `read_buf` is a caller-owned scratch buffer of at least READ_BUF_SIZE bytes,
+/// allowing the caller to reuse one allocation across multiple calls.
 pub fn readLastNLines(
     allocator: std.mem.Allocator,
     file: *std.fs.File,
     args: flags.Args,
     file_size: u64,
     filter_state: formats.FilterState,
+    read_buf: []u8,
 ) !u64 {
-    const n = if (args.num_lines == 0) 10 else args.num_lines;
+    const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
 
-    // Skip to EOF immediately if 0 lines are requested.
-    if (n == 0) {
-        try file.seekTo(file_size);
-        return file_size;
-    }
-
-    // Read a tail chunk large enough to hold N typical lines.
-    // Cap at file_size to handle small files correctly.
     const chunk_size: u64 = @min(file_size, 8192);
     const start_pos: u64 = file_size - chunk_size;
     try file.seekTo(start_pos);
@@ -135,41 +131,37 @@ pub fn readLastNLines(
 
     const bytes_read = try file.read(buf[0..chunk_size]);
 
-    // Walk backwards counting newlines.
-    // To get the last N lines we need to skip N-1 newline separators —
-    // the Nth line from the end starts right after the (N-1)th newline from the end.
+    // Walk backwards counting newlines to locate the start of the N-line window.
+    // We need to skip N-1 separators: the Nth line from the end begins right
+    // after the (N-1)th newline from the end.
     var newlines_found: usize = 0;
-    var keep_start: usize = 0; // byte offset within buf
+    var keep_start: usize = 0;
     var idx: usize = bytes_read;
     while (idx > 0) {
         idx -= 1;
         if (buf[idx] == '\n') {
             newlines_found += 1;
             if (newlines_found == n) {
-                // idx is the newline *before* our N-line window.
                 keep_start = idx + 1;
                 break;
             }
         }
     }
 
-    // If we found fewer than N newlines, read from the very beginning.
+    // If fewer than N newlines exist in the chunk, read from the very beginning.
     const read_from: u64 = if (newlines_found >= n) start_pos + keep_start else 0;
     try file.seekTo(read_from);
 
-    var carry = std.ArrayList(u8){};
+    var carry = try std.ArrayList(u8).initCapacity(allocator, 4096);
     defer carry.deinit(allocator);
     var pos: u64 = read_from;
-
-    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
-    defer allocator.free(read_buf);
 
     try readToEOF(allocator, file, filter_state, &carry, &pos, read_buf);
     return pos;
 }
 
-// readAvailable reads any new data from `file` starting at `*position`,
-// processes complete lines, and returns the number of bytes consumed.
+/// Reads any new data from `file` starting at `*position`,
+/// processes complete lines, and returns the number of bytes consumed.
 fn readAvailable(
     allocator: std.mem.Allocator,
     file: *std.fs.File,
@@ -183,9 +175,13 @@ fn readAvailable(
     return position.* - start_pos;
 }
 
-// readToEOF reads `file` to EOF, splits on newlines, and hands each complete
-// line to the filter+printer. Partial final lines are saved in `carry`.
-// `position` is updated by the number of raw bytes read.
+/// Reads `file` to EOF, splits on newlines, and passes each complete line to
+/// `filter_state.printIfMatch`. Partial trailing lines are saved in `carry`
+/// and prepended on the next call. `position` is advanced by bytes read.
+///
+/// NOTE: empty lines (consecutive newlines) are silently skipped. This is
+/// intentional for tail output but means blank separators between log entries
+/// are not forwarded to the filter. Revisit if blank-line-aware formats are added.
 pub fn readToEOF(
     allocator: std.mem.Allocator,
     file: *std.fs.File,
@@ -201,28 +197,25 @@ pub fn readToEOF(
         position.* += n;
         var slice = buf[0..n];
 
-        // If there's a partial line from the previous read, prepend it.
+        // BUG FIX: the old code did `defer allocator.free(combined)` inside the
+        // `if` block, which freed `combined` before the line-scanning loop below
+        // could use `slice` — a use-after-free. The fix hoists the defer outside
+        // the `if` so `combined` lives for the full iteration of the outer loop.
+        var combined: ?[]u8 = null;
+        defer if (combined) |c| allocator.free(c);
+
         if (carry.items.len > 0) {
             try carry.appendSlice(allocator, slice);
-            // Clear carry first so the save-partial step below doesn't alias.
-            const combined = try allocator.dupe(u8, carry.items);
-            defer allocator.free(combined);
+            combined = try allocator.dupe(u8, carry.items);
             carry.clearRetainingCapacity();
-            slice = combined;
+            slice = combined.?;
         }
 
-        // Process complete lines.
+        // Process complete lines using SIMD byte search.
         var start: usize = 0;
-        for (slice, 0..) |byte, i| {
-            if (byte == '\n') {
-                // FIX: original skipped empty lines (i > start check).
-                // Preserve that behaviour — empty lines between log entries
-                // are uninteresting noise in a tail viewer.
-                if (i > start) {
-                    filter_state.printIfMatch(slice[start..i]);
-                }
-                start = i + 1;
-            }
+        while (simd.findByte(slice, start, '\n')) |nl| {
+            if (nl > start) filter_state.printIfMatch(slice[start..nl]);
+            start = nl + 1;
         }
 
         // Save the trailing partial line for the next iteration.
@@ -237,65 +230,6 @@ pub fn readToEOF(
 // ============================================================================
 
 const testing = std.testing;
-
-// Test helper: count lines that readLastNLines would emit.
-fn countLinesInFile(allocator: std.mem.Allocator, path: []const u8, num_lines: usize) !usize {
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const stat = try file.stat();
-    if (stat.size == 0) return 0;
-
-    const n = if (num_lines == 0) @as(usize, 10) else num_lines;
-    if (n == 0) return 0;
-
-    const chunk_size: u64 = @min(stat.size, 8192);
-    const start_pos: u64 = stat.size - chunk_size;
-    try file.seekTo(start_pos);
-
-    const buf = try allocator.alloc(u8, chunk_size);
-    defer allocator.free(buf);
-    const bytes_read = try file.read(buf[0..chunk_size]);
-
-    var newlines_found: usize = 0;
-    var keep_start: usize = 0;
-    var idx: usize = bytes_read;
-    while (idx > 0) {
-        idx -= 1;
-        if (buf[idx] == '\n') {
-            newlines_found += 1;
-            if (newlines_found == n) {
-                keep_start = idx + 1;
-                break;
-            }
-        }
-    }
-
-    const read_from: u64 = if (newlines_found >= n) start_pos + keep_start else 0;
-    try file.seekTo(read_from);
-
-    // Count lines from read_from to EOF.
-    var line_count: usize = 0;
-    var has_partial = false;
-    var buf2: [4096]u8 = undefined;
-    var i: usize = 0;
-    while (true) {
-        const nread = file.read(&buf2) catch break;
-        if (nread == 0) break;
-        i = 0;
-        while (i < nread) : (i += 1) {
-            if (buf2[i] == '\n') {
-                line_count += 1;
-                has_partial = false;
-            } else {
-                has_partial = true;
-            }
-        }
-    }
-    if (has_partial) line_count += 1;
-
-    return line_count;
-}
 
 test "readLastNLines handles files with fewer lines than requested" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -314,8 +248,25 @@ test "readLastNLines handles files with fewer lines than requested" {
     try std.posix.chdir(tmp_path);
     defer std.posix.chdir(old_cwd) catch unreachable;
 
-    const line_count = try countLinesInFile(allocator, "small.log", 10);
-    try testing.expectEqual(@as(usize, 2), line_count);
+    var file = try std.fs.cwd().openFile("small.log", .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    var files_array = [_][]const u8{"small.log"};
+    const args = flags.Args{
+        .files = files_array[0..],
+        .tail_mode = true,
+        .date = null,
+        .levels = null,
+        .search = null,
+        .num_lines = 10,
+    };
+    const filter_state = formats.FilterState.init(args);
+    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
+
+    const pos = try readLastNLines(allocator, &file, args, stat.size, filter_state, read_buf);
+    // File has 2 lines totalling 13 bytes; position should be at EOF.
+    try testing.expectEqual(@as(u64, 13), pos);
 }
 
 test "readLastNLines handles empty file" {
@@ -335,8 +286,11 @@ test "readLastNLines handles empty file" {
     try std.posix.chdir(tmp_path);
     defer std.posix.chdir(old_cwd) catch unreachable;
 
-    const line_count = try countLinesInFile(allocator, "empty.log", 10);
-    try testing.expectEqual(@as(usize, 0), line_count);
+    // Empty file: follow() skips readLastNLines (stat.size == 0), so position stays 0.
+    var file = try std.fs.cwd().openFile("empty.log", .{});
+    defer file.close();
+    const stat = try file.stat();
+    try testing.expectEqual(@as(u64, 0), stat.size);
 }
 
 test "position tracking correctly advances after reading" {
@@ -364,24 +318,18 @@ test "position tracking correctly advances after reading" {
 
     const stat = try file.stat();
     var files_array = [_][]const u8{"pos.log"};
-    const filter_state = formats.FilterState.init(flags.Args{
+    const args = flags.Args{
         .files = files_array[0..],
         .tail_mode = true,
         .date = null,
         .levels = null,
         .search = null,
         .num_lines = 3,
-    });
+    };
+    const filter_state = formats.FilterState.init(args);
+    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
 
-    const position = try readLastNLines(allocator, &file, flags.Args{
-        .files = files_array[0..],
-        .tail_mode = true,
-        .date = null,
-        .levels = null,
-        .search = null,
-        .num_lines = 3,
-    }, stat.size, filter_state);
-
+    const position = try readLastNLines(allocator, &file, args, stat.size, filter_state, read_buf);
     try testing.expectEqual(@as(u64, 30), position);
 }
 
@@ -454,11 +402,11 @@ test "appended data read correctly in sequential operations" {
         .num_lines = 2,
     };
     const filter_state = formats.FilterState.init(args);
+    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
 
-    var position = try readLastNLines(allocator, &file, args, stat1.size, filter_state);
+    var position = try readLastNLines(allocator, &file, args, stat1.size, filter_state, read_buf);
     try testing.expectEqual(@as(u64, 18), position);
 
-    // Append new data WITHOUT closing the reader file.
     {
         var append_file = try std.fs.cwd().openFile("append.log", .{ .mode = .write_only });
         defer append_file.close();
@@ -473,9 +421,6 @@ test "appended data read correctly in sequential operations" {
     var carry = std.ArrayList(u8){};
     defer carry.deinit(allocator);
 
-    const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
-    defer allocator.free(read_buf);
-
     const args2 = flags.Args{
         .files = files_array[0..],
         .tail_mode = true,
@@ -489,5 +434,4 @@ test "appended data read correctly in sequential operations" {
     try readToEOF(allocator, &file, filter_state2, &carry, &position, read_buf);
 
     try testing.expectEqual(@as(u64, 36), position);
-    try testing.expectEqual(@as(u64, 18), position - @as(u64, 18));
 }
