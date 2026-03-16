@@ -78,7 +78,7 @@ zlrd auto-detects the format:
 
 ## Roadmap
 
-- [ ] Compressed logs (gzip, bzip2)
+- [x] Compressed logs (gzip)
 - [ ] Custom log format configuration
 - [ ] Regex pattern matching
 - [ ] Time range filtering

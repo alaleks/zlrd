@@ -5,6 +5,7 @@
 const std = @import("std");
 const flags = @import("../flags/flags.zig");
 const simd = @import("simd.zig");
+const gzip = @import("gzip.zig");
 
 /// Cached analysis of a single log line.
 /// Computed once per line by `analyzeLine` and reused by all filters and the printer.
@@ -283,11 +284,18 @@ fn getOptimalBufferSize(file: std.fs.File) usize {
 
 /// Entry point for reading a log file with filtering and colored output.
 /// Dispatches to pagination or continuous streaming based on `args.num_lines`.
+/// If the file is a gzip (.gz) file, pagination is not supported and the file is streamed continuously.
 pub fn readStreaming(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
 ) !void {
+    // Gzip files не поддерживают пагинацию — seek в сжатый поток невозможен.
+    if (gzip.isGzip(path)) {
+        const filter_state = FilterState.init(args);
+        return gzip.readGzip(allocator, path, filter_state);
+    }
+
     if (args.num_lines > 0) {
         try readWithPagination(allocator, path, args);
     } else {

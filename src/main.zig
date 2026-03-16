@@ -1,6 +1,7 @@
 const std = @import("std");
 const flags = @import("flags/flags.zig");
 const reader = @import("reader/reader.zig");
+const gzip = @import("reader/gzip.zig");
 const build_options = @import("build_options");
 
 pub fn main() !void {
@@ -28,7 +29,7 @@ pub fn main() !void {
         return;
     }
 
-    // No files given — discover *.log in the current directory.
+    // No files given — discover *.log and *.log.gz in the current directory.
     //
     // Ownership note: discovered_files owns the heap strings.
     // args.files may point to the same slice — before freeing discovered_files
@@ -37,7 +38,7 @@ pub fn main() !void {
     var discovered_files: [][]const u8 = &.{};
     defer {
         if (discovered_files.len > 0) {
-            args.files = &.{}; // prevent args.deinit from freeing this
+            args.files = &.{};
             for (discovered_files) |p| allocator.free(p);
             allocator.free(discovered_files);
         }
@@ -49,7 +50,7 @@ pub fn main() !void {
             std.process.exit(1);
         };
         if (discovered_files.len == 0) {
-            std.fs.File.stderr().writeAll("zlrd: no *.log files found in current directory\n") catch {};
+            std.fs.File.stderr().writeAll("zlrd: no *.log or *.log.gz files found in current directory\n") catch {};
             std.process.exit(1);
         }
         args.files = discovered_files;
@@ -57,6 +58,13 @@ pub fn main() !void {
         // Files were explicitly provided — verify each one exists and is readable.
         var all_ok = true;
         for (args.files) |path| {
+            if (args.tail_mode and gzip.isGzip(path)) {
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "zlrd: {s}: tail mode is not supported for .gz files\n", .{path}) catch "zlrd: tail mode is not supported for .gz files\n";
+                std.fs.File.stderr().writeAll(msg) catch {};
+                all_ok = false;
+                continue;
+            }
             std.fs.cwd().access(path, .{}) catch |err| {
                 var buf: [512]u8 = undefined;
                 const msg = switch (err) {
@@ -77,14 +85,12 @@ pub fn main() !void {
     };
 }
 
-/// Return sorted list of *.log files in the current directory.
+/// Returns a sorted list of *.log and *.log.gz files in the current directory.
 /// Caller owns the returned slice and each string within it.
 fn findLogFiles(allocator: std.mem.Allocator) ![][]const u8 {
     var dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
     defer dir.close();
 
-    // In Zig 0.15.2, ArrayList.init(gpa) does not exist — use empty init
-    // and pass the allocator explicitly to every method.
     var list = std.ArrayList([]const u8){};
     errdefer {
         for (list.items) |p| allocator.free(p);
@@ -94,7 +100,8 @@ fn findLogFiles(allocator: std.mem.Allocator) ![][]const u8 {
     var it = dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".log")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".log") and
+            !std.mem.endsWith(u8, entry.name, ".log.gz")) continue;
         try list.append(allocator, try allocator.dupe(u8, entry.name));
     }
 
@@ -107,13 +114,11 @@ fn findLogFiles(allocator: std.mem.Allocator) ![][]const u8 {
     return list.toOwnedSlice(allocator);
 }
 
-/// Process log files with memory-efficient strategy based on mode and file count.
+/// Processes log files with a memory-efficient strategy based on mode and file count.
 ///
-/// Strategy selection:
-/// - Single file or tail mode: Use one arena for the entire operation
-/// - Multiple files (no tail): Use separate arena per file to keep memory usage bounded
-///
-/// This approach ensures memory usage is O(largest_file) rather than O(sum_of_all_files).
+/// Strategy:
+/// - Tail mode or single file: one arena for the entire operation.
+/// - Multiple files (no tail): separate arena per file so memory stays O(largest_file).
 fn processFiles(
     allocator: std.mem.Allocator,
     args: flags.Args,
@@ -137,7 +142,7 @@ fn processFiles(
     }
 }
 
-/// Process a single file in an isolated arena allocator.
+/// Processes a single file in an isolated arena allocator.
 fn processFileWithArena(
     base_allocator: std.mem.Allocator,
     file_path: []const u8,
@@ -153,7 +158,7 @@ fn processFileWithArena(
     try reader.readLogs(arena.allocator(), single_file_args);
 }
 
-/// Print user-friendly error messages to stderr.
+/// Prints a user-friendly error message to stderr.
 fn printError(err: anyerror) void {
     const msg = switch (err) {
         error.FileNotFound => "file not found",
