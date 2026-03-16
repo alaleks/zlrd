@@ -8,8 +8,6 @@
 
 Designed for fast, predictable, streaming processing of large log files with minimal memory overhead. `zlrd` works well both for offline log analysis and real-time log inspection (`tail -f` style).
 
-> ⚠️ **Early Development**: This project is not stable yet. Use at your own risk.
-
 ## Features
 
 **Performance**
@@ -50,7 +48,7 @@ Designed for fast, predictable, streaming processing of large log files with min
 
 ### From Source
 
-Requirements: Zig 0.51.2 or later
+Requirements: Zig 0.15.2 or later
 
 ```bash
 git clone https://github.com/yourusername/zlrd.git

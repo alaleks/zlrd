@@ -1,5 +1,5 @@
 //! SIMD-accelerated utility functions for log parsing and string searching.
-//! This module provides vectorized operations for finding bytes, extracting fields,
+//! Provides vectorized operations for finding bytes, extracting fields,
 //! and validating formats commonly used in log processing.
 const std = @import("std");
 
@@ -10,22 +10,15 @@ pub const VecSize = 16;
 // Internal helpers
 // ============================================================================
 
-/// Convert a boolean SIMD mask to a packed u16 bitmask for use with @ctz.
+/// Converts a boolean SIMD mask to a packed u16 bitmask for use with @ctz.
 /// Bit N is set iff lane N of `mask` is true.
-///
-/// PERF: replaces the original `inline for (0..VecSize)` scan inside each
-/// SIMD hit — that scan was still O(VecSize) in the hot path. @ctz is O(1).
 inline fn chunkMask(mask: @Vector(VecSize, bool)) u16 {
-    const ones: @Vector(VecSize, u8) = @splat(1);
-    const zeros: @Vector(VecSize, u8) = @splat(0);
-    const bits: @Vector(VecSize, u8) = @select(u8, mask, ones, zeros);
     var result: u16 = 0;
     // Pack 16 single-bit values into a u16.
+    // @intFromBool guarantees 0/1 without an intermediate vector.
     // Zig has no _mm_movemask_epi8 intrinsic yet, so we do it manually.
-    // This still compiles to a handful of instructions and is always faster
-    // than the 16-iteration scalar scan it replaces.
     inline for (0..VecSize) |j| {
-        result |= @as(u16, bits[j]) << @intCast(j);
+        result |= @as(u16, @intFromBool(mask[j])) << @intCast(j);
     }
     return result;
 }
@@ -34,12 +27,8 @@ inline fn chunkMask(mask: @Vector(VecSize, bool)) u16 {
 // Public API
 // ============================================================================
 
-/// Finds the first occurrence of `needle` in `buf[start..]`.
-/// Uses SIMD for buffers ≥ VecSize bytes, scalar otherwise.
-/// Returns the absolute index within `buf`, or null.
-///
-/// BUG FIX (original code): `buf.len - start` underflows (usize wrap) when
-/// start > buf.len, causing an incorrect SIMD path or out-of-bounds access.
+/// Returns the index of the first occurrence of `needle` in `buf[start..]`,
+/// or null if not found. Uses SIMD for windows >= VecSize bytes.
 pub inline fn findByte(
     buf: []const u8,
     start: usize,
@@ -47,7 +36,6 @@ pub inline fn findByte(
 ) ?usize {
     if (start >= buf.len) return null;
 
-    // Scalar path for small remaining windows.
     if (buf.len - start < VecSize) {
         for (buf[start..], start..) |c, i| {
             if (c == needle) return i;
@@ -67,14 +55,14 @@ pub inline fn findByte(
         }
     }
 
-    // Scalar tail for remaining < VecSize bytes.
     while (i < buf.len) : (i += 1) {
         if (buf[i] == needle) return i;
     }
     return null;
 }
 
-/// Finds the first byte equal to `a` or `b` in `buf[start..]`.
+/// Returns the index of the first byte equal to `a` or `b` in `buf[start..]`,
+/// or null if not found.
 pub inline fn findEither(
     buf: []const u8,
     start: usize,
@@ -110,7 +98,8 @@ pub inline fn findEither(
     return null;
 }
 
-/// Finds the first byte equal to `a`, `b`, or `c` in `buf[start..]`.
+/// Returns the index of the first byte equal to `a`, `b`, or `c` in `buf[start..]`,
+/// or null if not found.
 pub inline fn findAny3(
     buf: []const u8,
     start: usize,
@@ -149,19 +138,9 @@ pub inline fn findAny3(
 }
 
 /// Extracts the string value of a JSON field matching `"key":"value"`.
-/// Returns a slice within `line` (no allocation), or null on any mismatch.
-///
-/// BUG FIX (original + my previous version): after clamping the scan window
-/// to `end = min(start + max_len, line.len)`, the closing-quote check was
-///   `if (i >= line.len)` — but `i` stops at `end`, not `line.len`, so when
-/// the value is shorter than max_len but longer than (line.len - start) the
-/// check was wrong. Correct condition: `line[i] != '"'` (i.e. we hit `end`
-/// without finding the closing quote).
-///
-/// BUG FIX 2: max_len is a character limit on the *value*, not a hard truncation
-/// that returns a partial string. If the closing `"` is beyond max_len we return
-/// null (malformed / too long), consistent with a filter use-case. The old test
-/// `expectEqualStrings("very long ", result.?)` was testing wrong behaviour.
+/// Returns a slice within `line` (no allocation), or null if the key is absent,
+/// the value is not quoted, or the value exceeds `max_len` bytes.
+/// Escaped quotes (`\"`) inside the value are handled correctly.
 pub fn extractJsonField(
     line: []const u8,
     comptime key: []const u8,
@@ -169,7 +148,6 @@ pub fn extractJsonField(
 ) ?[]const u8 {
     var i: usize = 0;
 
-    // Locate `"key"` in the line.
     while (true) {
         const q = findByte(line, i, '"') orelse return null;
 
@@ -191,18 +169,23 @@ pub fn extractJsonField(
     i += 1; // skip opening quote
     const start = i;
 
-    // Scan for closing quote within the max_len window.
+    // Scan for closing quote within the max_len window, honouring `\"` escapes.
     const window_end = @min(start + max_len, line.len);
-    while (i < window_end and line[i] != '"') : (i += 1) {}
+    while (i < window_end) : (i += 1) {
+        if (line[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (line[i] == '"') break;
+    }
 
-    // If we did not land on a closing quote, the value is absent or too long.
-    if (i >= line.len or line[i] != '"') return null;
+    if (i >= window_end or line[i] != '"') return null;
 
     return line[start..i];
 }
 
-/// Returns true if `s` starts with an ISO-8601 date: `YYYY-MM-DD`.
-/// Validates format only — calendar validity is not checked.
+/// Returns true if `s` starts with an ISO-8601 date (`YYYY-MM-DD`).
+/// Validates format only; calendar correctness is not checked.
 pub inline fn isISODate(s: []const u8) bool {
     if (s.len < 10) return false;
     inline for (0..10) |idx| {
@@ -217,50 +200,50 @@ pub inline fn isISODate(s: []const u8) bool {
 }
 
 /// Returns the byte range of the level text inside a leading `[LEVEL]` marker,
-/// or null if the line does not start with `[…]` (non-empty content required).
+/// or null if the line does not start with a non-empty `[…]`.
 pub fn findBracketedLevel(line: []const u8) ?struct { start: usize, end: usize } {
     if (line.len < 3 or line[0] != '[') return null;
     const end = findByte(line, 1, ']') orelse return null;
-    if (end <= 1) return null; // empty brackets `[]`
+    if (end <= 1) return null;
     return .{ .start = 1, .end = end };
 }
 
-/// True if `line[pos..]` starts with `key`.
+/// Returns true if `line[pos..]` starts with `key`.
 inline fn matchKeyAt(line: []const u8, pos: usize, comptime key: []const u8) bool {
     return pos + key.len <= line.len and
         std.mem.eql(u8, line[pos .. pos + key.len], key);
 }
 
-/// Finds a logfmt level field: `level=`, `severity=`, or `lvl=`.
-/// Returns the byte range of the value (up to the next space or EOL).
-///
-/// BUG FIX (original code): `pos >= 5 and matchKeyAt(line, pos - 5, "level")`
-/// allows `mylevel=` to match because it only checks that the 5 chars before `=`
-/// spell "level", without checking the word boundary before them.
-/// Fix: additionally require `key_start == 0 or line[key_start - 1] == ' '`.
+/// Returns true if `c` is a logfmt field separator (space or tab).
+inline fn isLogfmtSep(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+
+/// Finds a logfmt level field (`level=`, `severity=`, or `lvl=`) and returns
+/// the byte range of its value (up to the next whitespace or EOL), or null.
+/// Requires a word boundary before the key to avoid partial matches such as `mylevel=`.
 pub fn findLogfmtLevel(line: []const u8) ?struct { start: usize, end: usize } {
+    const keys = .{
+        .{ "level", 5 },
+        .{ "severity", 8 },
+        .{ "lvl", 3 },
+    };
+
     var i: usize = 0;
 
     while (true) {
         const eq = findByte(line, i, '=') orelse return null;
 
-        // Try each key in priority order. Word-boundary guard prevents
-        // `mylevel=` or `loglevel=` from matching as `level=`.
-        const keys = .{
-            .{ "level", 5 },
-            .{ "severity", 8 },
-            .{ "lvl", 3 },
-        };
         inline for (keys) |kv| {
             const klen = kv[1];
             if (eq >= klen) {
                 const key_start = eq - klen;
                 if (matchKeyAt(line, key_start, kv[0]) and
-                    (key_start == 0 or line[key_start - 1] == ' '))
+                    (key_start == 0 or isLogfmtSep(line[key_start - 1])))
                 {
                     const s = eq + 1;
                     var e = s;
-                    while (e < line.len and line[e] != ' ') : (e += 1) {}
+                    while (e < line.len and !isLogfmtSep(line[e])) : (e += 1) {}
                     return .{ .start = s, .end = e };
                 }
             }
@@ -298,7 +281,6 @@ test "findByte: empty buffer" {
     try testing.expectEqual(@as(?usize, null), findByte("", 0, 'x'));
 }
 
-// BUG: original panicked here due to usize underflow.
 test "findByte: start >= buf.len" {
     try testing.expectEqual(@as(?usize, null), findByte("hello", 5, 'h'));
     try testing.expectEqual(@as(?usize, null), findByte("hello", 100, 'h'));
@@ -313,6 +295,14 @@ test "findByte: SIMD vector boundaries" {
     try testing.expectEqual(@as(?usize, VecSize - 1), findByte(&buf, 0, 'x'));
     try testing.expectEqual(@as(?usize, VecSize), findByte(&buf, 0, 'y'));
     try testing.expectEqual(@as(?usize, VecSize * 2), findByte(&buf, 0, 'z'));
+}
+
+test "findByte: buffer exactly VecSize bytes" {
+    var buf: [VecSize]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[VecSize - 1] = 'x';
+    try testing.expectEqual(@as(?usize, VecSize - 1), findByte(&buf, 0, 'x'));
+    try testing.expectEqual(@as(?usize, null), findByte(&buf, 0, 'z'));
 }
 
 test "findByte: all-same buffer" {
@@ -349,6 +339,14 @@ test "findEither: start >= buf.len" {
     try testing.expectEqual(@as(?usize, null), findEither("hi", 10, 'h', 'i'));
 }
 
+test "findEither: buffer exactly VecSize bytes" {
+    var buf: [VecSize]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[VecSize - 1] = 'x';
+    try testing.expectEqual(@as(?usize, VecSize - 1), findEither(&buf, 0, 'x', 'y'));
+    try testing.expectEqual(@as(?usize, null), findEither(&buf, 0, 'z', 'w'));
+}
+
 // ── findAny3 ─────────────────────────────────────────────────────────────────
 
 test "findAny3: finds first match" {
@@ -368,6 +366,14 @@ test "findAny3: start >= buf.len" {
     try testing.expectEqual(@as(?usize, null), findAny3("hi", 10, 'h', 'i', 'j'));
 }
 
+test "findAny3: buffer exactly VecSize bytes" {
+    var buf: [VecSize]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[VecSize - 1] = 'z';
+    try testing.expectEqual(@as(?usize, VecSize - 1), findAny3(&buf, 0, 'x', 'y', 'z'));
+    try testing.expectEqual(@as(?usize, null), findAny3(&buf, 0, 'p', 'q', 'r'));
+}
+
 // ── extractJsonField ─────────────────────────────────────────────────────────
 
 test "extractJsonField: simple field" {
@@ -380,15 +386,12 @@ test "extractJsonField: time field" {
     try testing.expectEqualStrings("2024-01-15T10:30:45Z", r.?);
 }
 
-// BUG FIX: max_len is a limit — values longer than max_len return null,
-// not a truncated slice. Old code returned partial strings.
 test "extractJsonField: value exceeds max_len returns null" {
     const r = extractJsonField("{\"msg\":\"very long message here\"}", "msg", 4);
     try testing.expect(r == null);
 }
 
 test "extractJsonField: value exactly at max_len" {
-    // "err" is 5 chars; max_len=5 should succeed.
     const r = extractJsonField("{\"level\":\"error\"}", "level", 5);
     try testing.expectEqualStrings("error", r.?);
 }
@@ -402,7 +405,6 @@ test "extractJsonField: unquoted value (malformed)" {
 }
 
 test "extractJsonField: similar key prefix" {
-    // "level_old" must not shadow "level"
     const r = extractJsonField("{\"level_old\":\"warn\",\"level\":\"error\"}", "level", 10);
     try testing.expectEqualStrings("error", r.?);
 }
@@ -415,6 +417,18 @@ test "extractJsonField: empty value" {
 test "extractJsonField: unicode in other field does not crash" {
     const r = extractJsonField("{\"msg\":\"Hello 世界\",\"level\":\"info\"}", "level", 10);
     try testing.expectEqualStrings("info", r.?);
+}
+
+test "extractJsonField: escaped quote inside value" {
+    const r = extractJsonField("{\"msg\":\"hello \\\"world\\\"\"}", "msg", 20);
+    try testing.expectEqualStrings("hello \\\"world\\\"", r.?);
+}
+
+test "extractJsonField: window_end does not bleed into next field quote" {
+    const ok = extractJsonField("{\"k\":\"ab\",\"x\":\"y\"}", "k", 2);
+    try testing.expectEqualStrings("ab", ok.?);
+    const too_long = extractJsonField("{\"k\":\"ab\",\"x\":\"y\"}", "k", 1);
+    try testing.expect(too_long == null);
 }
 
 // ── isISODate ────────────────────────────────────────────────────────────────
@@ -496,11 +510,26 @@ test "findLogfmtLevel: not found" {
     try testing.expect(findLogfmtLevel("no equals") == null);
 }
 
-// BUG FIX: "mylevel=warn" must NOT match as "level=warn".
 test "findLogfmtLevel: word boundary — mylevel= must not match" {
     try testing.expect(findLogfmtLevel("mylevel=warn msg=test") == null);
 }
 
 test "findLogfmtLevel: word boundary — loglevel= must not match" {
     try testing.expect(findLogfmtLevel("loglevel=warn msg=test") == null);
+}
+
+test "findLogfmtLevel: tab separator before level=" {
+    const line = "time=2024-01-15\tlevel=error\tmsg=test";
+    const r = findLogfmtLevel(line).?;
+    try testing.expectEqualStrings("error", line[r.start..r.end]);
+}
+
+test "findLogfmtLevel: tab separator before lvl=" {
+    const line = "time=2024-01-15\tlvl=warn";
+    const r = findLogfmtLevel(line).?;
+    try testing.expectEqualStrings("warn", line[r.start..r.end]);
+}
+
+test "findLogfmtLevel: word boundary — xylvl= must not match" {
+    try testing.expect(findLogfmtLevel("xylvl=warn msg=test") == null);
 }
