@@ -5,6 +5,7 @@
 const std = @import("std");
 const flags = @import("../flags/flags.zig");
 const simd = @import("simd.zig");
+const tail_reader = @import("tail.zig");
 const gzip = @import("gzip.zig");
 
 /// Cached analysis of a single log line.
@@ -25,13 +26,6 @@ const LineInfo = struct {
     is_json: bool,
     starts_with_bracket: bool,
 };
-
-/// Reads logs from the given files, applying the provided arguments for filtering and formatting.
-pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args) !void {
-    for (args.files) |path| {
-        try readStreaming(allocator, path, args);
-    }
-}
 
 /// Analyzes a line and returns a fully populated `LineInfo`.
 /// All subsequent operations (filtering, printing) use this result directly,
@@ -284,18 +278,27 @@ fn getOptimalBufferSize(file: std.fs.File) usize {
 
 /// Entry point for reading a log file with filtering and colored output.
 /// Dispatches to pagination or continuous streaming based on `args.num_lines`.
-/// If the file is a gzip (.gz) file, pagination is not supported and the file is streamed continuously.
+/// Public entry point called by main.zig.
+/// Dispatches to tail follow mode, gzip, pagination, or continuous streaming.
+pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args) !void {
+    if (args.tail_mode) {
+        try tail_reader.follow(allocator, args);
+        return;
+    }
+    for (args.files) |path| {
+        try readStreaming(allocator, path, args);
+    }
+}
+
 pub fn readStreaming(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
 ) !void {
-    // Gzip files не поддерживают пагинацию — seek в сжатый поток невозможен.
     if (gzip.isGzip(path)) {
         const filter_state = FilterState.init(args);
         return gzip.readGzip(allocator, path, filter_state);
     }
-
     if (args.num_lines > 0) {
         try readWithPagination(allocator, path, args);
     } else {

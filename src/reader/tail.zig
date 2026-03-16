@@ -35,8 +35,7 @@ pub fn follow(
     // FilterState is built once and reused across all lines and files.
     const filter_state = formats.FilterState.init(args);
 
-    // Allocate a single shared read buffer for the follow loop and for
-    // readLastNLines — avoids a second READ_BUF_SIZE allocation per file.
+    // Allocate a single shared read buffer reused by readLastNLines and the follow loop.
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
 
@@ -110,13 +109,9 @@ pub fn follow(
 /// prints matching ones via `filter_state`, and returns the file position
 /// after the last consumed byte.
 ///
-/// Scans backwards through the file in SCAN_CHUNK steps until N newlines
-/// are found or the beginning of the file is reached. This handles files of
-/// any size correctly — the old single-chunk approach missed lines when the
-/// last N lines spanned more than 8 KB.
-///
-/// `read_buf` is a caller-owned scratch buffer of at least READ_BUF_SIZE bytes,
-/// allowing the caller to reuse one allocation across multiple calls.
+/// Scans backwards in READ_BUF_SIZE windows until N newlines are found or
+/// the beginning of the file is reached. This handles files of any size —
+/// the old single 8 KB chunk missed lines when the last N lines exceeded that size.
 pub fn readLastNLines(
     allocator: std.mem.Allocator,
     file: *std.fs.File,
@@ -127,47 +122,41 @@ pub fn readLastNLines(
 ) !u64 {
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
 
-    // Scan chunk size for the backwards pass — 64 KB matches READ_BUF_SIZE
-    // so one chunk is almost always enough for typical log lines.
-    const SCAN_CHUNK: u64 = 64 * 1024;
-
-    const scan_buf = try allocator.alloc(u8, SCAN_CHUNK);
+    const scan_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(scan_buf);
 
-    // Scan backwards in SCAN_CHUNK windows until we have found N newlines.
+    // Scan backwards in READ_BUF_SIZE windows until N newlines are found.
     var newlines_found: usize = 0;
-    var read_from: u64 = 0; // absolute file offset to start forward reading from
+    var read_from: u64 = 0;
     var scan_end: u64 = file_size;
 
     outer: while (scan_end > 0) {
-        const chunk_size: u64 = @min(scan_end, SCAN_CHUNK);
+        const chunk_size: u64 = @min(scan_end, READ_BUF_SIZE);
         const chunk_start: u64 = scan_end - chunk_size;
 
         try file.seekTo(chunk_start);
         const bytes_read = try file.read(scan_buf[0..chunk_size]);
 
-        // Walk backwards through this chunk counting newlines.
         var idx: usize = bytes_read;
         while (idx > 0) {
             idx -= 1;
             if (scan_buf[idx] == '\n') {
                 newlines_found += 1;
                 if (newlines_found == n) {
-                    // The line after this newline is where we start reading.
                     read_from = chunk_start + idx + 1;
                     break :outer;
                 }
             }
         }
 
-        if (chunk_start == 0) break; // reached the beginning
+        if (chunk_start == 0) break;
         scan_end = chunk_start;
     }
 
     // read_from stays 0 if fewer than N newlines exist in the entire file.
     try file.seekTo(read_from);
 
-    var carry = try std.ArrayList(u8).initCapacity(allocator, 4096);
+    var carry = std.ArrayList(u8){};
     defer carry.deinit(allocator);
     var pos: u64 = read_from;
 
@@ -194,9 +183,7 @@ fn readAvailable(
 /// `filter_state.printIfMatch`. Partial trailing lines are saved in `carry`
 /// and prepended on the next call. `position` is advanced by bytes read.
 ///
-/// NOTE: empty lines (consecutive newlines) are silently skipped. This is
-/// intentional for tail output but means blank separators between log entries
-/// are not forwarded to the filter. Revisit if blank-line-aware formats are added.
+/// NOTE: empty lines (consecutive newlines) are silently skipped.
 pub fn readToEOF(
     allocator: std.mem.Allocator,
     file: *std.fs.File,
@@ -212,10 +199,8 @@ pub fn readToEOF(
         position.* += n;
         var slice = buf[0..n];
 
-        // BUG FIX: the old code did `defer allocator.free(combined)` inside the
-        // `if` block, which freed `combined` before the line-scanning loop below
-        // could use `slice` — a use-after-free. The fix hoists the defer outside
-        // the `if` so `combined` lives for the full iteration of the outer loop.
+        // Hoist combined lifetime outside the if-block to prevent use-after-free:
+        // `defer allocator.free` inside the if would free before the scan loop runs.
         var combined: ?[]u8 = null;
         defer if (combined) |c| allocator.free(c);
 
@@ -233,7 +218,6 @@ pub fn readToEOF(
             start = nl + 1;
         }
 
-        // Save the trailing partial line for the next iteration.
         if (start < slice.len) {
             try carry.appendSlice(allocator, slice[start..]);
         }
