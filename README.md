@@ -2,13 +2,31 @@
   <img src=".github/logo.svg" alt="ZLRD Logo" width="200"/>
 </p>
 
-# zlrd
+# zlrd — high-performance log viewer CLI (tail/grep alternative)
 
-High-performance log reader written in Zig. Streams large files line-by-line with minimal memory usage.
+Fast and memory-efficient **log reader and analyzer** written in Zig.
+Designed for working with large log files with support for filtering, search, and real-time streaming.
 
-## Install
+**zlrd is a modern CLI alternative to `tail`, `grep`, and basic log viewers.**
 
-Requires Zig 0.15.2 or later.
+---
+
+## ✨ Features
+
+* ⚡ Stream large files line-by-line with minimal memory usage
+* 🔍 Full-text search (case-insensitive)
+* 📊 Filter by log levels (trace, debug, info, warn, error, fatal, panic)
+* 📅 Filter logs by date or date range
+* 🔄 Real-time mode (`tail -f` equivalent)
+* 📦 Supports JSON and plain text logs
+* 🧩 Works with multiple files
+* 🗜️ Supports compressed logs (gzip)
+
+---
+
+## 🚀 Install
+
+Requires **Zig 0.15.2 or later**
 
 ```bash
 git clone https://github.com/alaleks/zlrd.git
@@ -17,9 +35,11 @@ zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/zlrd /usr/local/bin/
 ```
 
-## Usage
+---
 
-```
+## 🧪 Usage
+
+```bash
 zlrd [options] <file...>
 
 Options:
@@ -36,7 +56,9 @@ Options:
   -h, --help               Show this help
 ```
 
-## Examples
+---
+
+## 📌 Examples
 
 ```bash
 # Basic viewing
@@ -48,14 +70,14 @@ zlrd -l error app.log
 zlrd -l error,warn app.log
 zlrd -l error -l fatal app.log
 
-# Search
+# Search (like grep)
 zlrd -s "connection failed" app.log
 
 # Date filter
 zlrd -d 2024-01-20 app.log
 zlrd -d 2024-01-01..2024-01-31 app.log
 
-# Tail mode
+# Tail mode (real-time)
 zlrd -t app.log
 zlrd -t -l error -s "timeout" app.log
 
@@ -65,28 +87,56 @@ zlrd -l error -d 2024-01-20 -s timeout app.log
 # Last N lines
 zlrd -n 100 app.log
 
-# Short flags can be grouped (GNU-style)
+# Short flags (GNU-style)
 zlrd -tl error app.log
 ```
 
-## Log formats
+---
 
-zlrd auto-detects the format:
+## 🧾 Supported Log Formats
 
-- **JSON** — `{"level":"error","message":"..."}`
-- **Plain text** — `[ERROR] ...`, `level=error ...`, `severity=error ...`
+zlrd automatically detects log format:
 
-## Roadmap
+* **JSON logs**
 
-- [x] Compressed logs (gzip)
-- [ ] Custom log format configuration
-- [ ] Regex pattern matching
-- [ ] Time range filtering
+  ```json
+  {"level":"error","message":"..."}
+  ```
 
-## Contributing
+* **Plain text logs**
 
-Follow Zig's style guide. Add tests for new features. Keep it simple.
+  ```
+  [ERROR] something failed
+  level=error msg="..."
+  severity=error ...
+  ```
 
-## License
+---
+
+## 🗺️ Roadmap
+
+* [x] Compressed logs (gzip)
+* [ ] Custom log format configuration
+* [ ] Regex pattern matching
+* [ ] Advanced time range filtering
+
+---
+
+## 🤝 Contributing
+
+* Follow Zig style guidelines
+* Add tests for new features
+* Keep the code simple and efficient
+
+---
+
+## 🏷️ Keywords
+
+log viewer, log analyzer, cli tool, tail alternative, grep alternative, zig cli, log parser, log monitoring, developer tools
+
+---
+
+## 📄 License
 
 MIT — see [LICENSE](LICENSE) for details.
+
