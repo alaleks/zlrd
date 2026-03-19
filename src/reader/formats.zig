@@ -114,7 +114,7 @@ pub const FilterState = struct {
 
     /// Build filter state from parsed command-line arguments.
     pub fn init(args: flags.Args) FilterState {
-        const has_date = !args.tail_mode and args.date != null;
+        const has_date = args.date != null;
         return .{
             .has_date_filter = has_date,
             .date_range = if (has_date) parseDateRange(args.date.?) else .{ .from = null, .to = null },
