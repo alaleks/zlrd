@@ -251,20 +251,65 @@ fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
 }
 
 /// Extract a date prefix from a log line.
-/// Recognizes JSON lines (field `"time"`) and ISO-8601 prefixes.
+/// Recognizes multiple formats:
+/// - JSON: {"time":"2026-03-19..."} or {"timestamp":"2026-03-19..."} or {"date":"2026-03-19..."}
+/// - ISO-8601 at start: "2026-03-19T12:00:00Z ..."
+/// - Bracketed: "[2026-03-19 12:00:00] ..."
+/// - Plain: "2026-03-19 12:00:00 - ..."
 /// Returns the first 10 characters (YYYY-MM-DD) or `null`.
 fn extractDate(line: []const u8) ?[]const u8 {
-    if (line.len == 0) return null;
+    if (line.len < 10) return null;
 
+    // Format 1: JSON with "time", "timestamp", or "date" field
     if (line[0] == '{') {
-        return simd.extractJsonField(line, "time", 10);
+        // Try "time" field first
+        if (simd.extractJsonField(line, "time", 10)) |date| {
+            return date;
+        }
+        // Try "timestamp" field
+        if (simd.extractJsonField(line, "timestamp", 10)) |date| {
+            return date;
+        }
+        // Try "date" field
+        if (simd.extractJsonField(line, "date", 10)) |date| {
+            return date;
+        }
+        return null;
     }
 
+    // Format 2: ISO-8601 at start (already working)
     if (simd.isISODate(line)) {
         return line[0..10];
     }
 
+    // Format 3: Bracketed timestamp "[2026-03-19 ...]"
+    if (line[0] == '[' and line.len >= 11) {
+        const potential = line[1..11];
+        if (isValidDateString(potential)) {
+            return potential;
+        }
+    }
+
+    // Format 4: Date anywhere in first 60 chars (fallback)
+    const search_len = @min(line.len, 60);
+    var i: usize = 0;
+    while (i + 10 <= search_len) : (i += 1) {
+        if (isValidDateString(line[i .. i + 10])) {
+            return line[i .. i + 10];
+        }
+    }
+
     return null;
+}
+
+/// Check if a 10-byte slice is a valid YYYY-MM-DD date
+inline fn isValidDateString(s: []const u8) bool {
+    if (s.len != 10) return false;
+    return isDigit(s[0]) and isDigit(s[1]) and isDigit(s[2]) and isDigit(s[3]) and
+        s[4] == '-' and
+        isDigit(s[5]) and isDigit(s[6]) and
+        s[7] == '-' and
+        isDigit(s[8]) and isDigit(s[9]);
 }
 
 /// Map a log level to its corresponding terminal color.
@@ -1124,4 +1169,51 @@ test "handleLine should not crash on various inputs" {
     const state = FilterState.init(args);
     _ = state.checkLine("[ERROR] Test");
     _ = state.checkLine("");
+}
+
+test "extractDate: JSON with time field" {
+    const line = "{\"time\":\"2026-03-19T12:00:00Z\",\"msg\":\"test\"}";
+    const date = extractDate(line);
+    try std.testing.expect(date != null);
+    try std.testing.expectEqualStrings("2026-03-19", date.?);
+}
+
+test "extractDate: JSON with timestamp field" {
+    const line = "{\"timestamp\":\"2026-03-19T12:00:00Z\",\"msg\":\"test\"}";
+    const date = extractDate(line);
+    try std.testing.expect(date != null);
+    try std.testing.expectEqualStrings("2026-03-19", date.?);
+}
+
+test "extractDate: JSON with date field" {
+    const line = "{\"date\":\"2026-03-19\",\"msg\":\"test\"}";
+    const date = extractDate(line);
+    try std.testing.expect(date != null);
+    try std.testing.expectEqualStrings("2026-03-19", date.?);
+}
+
+test "extractDate: ISO at start" {
+    const line = "2026-03-19T12:00:00Z [INFO] Message";
+    const date = extractDate(line);
+    try std.testing.expect(date != null);
+    try std.testing.expectEqualStrings("2026-03-19", date.?);
+}
+
+test "extractDate: bracketed timestamp" {
+    const line = "[2026-03-19 12:00:00] INFO: Message";
+    const date = extractDate(line);
+    try std.testing.expect(date != null);
+    try std.testing.expectEqualStrings("2026-03-19", date.?);
+}
+
+test "extractDate: date in middle" {
+    const line = "INFO - 2026-03-19 12:00:00 - Message";
+    const date = extractDate(line);
+    try std.testing.expect(date != null);
+    try std.testing.expectEqualStrings("2026-03-19", date.?);
+}
+
+test "extractDate: no date" {
+    const line = "[INFO] Message without date";
+    try std.testing.expect(extractDate(line) == null);
 }
