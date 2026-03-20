@@ -143,45 +143,47 @@ pub inline fn findAny3(
 /// Escaped quotes (`\"`) inside the value are handled correctly.
 pub fn extractJsonField(
     line: []const u8,
-    comptime key: []const u8,
+    key: []const u8,
     max_len: usize,
 ) ?[]const u8 {
-    var i: usize = 0;
+    // find "key"
+    var pattern_buf: [64]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\"", .{key}) catch return null;
 
-    while (true) {
-        const q = findByte(line, i, '"') orelse return null;
+    const key_pos = std.mem.indexOf(u8, line, pattern) orelse return null;
 
-        if (q + key.len + 2 <= line.len and
-            std.mem.eql(u8, line[q + 1 .. q + 1 + key.len], key) and
-            line[q + 1 + key.len] == '"')
-        {
-            i = q + key.len + 2;
-            break;
-        }
+    var i = key_pos + pattern.len;
 
-        i = q + 1;
-    }
+    // skip spaces
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
 
-    // Skip `:` and optional spaces.
-    while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-    if (i >= line.len or line[i] != '"') return null;
+    // expect :
+    if (i >= line.len or line[i] != ':') return null;
+    i += 1;
 
-    i += 1; // skip opening quote
+    // skip spaces
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+
+    // expect opening quote
+    if (i >= line.len or line[i] != '\"') return null;
+    i += 1;
+
     const start = i;
 
-    // Scan for closing quote within the max_len window, honouring `\"` escapes.
-    const window_end = @min(start + max_len, line.len);
-    while (i < window_end) : (i += 1) {
-        if (line[i] == '\\') {
-            i += 1;
-            continue;
-        }
-        if (line[i] == '"') break;
+    // find closing quote
+    while (i < line.len and line[i] != '\"') : (i += 1) {}
+
+    if (i > line.len) return null;
+
+    const end = i;
+
+    const value = line[start..end];
+
+    if (value.len > max_len) {
+        return value[0..max_len];
     }
 
-    if (i >= window_end or line[i] != '"') return null;
-
-    return line[start..i];
+    return value;
 }
 
 /// Returns true if `s` starts with an ISO-8601 date (`YYYY-MM-DD`).

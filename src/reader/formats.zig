@@ -236,18 +236,54 @@ fn matchDateRange(line: []const u8, range: DateRange) bool {
     return matchDateRangeWithDate(extractDate(line), range);
 }
 
-/// Test whether a pre-extracted date lies within `range`.
-fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
+// matchDateRangeWithDate checks if date is within range (inclusive).
+// Uses integer comparison for correctness and speed.
+fn matchDateRangeWithDate(
+    date: ?[]const u8,
+    range: ?DateRange,
+) bool {
     const d = date orelse return false;
+    const r = range orelse return true;
 
-    if (range.from) |from| {
-        if (std.mem.order(u8, d, from) == .lt) return false;
+    if (d.len < 10) return false;
+    const d10 = d[0..10];
+
+    const di = parseDate10ToInt(d10) orelse return false;
+
+    if (r.from) |from| {
+        const fi = parseDate10ToInt(from) orelse return false;
+        if (di < fi) return false;
     }
-    if (range.to) |to| {
-        if (std.mem.order(u8, d, to) == .gt) return false;
+
+    if (r.to) |to| {
+        const ti = parseDate10ToInt(to) orelse return false;
+        if (di > ti) return false;
     }
 
     return true;
+}
+
+// parseDate10ToInt converts "YYYY-MM-DD" into YYYYMMDD (u32).
+// Returns null if format is invalid.
+fn parseDate10ToInt(date: []const u8) ?u32 {
+    if (date.len < 10) return null;
+    if (date[4] != '-' or date[7] != '-') return null;
+
+    const y: u32 =
+        (@as(u32, date[0] - '0') * 1000) +
+        (@as(u32, date[1] - '0') * 100) +
+        (@as(u32, date[2] - '0') * 10) +
+        (@as(u32, date[3] - '0'));
+
+    const m: u32 =
+        (@as(u32, date[5] - '0') * 10) +
+        (@as(u32, date[6] - '0'));
+
+    const d: u32 =
+        (@as(u32, date[8] - '0') * 10) +
+        (@as(u32, date[9] - '0'));
+
+    return y * 10000 + m * 100 + d;
 }
 
 /// Extract a date prefix from a log line.
@@ -263,16 +299,16 @@ fn extractDate(line: []const u8) ?[]const u8 {
     // Format 1: JSON with "time", "timestamp", or "date" field
     if (line[0] == '{') {
         // Try "time" field first
-        if (simd.extractJsonField(line, "time", 10)) |date| {
-            return date;
+        if (simd.extractJsonField(line, "time", 32)) |date| {
+            if (date.len >= 10) return date[0..10];
         }
         // Try "timestamp" field
-        if (simd.extractJsonField(line, "timestamp", 10)) |date| {
-            return date;
+        if (simd.extractJsonField(line, "timestamp", 32)) |date| {
+            if (date.len >= 10) return date[0..10];
         }
         // Try "date" field
-        if (simd.extractJsonField(line, "date", 10)) |date| {
-            return date;
+        if (simd.extractJsonField(line, "date", 32)) |date| {
+            if (date.len >= 10) return date[0..10];
         }
         return null;
     }
