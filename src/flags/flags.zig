@@ -31,10 +31,40 @@ pub inline fn levelBit(l: Level) LevelMask {
 /// Accepts any casing: "error", "ERROR", "Error", "eRRoR", etc.
 /// Returns `null` if the string does not match any known level.
 pub fn parseLevelInsensitive(s: []const u8) ?Level {
-    inline for (std.meta.fields(Level)) |f| {
-        if (std.ascii.eqlIgnoreCase(s, f.name)) return @enumFromInt(f.value);
+    if (s.len == 0 or s.len > 7) return null;
+    inline for (std.meta.fields(Level)) |field| {
+        if (eqlIgnoreCaseFast(s, field.name)) {
+            return @enumFromInt(field.value);
+        }
     }
     return null;
+}
+
+inline fn eqlIgnoreCaseFast(a: []const u8, comptime b: []const u8) bool {
+    if (a.len != b.len) return false;
+
+    if (comptime b.len <= 8) {
+        comptime var i: usize = 0;
+        inline while (i < b.len) : (i += 1) {
+            if (toLowerFast(a[i]) != toLowerFast(b[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) {
+        if (toLowerFast(a[i]) != toLowerFast(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline fn toLowerFast(c: u8) u8 {
+    const is_upper = (c >= 'A') and (c <= 'Z');
+    return c + @as(u8, if (is_upper) 32 else 0);
 }
 
 /// Result of command-line parsing.
@@ -625,4 +655,46 @@ test "level flag case-insensitive via CLI" {
         try testing.expect((args.levels.? & levelBit(.Warn)) != 0);
         try testing.expect((args.levels.? & levelBit(.Info)) == 0);
     }
+}
+
+test "parseLevelInsensitive: all cases" {
+    // Lowercase
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("error").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("warn").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("info").?);
+    try testing.expectEqual(Level.Debug, parseLevelInsensitive("debug").?);
+    try testing.expectEqual(Level.Trace, parseLevelInsensitive("trace").?);
+    try testing.expectEqual(Level.Fatal, parseLevelInsensitive("fatal").?);
+    try testing.expectEqual(Level.Panic, parseLevelInsensitive("panic").?);
+
+    // UPPERCASE
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("ERROR").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("WARN").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("INFO").?);
+
+    // MiXeD
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("ErRoR").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("wArN").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("InFo").?);
+
+    // Invalid
+    try testing.expect(parseLevelInsensitive("invalid") == null);
+    try testing.expect(parseLevelInsensitive("") == null);
+    try testing.expect(parseLevelInsensitive("err") == null);
+}
+
+test "eqlIgnoreCaseFast: correctness" {
+    try testing.expect(eqlIgnoreCaseFast("error", "ERROR"));
+    try testing.expect(eqlIgnoreCaseFast("Error", "eRRoR"));
+    try testing.expect(eqlIgnoreCaseFast("WaRn", "warn"));
+    try testing.expect(!eqlIgnoreCaseFast("error", "warn"));
+    try testing.expect(!eqlIgnoreCaseFast("error", "erro"));
+}
+
+test "toLowerFast: ASCII conversion" {
+    try testing.expectEqual(@as(u8, 'a'), toLowerFast('A'));
+    try testing.expectEqual(@as(u8, 'z'), toLowerFast('Z'));
+    try testing.expectEqual(@as(u8, 'a'), toLowerFast('a'));
+    try testing.expectEqual(@as(u8, 'z'), toLowerFast('z'));
+    try testing.expectEqual(@as(u8, '0'), toLowerFast('0'));
 }
