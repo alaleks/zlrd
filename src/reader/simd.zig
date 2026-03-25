@@ -173,14 +173,13 @@ pub fn extractJsonField(
     // find closing quote
     while (i < line.len and line[i] != '\"') : (i += 1) {}
 
-    if (i > line.len) return null;
+    if (i >= line.len) return null;
 
     const end = i;
-
     const value = line[start..end];
 
     if (value.len > max_len) {
-        return value[0..max_len];
+        return null;
     }
 
     return value;
