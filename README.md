@@ -116,7 +116,7 @@ zlrd automatically detects log format:
 ## 🗺️ Roadmap
 
 * [x] Compressed logs (gzip)
-* [ ] Custom log format configuration
+* [x] Aggregates log rows.
 * [ ] Regex pattern matching
 * [ ] Advanced time range filtering
 
@@ -139,4 +139,3 @@ log viewer, log analyzer, cli tool, tail alternative, grep alternative, zig cli,
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE) for details.
-
