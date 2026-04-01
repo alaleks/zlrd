@@ -137,52 +137,91 @@ pub inline fn findAny3(
     return null;
 }
 
-/// Extracts the string value of a JSON field matching `"key":"value"`.
+/// Extracts the string value of a JSON field matching `"key": "value"`.
 /// Returns a slice within `line` (no allocation), or null if the key is absent,
-/// the value is not quoted, or the value exceeds `max_len` bytes.
-/// Escaped quotes (`\"`) inside the value are handled correctly.
+/// the value is not a quoted JSON string, or the value exceeds `max_len` bytes.
+///
+/// Escaped bytes inside JSON strings are skipped correctly while scanning.
 pub fn extractJsonField(
     line: []const u8,
     key: []const u8,
     max_len: usize,
 ) ?[]const u8 {
-    // find "key"
-    var pattern_buf: [64]u8 = undefined;
-    const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\"", .{key}) catch return null;
+    if (line.len < key.len + 4) return null;
 
-    const key_pos = std.mem.indexOf(u8, line, pattern) orelse return null;
+    var i: usize = 0;
+    while (i < line.len) {
+        const q = findByte(line, i, '"') orelse return null;
+        i = q + 1;
 
-    var i = key_pos + pattern.len;
+        const key_start = i;
 
-    // skip spaces
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+        // Scan JSON string key with escape handling.
+        while (i < line.len) {
+            if (line[i] == '\\') {
+                i += 2;
+                continue;
+            }
+            if (line[i] == '"') break;
+            i += 1;
+        }
+        if (i >= line.len) return null;
 
-    // expect :
-    if (i >= line.len or line[i] != ':') return null;
-    i += 1;
+        const key_end = i;
+        const found_key = line[key_start..key_end];
+        i += 1;
 
-    // skip spaces
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+        // Skip whitespace after key.
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
 
-    // expect opening quote
-    if (i >= line.len or line[i] != '\"') return null;
-    i += 1;
+        if (i >= line.len or line[i] != ':') {
+            continue;
+        }
+        i += 1;
 
-    const start = i;
+        // Skip whitespace before value.
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
 
-    // find closing quote
-    while (i < line.len and line[i] != '\"') : (i += 1) {}
+        // We only support quoted string values.
+        if (i >= line.len or line[i] != '"') {
+            return null;
+        }
+        i += 1;
 
-    if (i >= line.len) return null;
+        if (!std.mem.eql(u8, found_key, key)) {
+            // Skip this string value safely.
+            while (i < line.len) {
+                if (line[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (line[i] == '"') break;
+                i += 1;
+            }
+            if (i < line.len) i += 1;
+            continue;
+        }
 
-    const end = i;
-    const value = line[start..end];
+        const value_start = i;
 
-    if (value.len > max_len) {
-        return null;
+        while (i < line.len) {
+            if (line[i] == '\\') {
+                i += 2;
+                continue;
+            }
+            if (line[i] == '"') break;
+            i += 1;
+        }
+        if (i >= line.len) return null;
+
+        const value_end = i;
+        const value = line[value_start..value_end];
+        if (value.len > max_len) return null;
+
+        return value;
     }
 
-    return value;
+    return null;
 }
 
 /// Returns true if `s` starts with an ISO-8601 date (`YYYY-MM-DD`).
@@ -200,8 +239,10 @@ pub inline fn isISODate(s: []const u8) bool {
     return true;
 }
 
-/// Returns the byte range of the level text inside a leading `[LEVEL]` marker,
-/// or null if the line does not start with a non-empty `[…]`.
+/// Returns the byte range inside the leading `[...]` marker,
+/// or null if the line does not start with a non-empty bracketed token.
+///
+/// The caller is responsible for validating that the token is an actual log level.
 pub fn findBracketedLevel(line: []const u8) ?struct { start: usize, end: usize } {
     if (line.len < 3 or line[0] != '[') return null;
     const end = findByte(line, 1, ']') orelse return null;
@@ -220,9 +261,10 @@ inline fn isLogfmtSep(c: u8) bool {
     return c == ' ' or c == '\t';
 }
 
-/// Finds a logfmt level field (`level=`, `severity=`, or `lvl=`) and returns
-/// the byte range of its value (up to the next whitespace or EOL), or null.
-/// Requires a word boundary before the key to avoid partial matches such as `mylevel=`.
+/// Finds an unquoted logfmt level field (`level=`, `severity=`, or `lvl=`) and returns
+/// the byte range of its value up to the next whitespace or EOL, or null.
+///
+/// Requires a field boundary before the key to avoid partial matches such as `mylevel=`.
 pub fn findLogfmtLevel(line: []const u8) ?struct { start: usize, end: usize } {
     const keys = .{
         .{ "level", 5 },
@@ -533,4 +575,27 @@ test "findLogfmtLevel: tab separator before lvl=" {
 
 test "findLogfmtLevel: word boundary — xylvl= must not match" {
     try testing.expect(findLogfmtLevel("xylvl=warn msg=test") == null);
+}
+
+test "extractJsonField: key-like text inside another string must not match" {
+    const line =
+        "{\"msg\":\"text with \\\"level\\\":\\\"warn\\\" inside\",\"level\":\"error\"}";
+    const r = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", r.?);
+}
+
+test "extractJsonField: escaped backslash before quote" {
+    const line = "{\"msg\":\"path \\\\ server\"}";
+    const r = extractJsonField(line, "msg", 32);
+    try testing.expectEqualStrings("path \\\\ server", r.?);
+}
+
+test "extractJsonField: whitespace around colon" {
+    const line = "{ \"level\" : \"error\" }";
+    const r = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", r.?);
+}
+
+test "extractJsonField: non-string value is ignored" {
+    try testing.expect(extractJsonField("{\"level\":123}", "level", 10) == null);
 }

@@ -3,9 +3,10 @@
 //! Provides streaming reading with filtering by date, level, and search string.
 
 const std = @import("std");
-const flags = @import("../flags/flags.zig");
+const flags = @import("flags");
 const simd = @import("simd.zig");
 const tail_reader = @import("tail.zig");
+const formats = @import("formats.zig");
 const gzip = @import("gzip.zig");
 
 /// Cached analysis of a single log line.
@@ -162,6 +163,92 @@ const Stats = struct {
     bytes_read: usize = 0,
 };
 
+/// One aggregated log line with its occurrence count.
+const AggregateEntry = struct {
+    key: []const u8,
+    sample_line: []const u8,
+    count: usize,
+};
+
+/// Aggregates identical matched lines.
+/// Keeps first-seen order and stores each unique line only once.
+const Aggregator = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    counts: std.StringHashMapUnmanaged(usize),
+    sample_lines: std.StringHashMapUnmanaged([]const u8),
+    order: std.ArrayList([]const u8),
+
+    fn init(allocator: std.mem.Allocator) !Aggregator {
+        return .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .counts = .{},
+            .sample_lines = .{},
+            .order = try std.ArrayList([]const u8).initCapacity(allocator, 128),
+        };
+    }
+
+    fn deinit(self: *Aggregator) void {
+        self.counts.deinit(self.allocator);
+        self.sample_lines.deinit(self.allocator);
+        self.order.deinit(self.allocator);
+        self.arena.deinit();
+    }
+
+    /// Add one matched line under a precomputed aggregation key.
+    /// The first line seen for a key is kept as the sample line for display.
+    fn add(self: *Aggregator, key: []const u8, sample_line: []const u8) !void {
+        const gop = try self.counts.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+            return;
+        }
+
+        const owned_key = try self.arena.allocator().dupe(u8, key);
+        const owned_line = try self.arena.allocator().dupe(u8, sample_line);
+
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = 1;
+
+        try self.sample_lines.put(self.allocator, owned_key, owned_line);
+        try self.order.append(self.allocator, owned_key);
+    }
+
+    /// Print all aggregated entries in first-seen order.
+    /// If `page_size > 0`, paginate the aggregated output.
+    fn printAll(self: *Aggregator, output: *OutputBuffer, page_size: usize) !void {
+        var batch: usize = 0;
+        var page: usize = 1;
+
+        for (self.order.items) |key| {
+            const count = self.counts.get(key).?;
+            const line = self.sample_lines.get(key).?;
+            try printAggregatePrefix(output, count);
+            try printStyledLineBuffered(output, line, analyzeLine(line));
+
+            if (page_size > 0) {
+                batch += 1;
+                if (batch >= page_size) {
+                    try output.flush();
+                    printPaginationPrompt(page, batch);
+                    waitForEnter();
+                    clearScreen();
+                    batch = 0;
+                    page += 1;
+                }
+            }
+        }
+    }
+};
+
+/// Print `[xN] ` prefix before an aggregated line.
+fn printAggregatePrefix(output: *OutputBuffer, count: usize) !void {
+    try output.write(Color.dim);
+    try output.print("[x{d}] ", .{count});
+    try output.write(Color.reset);
+}
+
 /// Write-buffered wrapper around a `std.fs.File`.
 /// Accumulates output in a heap-allocated `ArrayList` and flushes automatically
 /// when the buffer reaches `max_size` or on `deinit`.
@@ -248,7 +335,13 @@ fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
 /// Returns a slice into `line`, or null if no date is found.
 fn extractDate(line: []const u8) ?[]const u8 {
     if (line.len == 0) return null;
-    if (line[0] == '{') return simd.extractJsonField(line, "time", 10);
+
+    if (line[0] == '{') {
+        const v = simd.extractJsonField(line, "time", 32) orelse return null;
+        if (v.len < 10) return null;
+        return v[0..10];
+    }
+
     if (simd.isISODate(line)) return line[0..10];
     return null;
 }
@@ -290,20 +383,97 @@ pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args) !void {
     }
 }
 
+/// Read a log file with filtering and colored output.
+/// If aggregation is enabled, identical matched lines are grouped and printed once.
+/// If `args.num_lines > 0`, paginates the output; otherwise streams continuously.
 pub fn readStreaming(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
 ) !void {
-    if (gzip.isGzip(path)) {
-        const filter_state = FilterState.init(args);
-        return gzip.readGzip(allocator, path, filter_state);
+    if (args.aggregate) {
+        try readAggregated(allocator, path, args);
+        return;
     }
+
     if (args.num_lines > 0) {
         try readWithPagination(allocator, path, args);
     } else {
         try readContinuous(allocator, path, args);
     }
+}
+
+/// Read the whole file, aggregate identical matched lines, and print them once.
+///
+/// Aggregation is applied after all active filters.
+/// Output keeps the order of the first occurrence of each unique line.
+fn readAggregated(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    args: flags.Args,
+) !void {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const buffer_size = getOptimalBufferSize(file);
+    const buffer = try allocator.alloc(u8, buffer_size);
+    defer allocator.free(buffer);
+
+    var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
+    defer carry.deinit(allocator);
+
+    const filter_state = FilterState.init(args);
+
+    var aggregator = try Aggregator.init(allocator);
+    defer aggregator.deinit();
+
+    var output = try OutputBuffer.init(allocator, std.fs.File.stdout());
+    defer output.deinit();
+
+    while (true) {
+        const n = try file.read(buffer);
+        if (n == 0) break;
+
+        var slice = buffer[0..n];
+
+        if (carry.items.len > 0) {
+            try carry.appendSlice(allocator, slice);
+            slice = carry.items;
+        }
+
+        var start: usize = 0;
+
+        while (true) {
+            const nl = simd.findByte(slice, start, '\n') orelse break;
+            const line = slice[start..nl];
+
+            if (filter_state.checkLine(line) != null) {
+                const key = try formats.buildAggregateKeyForLine(allocator, args.aggregate_mode, line);
+                defer allocator.free(key);
+
+                try aggregator.add(key, line);
+            }
+
+            start = nl + 1;
+        }
+
+        carry.clearRetainingCapacity();
+        if (start < slice.len) {
+            try carry.appendSlice(allocator, slice[start..]);
+        }
+    }
+
+    // Process final line if present (no trailing newline).
+    if (carry.items.len > 0) {
+        if (filter_state.checkLine(carry.items) != null) {
+            const key = try formats.buildAggregateKeyForLine(allocator, args.aggregate_mode, carry.items);
+            defer allocator.free(key);
+
+            try aggregator.add(key, carry.items);
+        }
+    }
+
+    try aggregator.printAll(&output, args.num_lines);
 }
 
 /// Streams a log file continuously, printing each matching line as it is read.
@@ -457,6 +627,187 @@ fn extractLevel(line: []const u8) ?flags.Level {
         return flags.parseLevelInsensitive(line[r.start..r.end]);
 
     return null;
+}
+
+/// Build a key from `level + message`.
+/// The level is normalized via enum tag name; message extraction depends on format.
+fn buildLevelMessageKey(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    info: LineInfo,
+) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(allocator, 128);
+    errdefer buf.deinit(allocator);
+
+    if (info.level) |lvl| {
+        try buf.appendSlice(allocator, @tagName(lvl));
+    } else {
+        try buf.appendSlice(allocator, "unknown");
+    }
+
+    // Unit Separator to avoid accidental ambiguity.
+    try buf.append(allocator, 0x1f);
+
+    const msg = extractMessage(line, info) orelse line;
+    const trimmed = std.mem.trim(u8, msg, &std.ascii.whitespace);
+    try buf.appendSlice(allocator, trimmed);
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a key from the JSON `message`/`msg` field only.
+/// Falls back to the whole line if the field is absent.
+fn buildJsonMessageKey(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    const msg =
+        simd.extractJsonField(line, "message", 4096) orelse
+        simd.extractJsonField(line, "msg", 4096) orelse
+        line;
+
+    return allocator.dupe(u8, std.mem.trim(u8, msg, &std.ascii.whitespace));
+}
+
+/// Build a normalized key that removes common high-cardinality noise:
+/// - lowercases ASCII
+/// - collapses whitespace
+/// - replaces ISO dates with `<date>`
+/// - replaces decimal runs with `#`
+fn buildNormalizedKey(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    info: LineInfo,
+) ![]u8 {
+    _ = info;
+
+    var buf = try std.ArrayList(u8).initCapacity(allocator, line.len);
+    defer buf.deinit(allocator);
+
+    var i: usize = 0;
+    var prev_space = false;
+
+    while (i < line.len) {
+        if (i + 10 <= line.len and isValidDateString(line[i .. i + 10])) {
+            try buf.appendSlice(allocator, "<date>");
+            i += 10;
+            prev_space = false;
+            continue;
+        }
+
+        if (isDigit(line[i])) {
+            try buf.append(allocator, '#');
+            i += 1;
+            while (i < line.len and isDigit(line[i])) : (i += 1) {}
+            prev_space = false;
+            continue;
+        }
+
+        const c = std.ascii.toLower(line[i]);
+        if (std.ascii.isWhitespace(c)) {
+            if (!prev_space) {
+                try buf.append(allocator, ' ');
+                prev_space = true;
+            }
+        } else {
+            try buf.append(allocator, c);
+            prev_space = false;
+        }
+
+        i += 1;
+    }
+
+    const trimmed = std.mem.trim(u8, buf.items, " ");
+    return allocator.dupe(u8, trimmed);
+}
+
+/// Extract a human-meaningful message slice from a line.
+/// Used by `level_message` aggregation mode.
+fn extractMessage(line: []const u8, info: LineInfo) ?[]const u8 {
+    switch (info.format) {
+        .json => {
+            if (simd.extractJsonField(line, "message", 4096)) |v| return v;
+            if (simd.extractJsonField(line, "msg", 4096)) |v| return v;
+            return null;
+        },
+        .plain_logfmt => {
+            if (extractLogfmtField(line, "message")) |v| return v;
+            if (extractLogfmtField(line, "msg")) |v| return v;
+            return null;
+        },
+        .plain_bracketed, .plain_unknown => {
+            return extractPlainMessage(line, info);
+        },
+    }
+}
+
+/// Extract an unquoted or quoted logfmt field value.
+/// Returns a slice into `line`, or null if the key is absent.
+fn extractLogfmtField(line: []const u8, comptime key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+
+    while (i < line.len) {
+        // Skip separators.
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+        if (i >= line.len) return null;
+
+        const field_start = i;
+        const eq = simd.findByte(line, i, '=') orelse return null;
+        const field_key = line[field_start..eq];
+
+        i = eq + 1;
+        if (!std.mem.eql(u8, field_key, key)) {
+            if (i < line.len and line[i] == '"') {
+                i += 1;
+                while (i < line.len and !isUnescapedQuote(line, i)) : (i += 1) {}
+                if (i < line.len) i += 1;
+            } else {
+                while (i < line.len and line[i] != ' ' and line[i] != '\t') : (i += 1) {}
+            }
+            continue;
+        }
+
+        if (i >= line.len) return line[i..i];
+
+        if (line[i] == '"') {
+            const start = i + 1;
+            i += 1;
+            while (i < line.len and !isUnescapedQuote(line, i)) : (i += 1) {}
+            if (i >= line.len) return null;
+            return line[start..i];
+        }
+
+        const start = i;
+        while (i < line.len and line[i] != ' ' and line[i] != '\t') : (i += 1) {}
+        return line[start..i];
+    }
+
+    return null;
+}
+
+/// Extract the message part from a plain-text line.
+/// This is heuristic by design: it removes an initial bracketed token and
+/// common punctuation separators, then returns the remaining tail.
+fn extractPlainMessage(line: []const u8, info: LineInfo) ?[]const u8 {
+    var start: usize = 0;
+
+    if (info.starts_with_bracket) {
+        if (simd.findByte(line, 0, ']')) |pos| {
+            start = pos + 1;
+            while (start < line.len and (line[start] == ' ' or line[start] == ':' or line[start] == '-')) : (start += 1) {}
+            if (start < line.len) return line[start..];
+            return null;
+        }
+    }
+
+    return line;
+}
+
+/// Validate a fixed-width `YYYY-MM-DD` date string.
+inline fn isValidDateString(s: []const u8) bool {
+    if (s.len != 10) return false;
+    return isDigit(s[0]) and isDigit(s[1]) and isDigit(s[2]) and isDigit(s[3]) and
+        s[4] == '-' and
+        isDigit(s[5]) and isDigit(s[6]) and
+        s[7] == '-' and
+        isDigit(s[8]) and isDigit(s[9]);
 }
 
 /// Returns true if `c` is an ASCII decimal digit.
@@ -1150,4 +1501,210 @@ test "matchSearch AND with adjacent operators skips empty tokens" {
     // `hello&&world` splits into ["hello", "", "world"]; empty token is skipped
     try std.testing.expect(matchSearch("hello world", "hello&&world"));
     try std.testing.expect(!matchSearch("hello", "hello&&world"));
+}
+
+test "Aggregator counts identical lines and preserves first-seen order" {
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+
+    try agg.add("[ERROR] one", "[ERROR] one");
+    try agg.add("[WARN] two", "[WARN] two");
+    try agg.add("[ERROR] one", "[ERROR] one");
+    try agg.add("[ERROR] one", "[ERROR] one");
+    try agg.add("[WARN] two", "[WARN] two");
+
+    try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
+    try std.testing.expectEqualStrings("[ERROR] one", agg.order.items[0]);
+    try std.testing.expectEqualStrings("[WARN] two", agg.order.items[1]);
+    try std.testing.expectEqual(@as(usize, 3), agg.counts.get("[ERROR] one").?);
+    try std.testing.expectEqual(@as(usize, 2), agg.counts.get("[WARN] two").?);
+    try std.testing.expectEqualStrings("[ERROR] one", agg.sample_lines.get("[ERROR] one").?);
+    try std.testing.expectEqualStrings("[WARN] two", agg.sample_lines.get("[WARN] two").?);
+}
+
+test "FilterState with aggregation semantics still filters before counting" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{
+        .files = &file,
+        .tail_mode = false,
+        .date = null,
+        .levels = flags.levelBit(.Error),
+        .search = "connection",
+        .num_lines = 0,
+        .aggregate = true,
+    };
+
+    const state = FilterState.init(args);
+
+    try std.testing.expect(state.checkLine("[ERROR] Connection failed") != null);
+    try std.testing.expect(state.checkLine("[ERROR] Timeout") == null);
+    try std.testing.expect(state.checkLine("[INFO] Connection failed") == null);
+}
+
+test "buildAggregateKey exact uses full line" {
+    const line = "[ERROR] Connection failed";
+
+    const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .exact, line);
+    defer std.testing.allocator.free(key);
+
+    try std.testing.expectEqualStrings("[ERROR] Connection failed", key);
+}
+
+test "buildAggregateKey level_message for bracketed line" {
+    const line1 = "[ERROR] Connection failed";
+    const line2 = "[ERROR] Connection failed";
+
+    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
+    defer std.testing.allocator.free(key1);
+
+    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
+    defer std.testing.allocator.free(key2);
+
+    try std.testing.expectEqualStrings(key1, key2);
+    try std.testing.expect(std.mem.indexOfScalar(u8, key1, 0x1f) != null);
+}
+
+test "buildAggregateKey level_message uses JSON message field" {
+    const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
+    const line2 = "{\"time\":\"2023-10-18T12:00:01Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
+
+    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
+    defer std.testing.allocator.free(key1);
+
+    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
+    defer std.testing.allocator.free(key2);
+
+    try std.testing.expectEqualStrings(key1, key2);
+}
+
+test "buildAggregateKey json_message ignores level and timestamp differences" {
+    const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
+    const line2 = "{\"time\":\"2023-10-18T12:00:01Z\",\"level\":\"warn\",\"message\":\"Connection failed\"}";
+
+    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
+    defer std.testing.allocator.free(key1);
+
+    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
+    defer std.testing.allocator.free(key2);
+
+    try std.testing.expectEqualStrings("Connection failed", key1);
+    try std.testing.expectEqualStrings(key1, key2);
+}
+
+test "buildAggregateKey normalized collapses dates digits case and whitespace" {
+    const line1 = "2023-10-18T12:00:00Z [ERROR] Request 123 failed";
+    const line2 = "2023-10-19T12:00:01Z   [error]   Request 987 failed";
+
+    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
+    defer std.testing.allocator.free(key1);
+
+    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
+    defer std.testing.allocator.free(key2);
+
+    try std.testing.expectEqualStrings(key1, key2);
+}
+
+test "Aggregator groups by key and keeps first sample line" {
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+
+    const key = "error\x1fConnection failed";
+
+    try agg.add(key, "[ERROR] Connection failed");
+    try agg.add(key, "[ERROR] Connection failed");
+    try agg.add(key, "[ERROR] Connection failed at retry");
+
+    try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
+    try std.testing.expectEqual(@as(usize, 3), agg.counts.get(key).?);
+    try std.testing.expectEqualStrings("[ERROR] Connection failed", agg.sample_lines.get(key).?);
+}
+
+test "level_message aggregation groups same message with different timestamps" {
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+
+    const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
+    const line2 = "{\"time\":\"2023-10-18T12:00:05Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
+
+    {
+        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
+        defer std.testing.allocator.free(key);
+        try agg.add(key, line1);
+    }
+    {
+        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
+        defer std.testing.allocator.free(key);
+        try agg.add(key, line2);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
+    try std.testing.expectEqual(@as(usize, 2), agg.counts.get(agg.order.items[0]).?);
+    try std.testing.expectEqualStrings(line1, agg.sample_lines.get(agg.order.items[0]).?);
+}
+
+test "json_message aggregation separates different messages" {
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+
+    const line1 = "{\"level\":\"error\",\"message\":\"Connection failed\"}";
+    const line2 = "{\"level\":\"error\",\"message\":\"Timeout\"}";
+
+    {
+        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
+        defer std.testing.allocator.free(key);
+        try agg.add(key, line1);
+    }
+    {
+        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
+        defer std.testing.allocator.free(key);
+        try agg.add(key, line2);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
+}
+
+test "normalized aggregation groups noisy numeric variants" {
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+
+    const line1 = "2023-10-18 [ERROR] Request 123 failed";
+    const line2 = "2023-10-19 [ERROR] Request 999 failed";
+
+    {
+        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
+        defer std.testing.allocator.free(key);
+        try agg.add(key, line1);
+    }
+    {
+        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
+        defer std.testing.allocator.free(key);
+        try agg.add(key, line2);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
+    try std.testing.expectEqual(@as(usize, 2), agg.counts.get(agg.order.items[0]).?);
+}
+
+test "extractLogfmtField extracts quoted and unquoted values" {
+    const line1 = "level=error message=test";
+    const line2 = "level=error message=\"connection failed\"";
+
+    try std.testing.expectEqualStrings("test", extractLogfmtField(line1, "message").?);
+    try std.testing.expectEqualStrings("connection failed", extractLogfmtField(line2, "message").?);
+}
+
+test "extractMessage uses logfmt message field" {
+    const line = "level=error message=\"connection failed\"";
+    const info = analyzeLine(line);
+
+    const msg = extractMessage(line, info).?;
+    try std.testing.expectEqualStrings("connection failed", msg);
+}
+
+test "extractMessage uses plain tail after bracketed level" {
+    const line = "[ERROR] connection failed";
+    const info = analyzeLine(line);
+
+    const msg = extractMessage(line, info).?;
+    try std.testing.expectEqualStrings("connection failed", msg);
 }

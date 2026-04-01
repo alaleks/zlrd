@@ -12,6 +12,14 @@ pub const Level = enum(u8) {
     Panic = 6,
 };
 
+/// Aggregation key strategy used with `-a` / `--aggregate`.
+pub const AggregateMode = enum {
+    exact,
+    level_message,
+    json_message,
+    normalized,
+};
+
 /// Bitmask of enabled log levels.
 /// Each bit corresponds to a `Level` enum value.
 pub const LevelMask = u8;
@@ -36,6 +44,7 @@ pub const OptionNumLines = Options{ .short = 'n', .long = "num-lines" };
 pub const OptionVersion = Options{ .short = 'v', .long = "version" };
 pub const OptionHelp = Options{ .short = 'h', .long = "help" };
 pub const OptionAggregate = Options{ .short = 'a', .long = "aggregate" };
+pub const OptionAggregateMode = Options{ .short = 'm', .long = "aggregate-mode" };
 
 /// Returns a bitmask with a single bit set for the given level.
 pub inline fn levelBit(l: Level) LevelMask {
@@ -55,6 +64,20 @@ pub fn parseLevelInsensitive(s: []const u8) ?Level {
         }
     }
 
+    return null;
+}
+
+/// Parse aggregation mode from CLI text.
+/// Accepted values:
+/// - `exact`
+/// - `level-message`
+/// - `json-message`
+/// - `normalized`
+pub fn parseAggregateMode(s: []const u8) ?AggregateMode {
+    if (std.mem.eql(u8, s, "exact")) return .exact;
+    if (std.mem.eql(u8, s, "level-message")) return .level_message;
+    if (std.mem.eql(u8, s, "json-message")) return .json_message;
+    if (std.mem.eql(u8, s, "normalized")) return .normalized;
     return null;
 }
 
@@ -122,8 +145,11 @@ pub const Args = struct {
     /// Number of lines to display (`-n` / `--num-lines`).
     num_lines: usize = 0,
 
-    /// Aggregate log rows (`-a` / `--aggregate`).
+    /// Aggregate matched log rows (`-a` / `--aggregate`).
     aggregate: bool = false,
+
+    /// Aggregation strategy used when `aggregate` is enabled.
+    aggregate_mode: AggregateMode = .exact,
 
     /// Free allocated memory owned by this struct.
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
@@ -149,10 +175,12 @@ pub const ParseError = error{
     MissingLevel,
     MissingDate,
     MissingNumLines,
+    MissingAggregateMode,
 
     /// Invalid value provided.
     InvalidLevel,
     InvalidNumLines,
+    InvalidAggregateMode,
 
     /// Unknown or unsupported flag.
     UnknownArgument,
@@ -177,26 +205,28 @@ pub fn printHelp() void {
         \\
         \\Options:
         \\  -{c}, --{s} <path>        Add log file (can be repeated)
-        \\  -{c}, --{s} <text>      Search string
-        \\  -{c}, --{s} <levels>     Levels: trace,debug,info,warn,error,fatal,panic
+        \\  -{c}, --{s} <text>        Search string
+        \\  -{c}, --{s} <levels>      Levels: trace,debug,info,warn,error,fatal,panic
         \\                           Case-insensitive. Multiple: -l error,warn -l fatal
         \\  -{c}, --{s} <date>        Date filter (YYYY-MM-DD)
         \\  -{c}, --{s}               Tail mode
-        \\  -{c}, --{s} <num>    Number of lines to display
-        \\  -{c}, --{s}            Print version and exit
+        \\  -{c}, --{s} <num>         Number of lines to display
+        \\  -{c}, --{s}               Print version and exit
         \\  -{c}, --{s}               Show help
-        \\  -{c}, --{s}          Aggregate log rows
+        \\  -{c}, --{s}               Aggregate matched log rows
+        \\  -{c}, --{s} <mode>        Aggregate mode: exact|level-message|json-message|normalized
         \\
     , .{
-        OptionFile.short,      OptionFile.long,
-        OptionSearch.short,    OptionSearch.long,
-        OptionLevel.short,     OptionLevel.long,
-        OptionDate.short,      OptionDate.long,
-        OptionTail.short,      OptionTail.long,
-        OptionNumLines.short,  OptionNumLines.long,
-        OptionVersion.short,   OptionVersion.long,
-        OptionHelp.short,      OptionHelp.long,
-        OptionAggregate.short, OptionAggregate.long,
+        OptionFile.short,          OptionFile.long,
+        OptionSearch.short,        OptionSearch.long,
+        OptionLevel.short,         OptionLevel.long,
+        OptionDate.short,          OptionDate.long,
+        OptionTail.short,          OptionTail.long,
+        OptionNumLines.short,      OptionNumLines.long,
+        OptionVersion.short,       OptionVersion.long,
+        OptionHelp.short,          OptionHelp.long,
+        OptionAggregate.short,     OptionAggregate.long,
+        OptionAggregateMode.short, OptionAggregateMode.long,
     });
 }
 
@@ -221,18 +251,14 @@ fn parseArgsFromIter(
 
     while (it.next()) |arg| {
         // Early exit for help.
-        if (std.mem.eql(u8, arg, "-" ++ [_]u8{OptionHelp.short}) or
-            std.mem.eql(u8, arg, "--" ++ OptionHelp.long))
-        {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             args.help = true;
             args.files = try files.toOwnedSlice(allocator);
             return args;
         }
 
         // Early exit for version.
-        if (std.mem.eql(u8, arg, "-" ++ [_]u8{OptionVersion.short}) or
-            std.mem.eql(u8, arg, "--" ++ OptionVersion.long))
-        {
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
             args.version = true;
             args.files = try files.toOwnedSlice(allocator);
             return args;
@@ -324,6 +350,12 @@ fn parseLongFlag(
         return;
     }
 
+    if (std.mem.eql(u8, name, OptionAggregateMode.long)) {
+        const v = value orelse it.next() orelse return ParseError.MissingAggregateMode;
+        args.aggregate_mode = parseAggregateMode(v) orelse return ParseError.InvalidAggregateMode;
+        return;
+    }
+
     return ParseError.UnknownArgument;
 }
 
@@ -333,6 +365,7 @@ fn parseLongFlag(
 ///   `-tl Error`
 ///   `-fpath`
 ///   `-n10`
+///   `-mexact`
 fn parseShortFlags(
     args: *Args,
     files: *std.ArrayList([]const u8),
@@ -387,12 +420,18 @@ fn parseShortFlags(
                 args.aggregate = true;
             },
 
+            OptionAggregateMode.short => {
+                const v = valueOrNext(group, &i, it) orelse return ParseError.MissingAggregateMode;
+                args.aggregate_mode = parseAggregateMode(v) orelse return ParseError.InvalidAggregateMode;
+                return;
+            },
+
             else => return ParseError.UnknownArgument,
         }
     }
 }
 
-/// Returns an inline value from grouped flags (`-fvalue`, `-n10`)
+/// Returns an inline value from grouped flags (`-fvalue`, `-n10`, `-mexact`)
 /// or consumes the next argv element.
 ///
 /// Inline value is allowed only when this flag is the last one in the group.
@@ -488,8 +527,9 @@ test "multiple long flags" {
     defer arena.deinit();
 
     const argv = [_][]const u8{
-        "zlrd",          "--file=a.log",      "--num-lines=10",
-        "--search=test", "--date=2025-01-01", "--tail",
+        "zlrd",          "--file=a.log",           "--num-lines=10",
+        "--search=test", "--date=2025-01-01",      "--tail",
+        "--aggregate",   "--aggregate-mode=exact",
     };
     var it = FakeIter{ .argv = &argv };
     var args = try parseArgsFromIter(arena.allocator(), &it);
@@ -501,6 +541,8 @@ test "multiple long flags" {
     try testing.expectEqualStrings("test", args.search.?);
     try testing.expectEqualStrings("2025-01-01", args.date.?);
     try testing.expectEqual(true, args.tail_mode);
+    try testing.expect(args.aggregate);
+    try testing.expectEqual(AggregateMode.exact, args.aggregate_mode);
 }
 
 test "mixed flags" {
@@ -599,6 +641,112 @@ test "aggregate short flag does not stop grouped parsing" {
     try testing.expectEqualStrings("log.txt", args.files[0]);
 }
 
+test "aggregate mode via long flag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "--aggregate-mode", "level-message",
+    };
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(AggregateMode.level_message, args.aggregate_mode);
+    try testing.expect(!args.aggregate);
+}
+
+test "aggregate mode via long flag with equals" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "--aggregate-mode=json-message",
+    };
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(AggregateMode.json_message, args.aggregate_mode);
+}
+
+test "aggregate mode via short flag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "-m", "normalized",
+    };
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(AggregateMode.normalized, args.aggregate_mode);
+}
+
+test "aggregate mode via short flag inline" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "-mexact",
+    };
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expectEqual(AggregateMode.exact, args.aggregate_mode);
+}
+
+test "aggregate mode in grouped short flags" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][]const u8{
+        "zlrd", "-amnormalized",
+    };
+    var it = FakeIter{ .argv = &argv };
+    var args = try parseArgsFromIter(arena.allocator(), &it);
+    defer args.deinit(arena.allocator());
+
+    try testing.expect(args.aggregate);
+    try testing.expectEqual(AggregateMode.normalized, args.aggregate_mode);
+}
+
+test "invalid aggregate mode returns error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    {
+        const argv = [_][]const u8{ "zlrd", "--aggregate-mode=bad" };
+        var it = FakeIter{ .argv = &argv };
+        try testing.expectError(ParseError.InvalidAggregateMode, parseArgsFromIter(arena.allocator(), &it));
+    }
+
+    {
+        const argv = [_][]const u8{ "zlrd", "-mbad" };
+        var it = FakeIter{ .argv = &argv };
+        try testing.expectError(ParseError.InvalidAggregateMode, parseArgsFromIter(arena.allocator(), &it));
+    }
+}
+
+test "missing aggregate mode returns error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    {
+        const argv = [_][]const u8{ "zlrd", "--aggregate-mode" };
+        var it = FakeIter{ .argv = &argv };
+        try testing.expectError(ParseError.MissingAggregateMode, parseArgsFromIter(arena.allocator(), &it));
+    }
+
+    {
+        const argv = [_][]const u8{ "zlrd", "-m" };
+        var it = FakeIter{ .argv = &argv };
+        try testing.expectError(ParseError.MissingAggregateMode, parseArgsFromIter(arena.allocator(), &it));
+    }
+}
+
 test "help flag stops parsing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -634,6 +782,7 @@ test "empty file list is allowed" {
     try testing.expectEqual(@as(usize, 0), args.files.len);
     try testing.expect(args.search == null);
     try testing.expect(args.levels == null);
+    try testing.expectEqual(AggregateMode.exact, args.aggregate_mode);
 }
 
 test "levels with whitespace" {
@@ -687,6 +836,20 @@ test "parseLevelInsensitive returns null for unknown" {
     try testing.expect(parseLevelInsensitive("") == null);
     try testing.expect(parseLevelInsensitive("invalid") == null);
     try testing.expect(parseLevelInsensitive("err") == null);
+}
+
+test "parseAggregateMode parses known values" {
+    try testing.expectEqual(AggregateMode.exact, parseAggregateMode("exact").?);
+    try testing.expectEqual(AggregateMode.level_message, parseAggregateMode("level-message").?);
+    try testing.expectEqual(AggregateMode.json_message, parseAggregateMode("json-message").?);
+    try testing.expectEqual(AggregateMode.normalized, parseAggregateMode("normalized").?);
+}
+
+test "parseAggregateMode returns null for unknown values" {
+    try testing.expect(parseAggregateMode("") == null);
+    try testing.expect(parseAggregateMode("level_message") == null);
+    try testing.expect(parseAggregateMode("json_message") == null);
+    try testing.expect(parseAggregateMode("bad") == null);
 }
 
 test "addLevels is case-insensitive" {

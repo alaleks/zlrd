@@ -1,5 +1,5 @@
 const std = @import("std");
-const flags = @import("flags/flags.zig");
+const flags = @import("flags");
 const reader = @import("reader/reader.zig");
 const gzip = @import("reader/gzip.zig");
 const build_options = @import("build_options");
@@ -34,7 +34,7 @@ pub fn main() !void {
     // Ownership note: discovered_files owns the heap strings.
     // args.files may point to the same slice — before freeing discovered_files
     // we reset args.files to &.{} so that the subsequent args.deinit defer
-    // (which runs after this one in LIFO order) does not double-free.
+    // does not double-free.
     var discovered_files: [][]const u8 = &.{};
     defer {
         if (discovered_files.len > 0) {
@@ -60,11 +60,13 @@ pub fn main() !void {
         for (args.files) |path| {
             if (args.tail_mode and gzip.isGzip(path)) {
                 var buf: [512]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "zlrd: {s}: tail mode is not supported for .gz files\n", .{path}) catch "zlrd: tail mode is not supported for .gz files\n";
+                const msg = std.fmt.bufPrint(&buf, "zlrd: {s}: tail mode is not supported for .gz files\n", .{path}) catch
+                    "zlrd: tail mode is not supported for .gz files\n";
                 std.fs.File.stderr().writeAll(msg) catch {};
                 all_ok = false;
                 continue;
             }
+
             std.fs.cwd().access(path, .{}) catch |err| {
                 var buf: [512]u8 = undefined;
                 const msg = switch (err) {
@@ -102,6 +104,7 @@ fn findLogFiles(allocator: std.mem.Allocator) ![][]const u8 {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".log") and
             !std.mem.endsWith(u8, entry.name, ".log.gz")) continue;
+
         try list.append(allocator, try allocator.dupe(u8, entry.name));
     }
 
@@ -170,13 +173,16 @@ fn printError(err: anyerror) void {
         error.InvalidNumLines => "invalid number of lines",
         error.MissingFile => "no input files specified",
         error.InvalidLevel => "invalid log level",
+        error.InvalidAggregateMode => "invalid aggregate mode",
         error.UnknownArgument => "unknown argument",
         error.MissingSearch => "missing search value",
         error.MissingLevel => "missing level value",
         error.MissingDate => "missing date value",
         error.MissingNumLines => "missing number of lines",
+        error.MissingAggregateMode => "missing aggregate mode",
         else => @errorName(err),
     };
+
     std.fs.File.stderr().writeAll("zlrd: ") catch {};
     std.fs.File.stderr().writeAll(msg) catch {};
     std.fs.File.stderr().writeAll("\n") catch {};
