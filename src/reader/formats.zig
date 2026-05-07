@@ -8,6 +8,13 @@ const simd = @import("simd.zig");
 const tail_reader = @import("tail.zig");
 const gzip = @import("gzip.zig");
 
+const debug_io = std.Options.debug_io;
+
+/// Write bytes to stdout. Swallows errors — log output is best-effort.
+fn writeOut(bytes: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(debug_io, bytes) catch {};
+}
+
 /// Cached analysis of a single log line.
 /// Computed once per line by `analyzeLine` and reused by all filters and the printer.
 const LineInfo = struct {
@@ -248,7 +255,7 @@ fn printAggregatePrefix(output: *OutputBuffer, count: usize) !void {
     try output.write(Color.reset);
 }
 
-/// Write-buffered wrapper around a `std.fs.File`.
+/// Write-buffered wrapper around a `std.Io.File`.
 /// Accumulates output in a heap-allocated `ArrayList` and flushes automatically
 /// when the buffer reaches `max_size` or on `deinit`.
 ///
@@ -258,10 +265,10 @@ fn printAggregatePrefix(output: *OutputBuffer, count: usize) !void {
 const OutputBuffer = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayList(u8),
-    file: std.fs.File,
+    file: std.Io.File,
     max_size: usize,
 
-    fn init(allocator: std.mem.Allocator, file: std.fs.File) !OutputBuffer {
+    fn init(allocator: std.mem.Allocator, file: std.Io.File) !OutputBuffer {
         return .{
             .allocator = allocator,
             .buffer = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024),
@@ -277,7 +284,9 @@ const OutputBuffer = struct {
 
     /// Formats and appends text to the internal buffer, flushing if full.
     fn print(self: *OutputBuffer, comptime fmt: []const u8, args: anytype) !void {
-        try self.buffer.writer(self.allocator).print(fmt, args);
+        var buf: [256]u8 = undefined;
+        const printed = try std.fmt.bufPrint(&buf, fmt, args);
+        try self.buffer.appendSlice(self.allocator, printed);
         if (self.buffer.items.len >= self.max_size) try self.flush();
     }
 
@@ -373,7 +382,7 @@ inline fn levelColor(lvl: flags.Level) []const u8 {
 
 /// Returns an appropriate read-buffer size based on the file's size.
 /// Larger files get a larger buffer to amortize syscall overhead.
-fn getOptimalBufferSize(file: std.fs.File) usize {
+fn getOptimalBufferSize(file: std.Io.File) usize {
     const stat = file.stat() catch return 512 * 1024;
     return if (stat.size > 100 * 1024 * 1024)
         1024 * 1024
@@ -445,7 +454,7 @@ fn readAggregated(
     var aggregator = try Aggregator.init(allocator);
     defer aggregator.deinit();
 
-    var output = try OutputBuffer.init(allocator, std.fs.File.stdout());
+    var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
 
     while (true) {
@@ -508,7 +517,7 @@ fn readContinuous(
 
     const filter_state = FilterState.init(args);
 
-    var output = try OutputBuffer.init(allocator, std.fs.File.stdout());
+    var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
 
     var stats = Stats{};
@@ -571,7 +580,7 @@ fn readWithPagination(
 
     const filter_state = FilterState.init(args);
 
-    var output = try OutputBuffer.init(allocator, std.fs.File.stdout());
+    var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
 
     var batch: usize = 0;
@@ -900,9 +909,8 @@ fn printStyledLine(line: []const u8, info: LineInfo) void {
     } else if (info.level != null) {
         printPlainTextWithLevel(line, info);
     } else {
-        const stdout = std.fs.File.stdout();
-        stdout.writeAll(line) catch {};
-        stdout.writeAll("\n") catch {};
+        writeOut(line);
+        writeOut("\n");
     }
 }
 
@@ -922,22 +930,21 @@ fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
 
 /// Writes a plain-text line to stdout, coloring the level token at `info.level_pos`.
 fn printPlainTextWithLevel(line: []const u8, info: LineInfo) void {
-    const stdout = std.fs.File.stdout();
     const color = levelColor(info.level.?);
 
     if (info.level_pos) |r| {
-        if (r.start > 0) stdout.writeAll(line[0..r.start]) catch {};
-        stdout.writeAll(Color.bold) catch {};
-        stdout.writeAll(color) catch {};
-        stdout.writeAll(line[r.start..r.end]) catch {};
-        stdout.writeAll(Color.reset) catch {};
-        if (r.end < line.len) stdout.writeAll(line[r.end..]) catch {};
-        stdout.writeAll("\n") catch {};
+        if (r.start > 0) writeOut(line[0..r.start]);
+        writeOut(Color.bold);
+        writeOut(color);
+        writeOut(line[r.start..r.end]);
+        writeOut(Color.reset);
+        if (r.end < line.len) writeOut(line[r.end..]);
+        writeOut("\n");
         return;
     }
 
-    stdout.writeAll(line) catch {};
-    stdout.writeAll("\n") catch {};
+    writeOut(line);
+    writeOut("\n");
 }
 
 /// Buffered version of `printPlainTextWithLevel`.
@@ -973,7 +980,6 @@ inline fn isUnescapedQuote(line: []const u8, i: usize) bool {
 
 /// Writes a JSON log line to stdout with syntax highlighting.
 fn printJsonStyled(line: []const u8, info: LineInfo) void {
-    const stdout = std.fs.File.stdout();
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
@@ -992,12 +998,12 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
 
                 if (info.level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
-                        stdout.writeAll(Color.bold) catch {};
-                        stdout.writeAll(levelColor(info.level.?)) catch {};
-                        stdout.writeAll("\"") catch {};
-                        stdout.writeAll(str) catch {};
-                        stdout.writeAll("\"") catch {};
-                        stdout.writeAll(Color.reset) catch {};
+                        writeOut(Color.bold);
+                        writeOut(levelColor(info.level.?));
+                        writeOut("\"");
+                        writeOut(str);
+                        writeOut("\"");
+                        writeOut(Color.reset);
                         i += 1;
                         continue;
                     }
@@ -1006,15 +1012,15 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                 var j = i + 1;
                 while (j < line.len and line[j] == ' ') : (j += 1) {}
                 if (j < line.len and line[j] == ':') {
-                    stdout.writeAll(Color.key) catch {};
-                    stdout.writeAll("\"") catch {};
-                    stdout.writeAll(str) catch {};
-                    stdout.writeAll("\"") catch {};
-                    stdout.writeAll(Color.reset) catch {};
+                    writeOut(Color.key);
+                    writeOut("\"");
+                    writeOut(str);
+                    writeOut("\"");
+                    writeOut(Color.reset);
                 } else {
-                    stdout.writeAll("\"") catch {};
-                    stdout.writeAll(str) catch {};
-                    stdout.writeAll("\"") catch {};
+                    writeOut("\"");
+                    writeOut(str);
+                    writeOut("\"");
                 }
             }
             i += 1;
@@ -1034,30 +1040,30 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                     line[i] == 'e' or line[i] == 'E' or
                     line[i] == '+' or line[i] == '-')) : (i += 1)
             {}
-            stdout.writeAll(Color.number) catch {};
-            stdout.writeAll(line[start..i]) catch {};
-            stdout.writeAll(Color.reset) catch {};
+            writeOut(Color.number);
+            writeOut(line[start..i]);
+            writeOut(Color.reset);
             continue;
         }
 
         if (matchWord(line, i, "true")) {
-            stdout.writeAll(Color.boolean) catch {};
-            stdout.writeAll("true") catch {};
-            stdout.writeAll(Color.reset) catch {};
+            writeOut(Color.boolean);
+            writeOut("true");
+            writeOut(Color.reset);
             i += 4;
             continue;
         }
         if (matchWord(line, i, "false")) {
-            stdout.writeAll(Color.boolean) catch {};
-            stdout.writeAll("false") catch {};
-            stdout.writeAll(Color.reset) catch {};
+            writeOut(Color.boolean);
+            writeOut("false");
+            writeOut(Color.reset);
             i += 5;
             continue;
         }
         if (matchWord(line, i, "null")) {
-            stdout.writeAll(Color.nullv) catch {};
-            stdout.writeAll("null") catch {};
-            stdout.writeAll(Color.reset) catch {};
+            writeOut(Color.nullv);
+            writeOut("null");
+            writeOut(Color.reset);
             i += 4;
             continue;
         }
@@ -1065,24 +1071,24 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
         switch (c) {
             '{', '}' => {
                 scratch[0] = c;
-                stdout.writeAll(Color.dim) catch {};
-                stdout.writeAll(scratch[0..1]) catch {};
-                stdout.writeAll(Color.reset) catch {};
+                writeOut(Color.dim);
+                writeOut(scratch[0..1]);
+                writeOut(Color.reset);
             },
             ':' => {
-                stdout.writeAll(Color.gray) catch {};
-                stdout.writeAll(":") catch {};
-                stdout.writeAll(Color.reset) catch {};
+                writeOut(Color.gray);
+                writeOut(":");
+                writeOut(Color.reset);
             },
             else => {
                 scratch[0] = c;
-                stdout.writeAll(scratch[0..1]) catch {};
+                writeOut(scratch[0..1]);
             },
         }
         i += 1;
     }
 
-    stdout.writeAll("\n") catch {};
+    writeOut("\n");
 }
 
 /// Buffered version of `printJsonStyled`, used in read loops to reduce syscalls.
@@ -1200,24 +1206,23 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
 
 /// Prints a pagination prompt to stdout after each full page.
 inline fn printPaginationPrompt(page: usize, count: usize) void {
-    const stdout = std.fs.File.stdout();
     var buf: [128]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "\n{s}--- Page {d}: {d} lines | Press Enter...{s}\n", .{
         Color.dim, page, count, Color.reset,
     }) catch return;
-    stdout.writeAll(s) catch {};
+    writeOut(s);
 }
 
 /// Blocks until the user presses Enter (reads one byte from stdin).
 fn waitForEnter() void {
     var buf: [1]u8 = undefined;
-    _ = std.fs.File.stdin().read(&buf) catch {};
+    _ = std.Io.File.stdin().readStreaming(debug_io, &.{&buf}) catch {};
 }
 
 /// Clears the terminal screen if stdout is a TTY.
 fn clearScreen() void {
-    const stdout = std.fs.File.stdout();
-    if (stdout.isTty()) stdout.writeAll("\x1b[2J\x1b[H") catch {};
+    const stdout = std.Io.File.stdout();
+    if (stdout.isTty(debug_io) catch false) writeOut("\x1b[2J\x1b[H");
 }
 
 /// Matches `line` against a search expression.

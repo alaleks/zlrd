@@ -26,7 +26,7 @@ Designed for working with large log files with support for filtering, search, an
 
 ## 🚀 Install
 
-Requires **Zig 0.15.2 or later**
+Requires **Zig 0.16.0 or later**
 
 ```bash
 git clone https://github.com/alaleks/zlrd.git

@@ -6,13 +6,24 @@ const simd = @import("simd.zig");
 // Track open files with manual position tracking.
 const OpenFile = struct {
     path: []const u8,
-    fd: std.fs.File,
+    fd: std.Io.File,
     position: u64,
 };
 
 // Read buffer size for the follow loop.
 // 64 KB gives good throughput without excessive stack usage.
 const READ_BUF_SIZE = 64 * 1024;
+const tail_io = std.Options.debug_io;
+
+fn seekTo(f: std.Io.File, pos: u64) !void {
+    var rbuf: [1]u8 = undefined;
+    var r = f.reader(tail_io, &rbuf);
+    try r.seekTo(pos);
+}
+
+fn readFile(f: std.Io.File, buf: []u8) !usize {
+    return f.readStreaming(tail_io, &.{buf});
+}
 
 /// Batch-local aggregator used by tail reads.
 /// Keeps first-seen order within one read batch and prints once per key.
@@ -65,7 +76,7 @@ const BatchAggregator = struct {
             if (count > 1) {
                 var buf: [128]u8 = undefined;
                 const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{count}) catch "[x?] ";
-                std.fs.File.stdout().writeAll(prefix) catch {};
+                std.Io.File.stdout().writeStreamingAll(tail_io, prefix) catch {};
             }
 
             formats.handleLine(line, .{
@@ -98,7 +109,7 @@ pub fn follow(
     defer {
         var i: usize = 0;
         while (i < files_len) : (i += 1) {
-            files_buf[i].fd.close();
+            files_buf[i].fd.close(tail_io);
         }
     }
 
@@ -108,10 +119,10 @@ pub fn follow(
     defer allocator.free(read_buf);
 
     for (args.files) |path| {
-        const fd = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const fd = std.Io.Dir.cwd().openFile(tail_io, path, .{}) catch |err| {
             var errbuf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&errbuf, "Cannot open {s}: {any}\n", .{ path, err }) catch "Cannot open file\n";
-            std.fs.File.stderr().writeAll(msg) catch {};
+            std.Io.File.stderr().writeStreamingAll(tail_io, msg) catch {};
             continue;
         };
 
@@ -122,7 +133,7 @@ pub fn follow(
         };
         files_len += 1;
 
-        const stat = try fd.stat();
+        const stat = try fd.stat(tail_io);
         if (stat.size > 0) {
             const final_pos = try readLastNLines(
                 allocator,
@@ -143,19 +154,19 @@ pub fn follow(
         for (carries) |*c| c.deinit(allocator);
         allocator.free(carries);
     }
-    for (carries) |*c| c.* = std.ArrayList(u8){};
+    for (carries) |*c| c.* = .empty;
 
     while (true) {
         var any_read = false;
 
         for (files_buf[0..files_len], carries) |*f, *carry| {
-            const stat = f.fd.stat() catch continue;
+            const stat = f.fd.stat(tail_io) catch continue;
 
             if (f.position > stat.size) {
                 f.position = 0;
-                f.fd.seekTo(0) catch continue;
+                seekTo(f.fd, 0) catch continue;
             } else if (f.position < stat.size) {
-                f.fd.seekTo(f.position) catch continue;
+                seekTo(f.fd, f.position) catch continue;
             } else {
                 continue;
             }
@@ -165,7 +176,7 @@ pub fn follow(
         }
 
         if (!any_read) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            std.Io.sleep(tail_io, std.Io.Duration.fromMilliseconds(100), .awake) catch continue;
         }
     }
 }
@@ -175,7 +186,7 @@ pub fn follow(
 /// after the last consumed byte.
 pub fn readLastNLines(
     allocator: std.mem.Allocator,
-    file: *std.fs.File,
+    file: *std.Io.File,
     args: flags.Args,
     file_size: u64,
     filter_state: formats.FilterState,
@@ -194,8 +205,8 @@ pub fn readLastNLines(
         const chunk_size: u64 = @min(scan_end, READ_BUF_SIZE);
         const chunk_start: u64 = scan_end - chunk_size;
 
-        try file.seekTo(chunk_start);
-        const bytes_read = try file.read(scan_buf[0..chunk_size]);
+        try seekTo(file.*, chunk_start);
+        const bytes_read = try readFile(file.*, scan_buf[0..chunk_size]);
 
         var idx: usize = bytes_read;
         while (idx > 0) {
@@ -213,9 +224,9 @@ pub fn readLastNLines(
         scan_end = chunk_start;
     }
 
-    try file.seekTo(read_from);
+    try seekTo(file.*, read_from);
 
-    var carry = std.ArrayList(u8){};
+    var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
     var pos: u64 = read_from;
 
@@ -227,7 +238,7 @@ pub fn readLastNLines(
 /// processes complete lines, and returns the number of bytes consumed.
 fn readAvailable(
     allocator: std.mem.Allocator,
-    file: *std.fs.File,
+    file: *std.Io.File,
     args: flags.Args,
     filter_state: formats.FilterState,
     carry: *std.ArrayList(u8),
@@ -246,7 +257,7 @@ fn readAvailable(
 /// If aggregation is enabled, matched lines are aggregated within this read batch.
 pub fn readToEOF(
     allocator: std.mem.Allocator,
-    file: *std.fs.File,
+    file: *std.Io.File,
     args: flags.Args,
     filter_state: formats.FilterState,
     carry: *std.ArrayList(u8),
@@ -263,7 +274,7 @@ pub fn readToEOF(
     const agg_ptr: ?*BatchAggregator = if (aggregator) |*agg| agg else null;
 
     while (true) {
-        const n = file.read(buf) catch break;
+        const n = readFile(file.*, buf) catch break;
         if (n == 0) break;
 
         position.* += n;
@@ -367,12 +378,12 @@ test "readLastNLines handles files with fewer lines than requested" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "small.log", .data = "first\nsecond\n" });
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "small.log", .data = "first\nsecond\n" });
 
-    var file = try tmp.dir.openFile("small.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "small.log", .{});
+    defer file.close(tail_io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"small.log"};
     const args = makeSilentTailArgs(files_array[0..], 10, false, .exact);
     const filter_state = formats.FilterState.init(args);
@@ -388,12 +399,12 @@ test "readLastNLines handles empty file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "empty.log", .data = "" });
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "empty.log", .data = "" });
 
-    var file = try tmp.dir.openFile("empty.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "empty.log", .{});
+    defer file.close(tail_io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(tail_io);
     try testing.expectEqual(@as(u64, 0), stat.size);
 }
 
@@ -405,15 +416,15 @@ test "position tracking correctly advances after reading" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(tail_io, .{
         .sub_path = "pos.log",
         .data = "line1\nline2\nline3\nline4\nline5\n",
     });
 
-    var file = try tmp.dir.openFile("pos.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "pos.log", .{});
+    defer file.close(tail_io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"pos.log"};
     const args = makeSilentTailArgs(files_array[0..], 3, false, .exact);
     const filter_state = formats.FilterState.init(args);
@@ -429,21 +440,21 @@ test "truncation detection resets position to beginning" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "truncate.log", .data = "initial content\n" });
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "truncate.log", .data = "initial content\n" });
 
-    var file = try tmp.dir.openFile("truncate.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "truncate.log", .{});
+    defer file.close(tail_io);
 
-    const stat1 = try file.stat();
+    const stat1 = try file.stat(tail_io);
     var position: u64 = stat1.size;
 
     {
-        var truncate_file = try tmp.dir.openFile("truncate.log", .{ .mode = .write_only });
-        defer truncate_file.close();
+        var truncate_file = try tmp.dir.openFile(tail_io, "truncate.log", .{ .mode = .write_only });
+        defer truncate_file.close(tail_io);
         try truncate_file.setEndPos(0);
     }
 
-    const stat2 = try file.stat();
+    const stat2 = try file.stat(tail_io);
     if (position > stat2.size) position = 0;
 
     try testing.expectEqual(@as(u64, 0), position);
@@ -457,15 +468,15 @@ test "appended data read correctly in sequential operations" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(tail_io, .{
         .sub_path = "append.log",
         .data = "line1\nline2\nline3\n",
     });
 
-    var file = try tmp.dir.openFile("append.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "append.log", .{});
+    defer file.close(tail_io);
 
-    const stat1 = try file.stat();
+    const stat1 = try file.stat(tail_io);
     var files_array = [_][]const u8{"append.log"};
     const args = makeSilentTailArgs(files_array[0..], 2, false, .exact);
     const filter_state = formats.FilterState.init(args);
@@ -477,18 +488,18 @@ test "appended data read correctly in sequential operations" {
     try testing.expectEqual(@as(u64, 18), position);
 
     {
-        var append_file = try tmp.dir.openFile("append.log", .{ .mode = .write_only });
-        defer append_file.close();
+        var append_file = try tmp.dir.openFile(tail_io, "append.log", .{ .mode = .write_only });
+        defer append_file.close(tail_io);
         try append_file.seekFromEnd(0);
-        try append_file.writeAll("line4\nline5\nline6\n");
+        try append_file.writeStreamingAll(tail_io, "line4\nline5\nline6\n");
     }
 
-    const stat2 = try file.stat();
+    const stat2 = try file.stat(tail_io);
     try testing.expect(stat2.size > position);
 
-    try file.seekTo(position);
+    try seekTo(file, position);
 
-    var carry = std.ArrayList(u8){};
+    var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
     const args2 = makeSilentTailArgs(files_array[0..], 0, false, .exact);
@@ -520,19 +531,19 @@ test "readToEOF with aggregate exact advances position and preserves carry" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(tail_io, .{
         .sub_path = "agg.log",
         .data = "[ERROR] one\n[ERROR] one\npartial",
     });
 
-    var file = try tmp.dir.openFile("agg.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "agg.log", .{});
+    defer file.close(tail_io);
 
     var files_array = [_][]const u8{"agg.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, true, .exact);
     const filter_state = formats.FilterState.init(args);
 
-    var carry = std.ArrayList(u8){};
+    var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
     var position: u64 = 0;
@@ -553,19 +564,19 @@ test "readToEOF with aggregate normalized consumes complete data" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(tail_io, .{
         .sub_path = "norm.log",
         .data = "2023-10-18 [ERROR] Request 123 failed\n2023-10-19 [ERROR] Request 999 failed\n",
     });
 
-    var file = try tmp.dir.openFile("norm.log", .{});
-    defer file.close();
+    var file = try tmp.dir.openFile(tail_io, "norm.log", .{});
+    defer file.close(tail_io);
 
     var files_array = [_][]const u8{"norm.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, true, .normalized);
     const filter_state = formats.FilterState.init(args);
 
-    var carry = std.ArrayList(u8){};
+    var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
     var position: u64 = 0;

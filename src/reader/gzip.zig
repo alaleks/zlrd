@@ -6,6 +6,8 @@ const std = @import("std");
 const flags = @import("flags");
 const simd = @import("simd.zig");
 
+const debug_io = std.Options.debug_io;
+
 /// Upper bound for a single logical line kept in memory while waiting for `\n`.
 /// Protects against corrupted input or unexpectedly huge records.
 pub const MaxLineLen = 4 * 1024 * 1024;
@@ -74,7 +76,7 @@ const BatchAggregator = struct {
             if (count > 1) {
                 var buf: [128]u8 = undefined;
                 const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{count}) catch "[x?] ";
-                std.fs.File.stdout().writeAll(prefix) catch {};
+                std.Io.File.stdout().writeStreamingAll(debug_io, prefix) catch {};
             }
 
             filter_state.printIfMatch(line);
@@ -104,11 +106,11 @@ pub fn readGzip(
     filter_state: anytype,
     key_builder: ?AggregateKeyBuilder,
 ) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
+    defer file.close(debug_io);
 
     var file_buf: [4096]u8 = undefined;
-    var file_reader = file.reader(&file_buf);
+    var file_reader = file.reader(debug_io, &file_buf);
 
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(
