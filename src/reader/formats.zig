@@ -298,7 +298,7 @@ const OutputBuffer = struct {
 
     fn flush(self: *OutputBuffer) !void {
         if (self.buffer.items.len > 0) {
-            try self.file.writeAll(self.buffer.items);
+            try self.file.writeStreamingAll(debug_io, self.buffer.items);
             self.buffer.clearRetainingCapacity();
         }
     }
@@ -383,7 +383,7 @@ inline fn levelColor(lvl: flags.Level) []const u8 {
 /// Returns an appropriate read-buffer size based on the file's size.
 /// Larger files get a larger buffer to amortize syscall overhead.
 fn getOptimalBufferSize(file: std.Io.File) usize {
-    const stat = file.stat() catch return 512 * 1024;
+    const stat = file.stat(debug_io) catch return 512 * 1024;
     return if (stat.size > 100 * 1024 * 1024)
         1024 * 1024
     else if (stat.size > 10 * 1024 * 1024)
@@ -439,8 +439,8 @@ fn readAggregated(
     path: []const u8,
     args: flags.Args,
 ) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
+    defer file.close(debug_io);
 
     const buffer_size = getOptimalBufferSize(file);
     const buffer = try allocator.alloc(u8, buffer_size);
@@ -458,7 +458,7 @@ fn readAggregated(
     defer output.deinit();
 
     while (true) {
-        const n = try file.read(buffer);
+        const n = try file.readStreaming(debug_io, &.{buffer});
         if (n == 0) break;
 
         var slice = buffer[0..n];
@@ -505,8 +505,8 @@ fn readContinuous(
     path: []const u8,
     args: flags.Args,
 ) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
+    defer file.close(debug_io);
 
     const buffer_size = getOptimalBufferSize(file);
     const buffer = try allocator.alloc(u8, buffer_size);
@@ -523,7 +523,7 @@ fn readContinuous(
     var stats = Stats{};
 
     while (true) {
-        const n = try file.read(buffer);
+        const n = try file.readStreaming(debug_io, &.{buffer});
         if (n == 0) break;
 
         stats.bytes_read += n;
@@ -568,8 +568,8 @@ fn readWithPagination(
     path: []const u8,
     args: flags.Args,
 ) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
+    defer file.close(debug_io);
 
     const buffer_size = getOptimalBufferSize(file);
     const buffer = try allocator.alloc(u8, buffer_size);
@@ -587,7 +587,7 @@ fn readWithPagination(
     var page: usize = 1;
 
     while (true) {
-        const n = try file.read(buffer);
+        const n = try file.readStreaming(debug_io, &.{buffer});
         if (n == 0) break;
 
         var slice = buffer[0..n];
@@ -1758,4 +1758,420 @@ test "extractMessage uses plain tail after bracketed level" {
 
     const msg = extractMessage(line, info).?;
     try testing.expectEqualStrings("connection failed", msg);
+}
+
+test "analyzeLine detects JSON without level field" {
+    const line = "{\"time\":\"2023-10-18T12:00:00Z\",\"msg\":\"hello\"}";
+    const info = analyzeLine(line);
+    try testing.expect(info.is_json);
+    try testing.expectEqual(.json, info.format);
+    try testing.expect(info.level == null);
+    try testing.expectEqualStrings("2023-10-18", info.date.?);
+}
+
+test "analyzeLine detects logfmt format" {
+    const line = "level=info message=\"hello world\"";
+    const info = analyzeLine(line);
+    try testing.expectEqual(.plain_logfmt, info.format);
+    try testing.expectEqual(flags.Level.Info, info.level.?);
+    try testing.expect(!info.is_json);
+    try testing.expect(!info.starts_with_bracket);
+}
+
+test "analyzeLine returns plain_unknown for unrecognized format" {
+    const line = "Just a plain message without any structure";
+    const info = analyzeLine(line);
+    try testing.expectEqual(.plain_unknown, info.format);
+    try testing.expect(info.level == null);
+    try testing.expect(!info.is_json);
+}
+
+test "analyzeLine handles empty line" {
+    const info = analyzeLine("");
+    try testing.expectEqual(.plain_unknown, info.format);
+    try testing.expect(info.level == null);
+    try testing.expect(info.date == null);
+}
+
+test "analyzeLine detects bracketed date" {
+    // When date bracket precedes level bracket, level extraction is blocked
+    // because findBracketedLevel starts from position 0 and sees the date bracket.
+    const line = "[2023-10-18][ERROR] Connection failed";
+    const info = analyzeLine(line);
+    try testing.expect(info.starts_with_bracket);
+    try testing.expectEqual(.plain_bracketed, info.format);
+    try testing.expectEqualStrings("2023-10-18", info.date.?);
+}
+
+test "extractDate extracts bracketed date" {
+    const line = "[2023-10-18] [INFO] Message";
+    const result = extractDate(line);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("2023-10-18", result.?);
+}
+
+test "extractDate returns null for non-date bracket content" {
+    const line = "[INFO] Just a level in brackets";
+    try testing.expect(extractDate(line) == null);
+}
+
+test "buildAggregateKeyForLine wraps analyzeLine automatically" {
+    const line = "[ERROR] Connection failed";
+
+    const key_direct = try buildAggregateKey(testing.allocator, .level_message, line, analyzeLine(line));
+    defer testing.allocator.free(key_direct);
+
+    const key_wrapper = try buildAggregateKeyForLine(testing.allocator, .level_message, line);
+    defer testing.allocator.free(key_wrapper);
+
+    try testing.expectEqualStrings(key_direct, key_wrapper);
+}
+
+test "FilterState.printIfMatch checkLine composition" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{
+        .files = &file,
+        .tail_mode = false,
+        .date = null,
+        .levels = flags.levelBit(.Error),
+        .search = null,
+        .num_lines = 0,
+        .aggregate = false,
+        .aggregate_mode = .exact,
+    };
+    const state = FilterState.init(args);
+    // Same logic as printIfMatch but verifiable without stdout:
+    try testing.expect(state.checkLine("[ERROR] Something went wrong") != null);
+    try testing.expect(state.checkLine("[INFO] Should be filtered out") == null);
+}
+
+test "OutputBuffer init write flush deinit" {
+    var buf = try OutputBuffer.init(testing.allocator, std.Io.File.stdout());
+
+    try buf.write("hello ");
+    try buf.write("world");
+    try testing.expectEqual(@as(usize, 11), buf.buffer.items.len);
+
+    try buf.print(" {d}", .{42});
+    try testing.expect(buf.buffer.items.len > 11);
+
+    // Avoid flushing to stdout in tests
+    buf.buffer.clearRetainingCapacity();
+    buf.buffer.deinit(buf.allocator);
+}
+
+test "OutputBuffer print uses stack buffer for formatting" {
+    var buf = try OutputBuffer.init(testing.allocator, std.Io.File.stdout());
+
+    try buf.print("[x{d}] ", .{5});
+    try testing.expectEqualStrings("[x5] ", buf.buffer.items);
+
+    // Avoid flushing to stdout in tests
+    buf.buffer.clearRetainingCapacity();
+    buf.buffer.deinit(buf.allocator);
+}
+
+test "extractJsonLevelPos finds level field in JSON" {
+    const line = "{\"time\":\"...\",\"level\":\"error\",\"msg\":\"test\"}";
+    const pos = extractJsonLevelPos(line).?;
+    try testing.expectEqualStrings("error", line[pos.start..pos.end]);
+}
+
+test "extractJsonLevelPos returns null for JSON without level" {
+    const line = "{\"time\":\"...\",\"msg\":\"test\"}";
+    try testing.expect(extractJsonLevelPos(line) == null);
+}
+
+test "extractLogfmtField returns null for missing key" {
+    const line = "level=error foo=bar";
+    try testing.expect(extractLogfmtField(line, "message") == null);
+}
+
+test "extractLogfmtField handles empty value at end of line" {
+    const line = "level=error message=";
+    const val = extractLogfmtField(line, "message").?;
+    try testing.expectEqualStrings("", val);
+}
+
+test "extractLogfmtField handles field at very end of line" {
+    const line = "level=error message=hello";
+    const val = extractLogfmtField(line, "message").?;
+    try testing.expectEqualStrings("hello", val);
+}
+
+test "extractPlainMessage returns full line when no brackets" {
+    const line = "Just a plain message";
+    const info = analyzeLine(line);
+    const msg = extractPlainMessage(line, info).?;
+    try testing.expectEqualStrings("Just a plain message", msg);
+}
+
+test "extractPlainMessage strips bracketed prefix with colon" {
+    const line = "[ERROR]: connection failed";
+    const info = analyzeLine(line);
+    const msg = extractPlainMessage(line, info).?;
+    try testing.expectEqualStrings("connection failed", msg);
+}
+
+test "extractPlainMessage strips bracketed prefix with dash" {
+    const line = "[WARN] - something happened";
+    const info = analyzeLine(line);
+    const msg = extractPlainMessage(line, info).?;
+    try testing.expectEqualStrings("something happened", msg);
+}
+
+test "buildLevelMessageKey falls back to full line for unknown format" {
+    const line = "Just a plain line without any level";
+    const info = analyzeLine(line);
+    const key = try buildLevelMessageKey(testing.allocator, line, info);
+    defer testing.allocator.free(key);
+
+    try testing.expect(std.mem.indexOfScalar(u8, key, 0x1f) != null);
+}
+
+test "buildJsonMessageKey falls back to full line when no msg field" {
+    const line = "{\"time\":\"...\",\"level\":\"info\"}";
+    const key = try buildJsonMessageKey(testing.allocator, line);
+    defer testing.allocator.free(key);
+
+    try testing.expectEqualStrings(line, key);
+}
+
+test "buildJsonMessageKey prefers message over msg field" {
+    const line = "{\"msg\":\"short\",\"message\":\"full message\"}";
+    const key = try buildJsonMessageKey(testing.allocator, line);
+    defer testing.allocator.free(key);
+
+    try testing.expectEqualStrings("full message", key);
+}
+
+test "isValidDateString accepts valid date" {
+    try testing.expect(isValidDateString("2023-10-15"));
+    try testing.expect(isValidDateString("0000-00-00"));
+    try testing.expect(isValidDateString("9999-99-99"));
+}
+
+test "isValidDateString rejects invalid strings" {
+    try testing.expect(!isValidDateString("2023-1-15"));
+    try testing.expect(!isValidDateString("2023-10-1"));
+    try testing.expect(!isValidDateString("20231015"));
+    try testing.expect(!isValidDateString("2023-10-15T12:00:00Z"));
+    try testing.expect(!isValidDateString(""));
+    try testing.expect(!isValidDateString("2023-10"));
+}
+
+test "matchDateRangeWithDate returns false for null date" {
+    const range = DateRange{ .from = "2023-10-01", .to = "2023-10-31" };
+    try testing.expect(!matchDateRangeWithDate(null, range));
+}
+
+test "matchDateRangeWithDate returns false for short date" {
+    const range = DateRange{ .from = "2023-10-01", .to = "2023-10-31" };
+    try testing.expect(!matchDateRangeWithDate("2023-10", range));
+}
+
+test "matchDateRangeWithDate handles open-ended from" {
+    const range = DateRange{ .from = null, .to = "2023-10-15" };
+    try testing.expect(matchDateRangeWithDate("2023-10-01", range));
+    try testing.expect(!matchDateRangeWithDate("2023-10-31", range));
+}
+
+test "matchDateRangeWithDate handles open-ended to" {
+    const range = DateRange{ .from = "2023-10-15", .to = null };
+    try testing.expect(!matchDateRangeWithDate("2023-10-01", range));
+    try testing.expect(matchDateRangeWithDate("2023-10-31", range));
+}
+
+test "matchDateRangeWithDate handles unbounded range" {
+    const range = DateRange{ .from = null, .to = null };
+    try testing.expect(matchDateRangeWithDate("2023-10-15", range));
+}
+
+test "matchDateRangeWithDate handles exact date match" {
+    const range = DateRange{ .from = "2023-10-15", .to = "2023-10-15" };
+    try testing.expect(matchDateRangeWithDate("2023-10-15", range));
+    try testing.expect(!matchDateRangeWithDate("2023-10-14", range));
+    try testing.expect(!matchDateRangeWithDate("2023-10-16", range));
+}
+
+test "matchSearch handles empty expression" {
+    try testing.expect(!matchSearch("Hello World", ""));
+}
+
+test "matchSearch handles single character expression" {
+    try testing.expect(matchSearch("Hello World", "h"));
+    try testing.expect(!matchSearch("Hello World", "z"));
+}
+
+test "matchSearch AND has precedence via left-to-right evaluation" {
+    try testing.expect(matchSearch("error: connection failed", "error&failed"));
+    try testing.expect(!matchSearch("error: connection failed", "error&timeout"));
+}
+
+test "containsIgnoreCase finds match at start and end" {
+    try testing.expect(containsIgnoreCase("Hello World Hello", "Hello"));
+    try testing.expect(containsIgnoreCase("abcXYZdef", "xyz"));
+}
+
+test "containsIgnoreCase exact match" {
+    try testing.expect(containsIgnoreCase("hello", "hello"));
+    try testing.expect(containsIgnoreCase("HELLO", "hello"));
+}
+
+test "containsIgnoreCase single char match" {
+    try testing.expect(containsIgnoreCase("abc", "b"));
+    try testing.expect(!containsIgnoreCase("abc", "d"));
+}
+
+test "isUnescapedQuote at position zero" {
+    try testing.expect(isUnescapedQuote("\"hello\"", 0));
+    try testing.expect(isUnescapedQuote("\"hello\"", 6));
+}
+
+test "isUnescapedQuote returns false for non-quote char" {
+    try testing.expect(!isUnescapedQuote("hello", 0));
+}
+
+test "isUnescapedQuote triple backslash before quote is escaped" {
+    try testing.expect(!isUnescapedQuote("\\\\\\\"", 3));
+}
+
+test "Aggregator deinit after no additions is safe" {
+    var agg = try Aggregator.init(testing.allocator);
+    agg.deinit();
+}
+
+test "extractMessage returns null for JSON without message field" {
+    const line = "{\"time\":\"...\",\"level\":\"info\"}";
+    const info = analyzeLine(line);
+    try testing.expect(extractMessage(line, info) == null);
+}
+
+test "extractMessage uses msg field as fallback in JSON" {
+    const line = "{\"time\":\"...\",\"level\":\"info\",\"msg\":\"short msg\"}";
+    const info = analyzeLine(line);
+    const msg = extractMessage(line, info).?;
+    try testing.expectEqualStrings("short msg", msg);
+}
+
+test "extractMessage returns null for logfmt without message" {
+    const line = "level=error foo=bar";
+    const info = analyzeLine(line);
+    try testing.expect(extractMessage(line, info) == null);
+}
+
+test "buildNormalizedKey replaces digit runs with single hash" {
+    const line = "error code 12345 at line 99";
+    const info = analyzeLine(line);
+    const key = try buildNormalizedKey(testing.allocator, line, info);
+    defer testing.allocator.free(key);
+
+    try testing.expectEqualStrings("error code # at line #", key);
+}
+
+test "buildNormalizedKey collapses multiple spaces" {
+    const line = "error    multiple    spaces";
+    const info = analyzeLine(line);
+    const key = try buildNormalizedKey(testing.allocator, line, info);
+    defer testing.allocator.free(key);
+
+    try testing.expectEqualStrings("error multiple spaces", key);
+}
+
+test "buildNormalizedKey replaces ISO date in middle of line" {
+    const line = "request 2023-10-18 failed";
+    const info = analyzeLine(line);
+    const key = try buildNormalizedKey(testing.allocator, line, info);
+    defer testing.allocator.free(key);
+
+    try testing.expect(std.mem.indexOf(u8, key, "<date>") != null);
+}
+
+test "printAggregatePrefix formats count correctly" {
+    var buf = try OutputBuffer.init(testing.allocator, std.Io.File.stdout());
+
+    try printAggregatePrefix(&buf, 42);
+    const output = buf.buffer.items;
+    try testing.expect(std.mem.indexOf(u8, output, "[x42]") != null);
+
+    // Avoid flushing to stdout in tests
+    buf.buffer.clearRetainingCapacity();
+    buf.buffer.deinit(buf.allocator);
+}
+
+test "FilterState checkLine returns null for empty line" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{
+        .files = &file,
+        .tail_mode = false,
+        .date = null,
+        .levels = null,
+        .search = null,
+        .num_lines = 0,
+        .aggregate = false,
+        .aggregate_mode = .exact,
+    };
+    const state = FilterState.init(args);
+    try testing.expect(state.checkLine("") == null);
+}
+
+test "FilterState disables date filter in tail mode" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{
+        .files = &file,
+        .tail_mode = true,
+        .date = "2023-10-01..2023-10-31",
+        .levels = null,
+        .search = null,
+        .num_lines = 0,
+        .aggregate = false,
+        .aggregate_mode = .exact,
+    };
+    const state = FilterState.init(args);
+    try testing.expect(!state.has_date_filter);
+}
+
+test "buildAggregateKey exact duplicates the line" {
+    const line = "some log line";
+    const info = analyzeLine(line);
+    const key = try buildAggregateKey(testing.allocator, .exact, line, info);
+    defer testing.allocator.free(key);
+    try testing.expectEqualStrings(line, key);
+    try testing.expect(key.ptr != line.ptr);
+}
+
+test "extractLogfmtField handles quoted value with spaces" {
+    const line = "level=error msg=\"hello world\" code=500";
+    const val = extractLogfmtField(line, "msg").?;
+    try testing.expectEqualStrings("hello world", val);
+}
+
+test "extractLogfmtField handles key at start of line" {
+    const line = "message=hello level=error";
+    const val = extractLogfmtField(line, "message").?;
+    try testing.expectEqualStrings("hello", val);
+}
+
+test "extractPlainMessage returns null for bracket-only line" {
+    const line = "[ERROR]";
+    const info = analyzeLine(line);
+    try testing.expect(extractPlainMessage(line, info) == null);
+}
+
+test "buildLevelMessageKey uses unknown when level absent" {
+    const line = "Just a plain message";
+    const info = analyzeLine(line);
+    const key = try buildLevelMessageKey(testing.allocator, line, info);
+    defer testing.allocator.free(key);
+
+    try testing.expect(std.mem.startsWith(u8, key, "unknown"));
+}
+
+test "buildAggregateKeyForLine works for normalized mode" {
+    const line = "2023-10-18 [ERROR] Request 123 failed";
+    const key = try buildAggregateKeyForLine(testing.allocator, .normalized, line);
+    defer testing.allocator.free(key);
+
+    try testing.expect(std.mem.indexOf(u8, key, "<date>") != null);
+    try testing.expect(std.mem.indexOf(u8, key, "#") != null);
 }

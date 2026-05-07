@@ -451,7 +451,7 @@ test "truncation detection resets position to beginning" {
     {
         var truncate_file = try tmp.dir.openFile(tail_io, "truncate.log", .{ .mode = .write_only });
         defer truncate_file.close(tail_io);
-        try truncate_file.setEndPos(0);
+        try truncate_file.setLength(tail_io, 0);
     }
 
     const stat2 = try file.stat(tail_io);
@@ -488,9 +488,12 @@ test "appended data read correctly in sequential operations" {
     try testing.expectEqual(@as(u64, 18), position);
 
     {
-        var append_file = try tmp.dir.openFile(tail_io, "append.log", .{ .mode = .write_only });
+        var append_file = try tmp.dir.openFile(tail_io, "append.log", .{});
         defer append_file.close(tail_io);
-        try append_file.seekFromEnd(0);
+        const end_pos = try append_file.length(tail_io);
+        var rbuf: [1]u8 = undefined;
+        var reader = append_file.reader(tail_io, &rbuf);
+        try reader.seekTo(end_pos);
         try append_file.writeStreamingAll(tail_io, "line4\nline5\nline6\n");
     }
 

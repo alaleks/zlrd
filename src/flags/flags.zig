@@ -567,7 +567,7 @@ test "memory cleanup on error" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-f", "a.log", "-f", "b.log", "--bad-flag" } };
     var it = fake;
-    _ = parseArgsFromIter(allocator, &it);
+    _ = parseArgsFromIter(allocator, &it) catch {};
 }
 
 test "empty file list is allowed" {
