@@ -35,34 +35,22 @@ pub fn parseLevelInsensitive(s: []const u8) ?Level {
 }
 
 pub fn parseAggregateMode(s: []const u8) ?AggregateMode {
-    const norm = normalize(s);
     inline for (@typeInfo(AggregateMode).@"enum".fields) |f| {
-        if (std.mem.eql(u8, norm, f.name)) return @enumFromInt(f.value);
+        if (eqlDashInsensitive(s, f.name)) return @enumFromInt(f.value);
     }
     return null;
 }
 
-fn normalize(s: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        if (s[i] == '-') {
-            return replaceDashes(s, i);
-        }
+/// Returns true if `a` and `b` are equal when dashes and underscores are treated
+/// as equivalent. Used for parsing enum values from CLI flags.
+fn eqlDashInsensitive(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        const na = if (ca == '-') '_' else ca;
+        const nb = if (cb == '-') '_' else cb;
+        if (std.ascii.toLower(na) != std.ascii.toLower(nb)) return false;
     }
-    return s;
-}
-
-fn replaceDashes(s: []const u8, first_dash: usize) []const u8 {
-    // We need to return a slice that has underscores instead of dashes.
-    // Since we don't own the memory, we use a threadlocal buffer.
-    const max_len = 64;
-    if (s.len > max_len) return s;
-    var buf: [max_len]u8 = undefined;
-    @memcpy(buf[0..s.len], s);
-    for (buf[0..s.len][first_dash..]) |*c| {
-        if (c.* == '-') c.* = '_';
-    }
-    return buf[0..s.len];
+    return true;
 }
 
 fn eqlIgnoreCaseFast(a: []const u8, b: []const u8) bool {
@@ -564,7 +552,10 @@ test "help flag stops parsing" {
 }
 
 test "memory cleanup on error" {
-    const allocator = testing.allocator;
+    // Use arena so leaked allocations from partial parsing are freed together.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const fake = FakeIter{ .argv = &.{ "zlrd", "-f", "a.log", "-f", "b.log", "--bad-flag" } };
     var it = fake;
     _ = parseArgsFromIter(allocator, &it) catch {};

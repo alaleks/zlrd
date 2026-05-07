@@ -15,14 +15,10 @@ const OpenFile = struct {
 const READ_BUF_SIZE = 64 * 1024;
 const tail_io = std.Options.debug_io;
 
-fn seekTo(f: std.Io.File, pos: u64) !void {
-    var rbuf: [1]u8 = undefined;
-    var r = f.reader(tail_io, &rbuf);
-    try r.seekTo(pos);
-}
-
-fn readFile(f: std.Io.File, buf: []u8) !usize {
-    return f.readStreaming(tail_io, &.{buf});
+/// Reads up to buf.len bytes from `pos` without affecting the OS seek position.
+/// Uses positional read (pread) so concurrent / interleaved I/O is safe.
+fn readAt(f: std.Io.File, pos: u64, buf: []u8) !usize {
+    return f.readPositional(tail_io, &.{buf}, pos);
 }
 
 /// Batch-local aggregator used by tail reads.
@@ -137,7 +133,7 @@ pub fn follow(
         if (stat.size > 0) {
             const final_pos = try readLastNLines(
                 allocator,
-                &files_buf[files_len - 1].fd,
+                &files_buf[files_len - 1],
                 args,
                 stat.size,
                 filter_state,
@@ -163,15 +159,13 @@ pub fn follow(
             const stat = f.fd.stat(tail_io) catch continue;
 
             if (f.position > stat.size) {
+                // File was truncated — reset to beginning.
                 f.position = 0;
-                seekTo(f.fd, 0) catch continue;
-            } else if (f.position < stat.size) {
-                seekTo(f.fd, f.position) catch continue;
-            } else {
+            } else if (f.position == stat.size) {
                 continue;
             }
 
-            const bytes_read = readAvailable(allocator, &f.fd, args, filter_state, carry, &f.position, read_buf) catch continue;
+            const bytes_read = readAvailable(allocator, f, args, filter_state, carry, read_buf) catch continue;
             if (bytes_read > 0) any_read = true;
         }
 
@@ -186,7 +180,7 @@ pub fn follow(
 /// after the last consumed byte.
 pub fn readLastNLines(
     allocator: std.mem.Allocator,
-    file: *std.Io.File,
+    f: *OpenFile,
     args: flags.Args,
     file_size: u64,
     filter_state: formats.FilterState,
@@ -205,8 +199,7 @@ pub fn readLastNLines(
         const chunk_size: u64 = @min(scan_end, READ_BUF_SIZE);
         const chunk_start: u64 = scan_end - chunk_size;
 
-        try seekTo(file.*, chunk_start);
-        const bytes_read = try readFile(file.*, scan_buf[0..chunk_size]);
+        const bytes_read = try readAt(f.fd, chunk_start, scan_buf[0..chunk_size]);
 
         var idx: usize = bytes_read;
         while (idx > 0) {
@@ -224,30 +217,28 @@ pub fn readLastNLines(
         scan_end = chunk_start;
     }
 
-    try seekTo(file.*, read_from);
+    f.position = read_from;
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
-    var pos: u64 = read_from;
 
-    try readToEOF(allocator, file, args, filter_state, &carry, &pos, read_buf);
-    return pos;
+    try readToEOF(allocator, f, args, filter_state, &carry, read_buf);
+    return f.position;
 }
 
 /// Reads any new data from `file` starting at `*position`,
 /// processes complete lines, and returns the number of bytes consumed.
 fn readAvailable(
     allocator: std.mem.Allocator,
-    file: *std.Io.File,
+    f: *OpenFile,
     args: flags.Args,
     filter_state: formats.FilterState,
     carry: *std.ArrayList(u8),
-    position: *u64,
     buf: []u8,
 ) !usize {
-    const start_pos = position.*;
-    try readToEOF(allocator, file, args, filter_state, carry, position, buf);
-    return position.* - start_pos;
+    const start_pos = f.position;
+    try readToEOF(allocator, f, args, filter_state, carry, buf);
+    return f.position - start_pos;
 }
 
 /// Reads `file` to EOF, splits on newlines, and processes complete lines.
@@ -257,11 +248,10 @@ fn readAvailable(
 /// If aggregation is enabled, matched lines are aggregated within this read batch.
 pub fn readToEOF(
     allocator: std.mem.Allocator,
-    file: *std.Io.File,
+    f: *OpenFile,
     args: flags.Args,
     filter_state: formats.FilterState,
     carry: *std.ArrayList(u8),
-    position: *u64,
     buf: []u8,
 ) !void {
     var aggregator: ?BatchAggregator = null;
@@ -274,10 +264,10 @@ pub fn readToEOF(
     const agg_ptr: ?*BatchAggregator = if (aggregator) |*agg| agg else null;
 
     while (true) {
-        const n = readFile(file.*, buf) catch break;
+        const n = readAt(f.fd, f.position, buf) catch break;
         if (n == 0) break;
 
-        position.* += n;
+        f.position += n;
         var slice = buf[0..n];
 
         if (carry.items.len > 0) {
@@ -391,7 +381,8 @@ test "readLastNLines handles files with fewer lines than requested" {
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
 
-    const pos = try readLastNLines(allocator, &file, args, stat.size, filter_state, read_buf);
+    var of = OpenFile{ .path = "small.log", .fd = file, .position = 0 };
+    const pos = try readLastNLines(allocator, &of, args, stat.size, filter_state, read_buf);
     try testing.expectEqual(@as(u64, 13), pos);
 }
 
@@ -432,7 +423,8 @@ test "position tracking correctly advances after reading" {
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
 
-    const position = try readLastNLines(allocator, &file, args, stat.size, filter_state, read_buf);
+    var of = OpenFile{ .path = "pos.log", .fd = file, .position = 0 };
+    const position = try readLastNLines(allocator, &of, args, stat.size, filter_state, read_buf);
     try testing.expectEqual(@as(u64, 30), position);
 }
 
@@ -484,23 +476,20 @@ test "appended data read correctly in sequential operations" {
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
 
-    var position = try readLastNLines(allocator, &file, args, stat1.size, filter_state, read_buf);
+    var of = OpenFile{ .path = "append.log", .fd = file, .position = 0 };
+    const position = try readLastNLines(allocator, &of, args, stat1.size, filter_state, read_buf);
     try testing.expectEqual(@as(u64, 18), position);
 
+    // Append more data using positional write (pwrite)
     {
-        var append_file = try tmp.dir.openFile(tail_io, "append.log", .{});
+        var append_file = try tmp.dir.openFile(tail_io, "append.log", .{ .mode = .read_write });
         defer append_file.close(tail_io);
         const end_pos = try append_file.length(tail_io);
-        var rbuf: [1]u8 = undefined;
-        var reader = append_file.reader(tail_io, &rbuf);
-        try reader.seekTo(end_pos);
-        try append_file.writeStreamingAll(tail_io, "line4\nline5\nline6\n");
+        try append_file.writePositionalAll(tail_io, "line4\nline5\nline6\n", end_pos);
     }
 
     const stat2 = try file.stat(tail_io);
     try testing.expect(stat2.size > position);
-
-    try seekTo(file, position);
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -508,8 +497,8 @@ test "appended data read correctly in sequential operations" {
     const args2 = makeSilentTailArgs(files_array[0..], 0, false, .exact);
     const filter_state2 = formats.FilterState.init(args2);
 
-    try readToEOF(allocator, &file, args2, filter_state2, &carry, &position, read_buf);
-    try testing.expectEqual(@as(u64, 36), position);
+    try readToEOF(allocator, &of, args2, filter_state2, &carry, read_buf);
+    try testing.expectEqual(@as(u64, 36), of.position);
 }
 
 test "batch aggregator counts identical keys and keeps first line" {
@@ -549,14 +538,14 @@ test "readToEOF with aggregate exact advances position and preserves carry" {
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
-    var position: u64 = 0;
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
 
-    try readToEOF(allocator, &file, args, filter_state, &carry, &position, read_buf);
+    var of = OpenFile{ .path = "agg.log", .fd = file, .position = 0 };
+    try readToEOF(allocator, &of, args, filter_state, &carry, read_buf);
 
     try testing.expectEqualStrings("partial", carry.items);
-    try testing.expect(position > 0);
+    try testing.expect(of.position > 0);
 }
 
 test "readToEOF with aggregate normalized consumes complete data" {
@@ -582,12 +571,12 @@ test "readToEOF with aggregate normalized consumes complete data" {
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
-    var position: u64 = 0;
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
 
-    try readToEOF(allocator, &file, args, filter_state, &carry, &position, read_buf);
+    var of = OpenFile{ .path = "norm.log", .fd = file, .position = 0 };
+    try readToEOF(allocator, &of, args, filter_state, &carry, read_buf);
 
     try testing.expectEqual(@as(usize, 0), carry.items.len);
-    try testing.expect(position > 0);
+    try testing.expect(of.position > 0);
 }
