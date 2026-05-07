@@ -676,3 +676,219 @@ test "toLowerFast: ASCII conversion" {
     try testing.expectEqual(@as(u8, 'a'), toLowerFast('a'));
     try testing.expectEqual(@as(u8, '1'), toLowerFast('1'));
 }
+
+test "version flag returns early" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--version", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.version);
+}
+
+test "version flag via -v" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-v" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.version);
+}
+
+test "date filter via -d" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-d", "2023-10-01..2023-10-31", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqualStrings("2023-10-01..2023-10-31", parsed.date.?);
+}
+
+test "date filter via inline -d" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-d2023-10-15", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqualStrings("2023-10-15", parsed.date.?);
+}
+
+test "date filter via --date equals" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--date=2023-10-01" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqualStrings("2023-10-01", parsed.date.?);
+}
+
+test "num lines via -n" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-n", "50", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 50), parsed.num_lines);
+}
+
+test "num lines via inline -n" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-n100", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 100), parsed.num_lines);
+}
+
+test "num lines via --num-lines equals" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--num-lines=25", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 25), parsed.num_lines);
+}
+
+test "num lines zero returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-n", "0" } };
+    var it = fake;
+    try testing.expectError(error.InvalidNumLines, parseArgsFromIter(allocator, &it));
+}
+
+test "num lines missing value" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-n" } };
+    var it = fake;
+    try testing.expectError(error.MissingNumLines, parseArgsFromIter(allocator, &it));
+}
+
+test "search via --search equals" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--search=error" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqualStrings("error", parsed.search.?);
+}
+
+test "level via --level equals" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--level=error,warn" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    const mask = parsed.levels.?;
+    try testing.expect(mask & levelBit(.Error) != 0);
+    try testing.expect(mask & levelBit(.Warn) != 0);
+}
+
+test "file via --file equals" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--file=app.log", "--file=err.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), parsed.files.len);
+}
+
+test "unknown short flag returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-x" } };
+    var it = fake;
+    try testing.expectError(error.UnknownArgument, parseArgsFromIter(allocator, &it));
+}
+
+test "unknown long flag returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--unknown-flag" } };
+    var it = fake;
+    try testing.expectError(error.UnknownArgument, parseArgsFromIter(allocator, &it));
+}
+
+test "allLevelsMask covers all levels" {
+    const mask = allLevelsMask();
+    try testing.expect(mask & levelBit(.Trace) != 0);
+    try testing.expect(mask & levelBit(.Debug) != 0);
+    try testing.expect(mask & levelBit(.Info) != 0);
+    try testing.expect(mask & levelBit(.Warn) != 0);
+    try testing.expect(mask & levelBit(.Error) != 0);
+    try testing.expect(mask & levelBit(.Fatal) != 0);
+    try testing.expect(mask & levelBit(.Panic) != 0);
+}
+
+test "levelBit values are sequential" {
+    try testing.expectEqual(@as(LevelMask, 1), levelBit(.Trace));
+    try testing.expectEqual(@as(LevelMask, 2), levelBit(.Debug));
+    try testing.expectEqual(@as(LevelMask, 4), levelBit(.Info));
+    try testing.expectEqual(@as(LevelMask, 8), levelBit(.Warn));
+    try testing.expectEqual(@as(LevelMask, 16), levelBit(.Error));
+    try testing.expectEqual(@as(LevelMask, 32), levelBit(.Fatal));
+    try testing.expectEqual(@as(LevelMask, 64), levelBit(.Panic));
+}
+
+test "eqlDashInsensitive treats dash and underscore as equal" {
+    try testing.expect(eqlDashInsensitive("level-message", "level_message"));
+    try testing.expect(eqlDashInsensitive("level_message", "level-message"));
+    try testing.expect(eqlDashInsensitive("json-message", "json_message"));
+    try testing.expect(!eqlDashInsensitive("level-message", "level_msg"));
+    try testing.expect(!eqlDashInsensitive("", "x"));
+}
+
+test "eqlDashInsensitive is case-insensitive" {
+    try testing.expect(eqlDashInsensitive("LEVEL-MESSAGE", "level_message"));
+    try testing.expect(eqlDashInsensitive("Exact", "exact"));
+}
+
+test "eqlIgnoreCaseFast handles equal strings" {
+    try testing.expect(eqlIgnoreCaseFast("", ""));
+    try testing.expect(eqlIgnoreCaseFast("a", "A"));
+    try testing.expect(!eqlIgnoreCaseFast("a", "b"));
+    try testing.expect(!eqlIgnoreCaseFast("", "x"));
+}
+
+test "toLowerFast boundary values" {
+    try testing.expectEqual(@as(u8, 'a'), toLowerFast('A'));
+    try testing.expectEqual(@as(u8, 'z'), toLowerFast('Z'));
+    try testing.expectEqual(@as(u8, '@'), toLowerFast('@'));
+    try testing.expectEqual(@as(u8, '['), toLowerFast('['));
+    try testing.expectEqual(@as(u8, '`'), toLowerFast('`'));
+}
+
+test "parseNumLines valid values" {
+    try testing.expectEqual(@as(usize, 1), try parseNumLines("1"));
+    try testing.expectEqual(@as(usize, 99999), try parseNumLines("99999"));
+}
+
+test "parseAggregateMode accepts underscore form" {
+    try testing.expectEqual(AggregateMode.level_message, parseAggregateMode("level_message").?);
+    try testing.expectEqual(AggregateMode.json_message, parseAggregateMode("json_message").?);
+}
+
+test "missing file value returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-f" } };
+    var it = fake;
+    try testing.expectError(error.MissingFile, parseArgsFromIter(allocator, &it));
+}
+
+test "missing search value returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-s" } };
+    var it = fake;
+    try testing.expectError(error.MissingSearch, parseArgsFromIter(allocator, &it));
+}
+
+test "missing date value returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-d" } };
+    var it = fake;
+    try testing.expectError(error.MissingDate, parseArgsFromIter(allocator, &it));
+}
+
+test "missing level value returns error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-l" } };
+    var it = fake;
+    try testing.expectError(error.MissingLevel, parseArgsFromIter(allocator, &it));
+}
