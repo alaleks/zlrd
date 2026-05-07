@@ -670,3 +670,260 @@ test "processLine: aggregate requires key builder" {
         ),
     );
 }
+
+
+test "flushFinalCarry: non-aggregate mode prints line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var carry = try std.ArrayList(u8).initCapacity(allocator, 16);
+    defer carry.deinit(allocator);
+    try carry.appendSlice(allocator, "unterminated");
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try flushFinalCarry(
+        allocator,
+        &carry,
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, 1), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("unterminated", sink.printed_lines.items[0]);
+}
+
+test "flushFinalCarry: empty carry is no-op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(allocator);
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try flushFinalCarry(
+        allocator,
+        &carry,
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, 0), sink.printed_lines.items.len);
+}
+
+test "processChunk: filter that rejects lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var carry = try std.ArrayList(u8).initCapacity(arena.allocator(), 16);
+    defer carry.deinit(arena.allocator());
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+    sink.should_match = false;
+
+    try processChunk(
+        arena.allocator(),
+        &carry,
+        "line1\nline2\n",
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, 0), sink.printed_lines.items.len);
+    try testing.expectEqual(@as(usize, 0), carry.items.len);
+}
+
+test "processChunk: filter rejection with carry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var carry = try std.ArrayList(u8).initCapacity(allocator, 16);
+    defer carry.deinit(allocator);
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+    sink.should_match = false;
+
+    // Rejected lines still consume the carry correctly
+    try processChunk(
+        allocator,
+        &carry,
+        "line1\nline2",
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, 0), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("line2", carry.items);
+}
+
+test "processLine: aggregate mode with key builder" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    var agg = try BatchAggregator.init(allocator);
+    defer agg.deinit();
+
+    try processLine(
+        allocator,
+        "hello",
+        makeArgs(true, .exact),
+        &sink,
+        &agg,
+        testKeyBuilder,
+    );
+
+    try testing.expectEqual(@as(usize, 1), agg.order.items.len);
+    try testing.expectEqualStrings("hello", agg.sample_lines.get("hello").?);
+}
+
+test "processLine: aggregate requires aggregator" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try testing.expectError(
+        GzipReadError.MissingAggregator,
+        processLine(
+            allocator,
+            "x",
+            makeArgs(true, .exact),
+            &sink,
+            null,
+            testKeyBuilder,
+        ),
+    );
+}
+
+test "processLine: non-aggregate prints line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try processLine(
+        allocator,
+        "hello world",
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, 1), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("hello world", sink.printed_lines.items[0]);
+}
+
+test "processChunk: carry near MaxLineLen is accepted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var carry = try std.ArrayList(u8).initCapacity(allocator, MaxLineLen);
+    defer carry.deinit(allocator);
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    // Fill carry near the limit, then add a tiny chunk.
+    // Use a smaller representative size to keep the test fast.
+    const fill_size = 64 * 1024;
+    const big = try allocator.alloc(u8, fill_size);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    try carry.appendSlice(allocator, big);
+
+    try processChunk(
+        allocator,
+        &carry,
+        "y",
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, fill_size + 1), carry.items.len);
+}
+
+test "processChunk: slow path carry compaction after partial consumption" {
+    // When carry has data and a chunk with newlines is appended,
+    // consumed lines are removed and remainder is compacted to the front.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var carry = try std.ArrayList(u8).initCapacity(allocator, 64);
+    defer carry.deinit(allocator);
+    try carry.appendSlice(allocator, "old");
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try processChunk(
+        allocator,
+        &carry,
+        "line\nnew-tail",
+        makeArgs(false, .exact),
+        &sink,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(@as(usize, 1), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("oldline", sink.printed_lines.items[0]);
+    try testing.expectEqualStrings("new-tail", carry.items);
+}
+
+test "BatchAggregator.printAll delegates to filter_state" {
+    // Use unique keys to avoid stdout output from the count > 1 prefix.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var agg = try BatchAggregator.init(allocator);
+    defer agg.deinit();
+
+    try agg.add("key-a", "line-a");
+    try agg.add("key-b", "line-b");
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    agg.printAll(&sink);
+
+    try testing.expectEqual(@as(usize, 2), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("line-a", sink.printed_lines.items[0]);
+    try testing.expectEqualStrings("line-b", sink.printed_lines.items[1]);
+}
+
+test "BatchAggregator deinit after no additions is safe" {
+    var agg = try BatchAggregator.init(testing.allocator);
+    agg.deinit();
+}
+
+
