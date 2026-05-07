@@ -599,3 +599,166 @@ test "extractJsonField: whitespace around colon" {
 test "extractJsonField: non-string value is ignored" {
     try testing.expect(extractJsonField("{\"level\":123}", "level", 10) == null);
 }
+
+
+// ── chunkMask ────────────────────────────────────────────────────────────────
+
+test "chunkMask: single bit" {
+    var mask: @Vector(VecSize, bool) = @splat(false);
+    mask[0] = true;
+    try testing.expectEqual(@as(u16, 1), chunkMask(mask));
+    mask = @splat(false);
+    mask[15] = true;
+    try testing.expectEqual(@as(u16, 0x8000), chunkMask(mask));
+}
+
+test "chunkMask: all bits set" {
+    const mask: @Vector(VecSize, bool) = @splat(true);
+    try testing.expectEqual(@as(u16, 0xFFFF), chunkMask(mask));
+}
+
+test "chunkMask: no bits set" {
+    const mask: @Vector(VecSize, bool) = @splat(false);
+    try testing.expectEqual(@as(u16, 0), chunkMask(mask));
+}
+
+test "chunkMask: alternating bits" {
+    var mask: @Vector(VecSize, bool) = @splat(false);
+    mask[0] = true;
+    mask[2] = true;
+    mask[4] = true;
+    mask[15] = true;
+    const result = chunkMask(mask);
+    try testing.expect(result & 1 != 0);
+    try testing.expect(result & 4 != 0);
+    try testing.expect(result & 16 != 0);
+    try testing.expect(result & 0x8000 != 0);
+    try testing.expect(result & 2 == 0);
+}
+
+// ── findByte edge cases ──────────────────────────────────────────────────────
+
+test "findByte: needle in last byte with start offset" {
+    var buf: [VecSize + 5]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[buf.len - 1] = 'x';
+    try testing.expectEqual(@as(?usize, buf.len - 1), findByte(&buf, VecSize - 1, 'x'));
+}
+
+test "findByte: start near end, scalar path" {
+    const buf = "abcdefghijklmnop";
+    try testing.expectEqual(@as(?usize, null), findByte(buf, 15, 'x'));
+    try testing.expectEqual(@as(?usize, 15), findByte(buf, 14, 'p'));
+}
+
+test "findByte: needle at position 0 with non-zero start" {
+    try testing.expectEqual(@as(?usize, 6), findByte("hello world", 6, 'w'));
+}
+
+test "findByte: every byte matches" {
+    const buf = "xxxxxxxxxxxxxxxxxxxxxx";
+    try testing.expectEqual(@as(?usize, 0), findByte(buf, 0, 'x'));
+    try testing.expectEqual(@as(?usize, 5), findByte(buf, 5, 'x'));
+}
+
+// ── extractJsonField edge cases ──────────────────────────────────────────────
+
+test "extractJsonField: basic key extraction" {
+    const line = "{\"key\":\"val\"}";
+    const r = extractJsonField(line, "key", 10);
+    try testing.expectEqualStrings("val", r.?);
+}
+
+test "extractJsonField: backslash at end of buffer is safe" {
+    const line = "{\"key\": \\";
+    const r = extractJsonField(line, "key", 10);
+    try testing.expect(r == null);
+}
+
+test "extractJsonField: escaped backslash in key" {
+    const line = "{\"k\\\\y\":\"value\"}";
+    const r = extractJsonField(line, "k\\\\y", 10);
+    try testing.expectEqualStrings("value", r.?);
+}
+
+test "extractJsonField: unicode escape in value" {
+    const line = "{\"msg\":\"hello \\\\u0041 world\"}";
+    const r = extractJsonField(line, "msg", 30);
+    try testing.expect(r != null);
+}
+
+test "extractJsonField: tab around colon" {
+    const line = "{\"level\":\t\"error\"}";
+    const r = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", r.?);
+}
+
+test "extractJsonField: key starting after escaped quote in previous field" {
+    const line = "{\"msg\":\"he\\\"llo\",\"level\":\"info\"}";
+    const r = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("info", r.?);
+}
+
+test "extractJsonField: not a JSON object (no opening brace)" {
+    try testing.expect(extractJsonField("level: error", "level", 10) == null);
+}
+
+test "extractJsonField: truncated JSON" {
+    try testing.expect(extractJsonField("{\"lev", "level", 10) == null);
+    try testing.expect(extractJsonField("{\"level\"", "level", 10) == null);
+    try testing.expect(extractJsonField("{\"level\":", "level", 10) == null);
+}
+
+// ── findLogfmtLevel edge cases ───────────────────────────────────────────────
+
+test "findLogfmtLevel: multiple equals signs, level is first" {
+    const line = "level=error extra=stuff=more";
+    const r = findLogfmtLevel(line).?;
+    try testing.expectEqualStrings("error", line[r.start..r.end]);
+}
+
+test "findLogfmtLevel: severity= at position 0" {
+    const line = "severity=warn time=...";
+    const r = findLogfmtLevel(line).?;
+    try testing.expectEqualStrings("warn", line[r.start..r.end]);
+}
+
+test "findLogfmtLevel: equals inside value does not confuse" {
+    const line = "msg=url=http://x level=error";
+    const r = findLogfmtLevel(line).?;
+    try testing.expectEqualStrings("error", line[r.start..r.end]);
+}
+
+test "findLogfmtLevel: key appears as suffix of another key" {
+    try testing.expect(findLogfmtLevel("notlevel=warn") == null);
+}
+
+// ── isISODate edge cases ─────────────────────────────────────────────────────
+
+test "isISODate: exactly 10 bytes" {
+    try testing.expect(isISODate("2024-12-31"));
+}
+
+test "isISODate: rejects non-ASCII digits" {
+    try testing.expect(!isISODate("2024-12-3١"));
+}
+
+test "isISODate: rejects hyphen at wrong positions" {
+    try testing.expect(!isISODate("202412-31"));
+    try testing.expect(!isISODate("2024-1231"));
+}
+
+// ── findBracketedLevel edge cases ────────────────────────────────────────────
+
+test "findBracketedLevel: nested brackets" {
+    const r = findBracketedLevel("[[nested]] msg");
+    try testing.expect(r != null);
+    try testing.expectEqual(@as(usize, 1), r.?.start);
+    try testing.expectEqual(@as(usize, 8), r.?.end);
+}
+
+test "findBracketedLevel: single char inside brackets" {
+    const r = findBracketedLevel("[X] something").?;
+    try testing.expectEqual(@as(usize, 1), r.start);
+    try testing.expectEqual(@as(usize, 2), r.end);
+}
