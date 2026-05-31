@@ -23,6 +23,7 @@ zig-out/
 .idea/
 .zed
 *.iml
+.agents
 
 # Coverage / profiling
 *.prof

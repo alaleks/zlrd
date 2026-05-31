@@ -137,11 +137,11 @@ pub const FilterState = struct {
     pub fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
         if (line.len == 0) return null;
 
-        const info = analyzeLine(line);
-
         if (self.has_search_filter) {
             if (!matchSearch(line, self.search_expr.?)) return null;
         }
+
+        const info = analyzeLine(line);
 
         if (self.has_level_filter) {
             const lvl = info.level orelse return null;
@@ -162,13 +162,6 @@ pub const FilterState = struct {
     }
 };
 
-/// Per-session read statistics (non-interactive mode only).
-const Stats = struct {
-    lines_read: usize = 0,
-    lines_matched: usize = 0,
-    bytes_read: usize = 0,
-};
-
 /// One aggregated output entry.
 const AggregateEntry = struct {
     key: []const u8,
@@ -183,6 +176,7 @@ const Aggregator = struct {
     arena: std.heap.ArenaAllocator,
     counts: std.StringHashMapUnmanaged(usize),
     sample_lines: std.StringHashMapUnmanaged([]const u8),
+    sample_infos: std.StringHashMapUnmanaged(LineInfo),
     order: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) !Aggregator {
@@ -191,6 +185,7 @@ const Aggregator = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .counts = .{},
             .sample_lines = .{},
+            .sample_infos = .{},
             .order = try std.ArrayList([]const u8).initCapacity(allocator, 128),
         };
     }
@@ -198,13 +193,15 @@ const Aggregator = struct {
     fn deinit(self: *Aggregator) void {
         self.counts.deinit(self.allocator);
         self.sample_lines.deinit(self.allocator);
+        self.sample_infos.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.arena.deinit();
     }
 
     /// Add one matched line under a precomputed aggregation key.
-    /// The first line seen for a key is kept as the sample line for display.
-    fn add(self: *Aggregator, key: []const u8, sample_line: []const u8) !void {
+    /// The first line seen for a key is kept as the sample line for display
+    /// together with its precomputed `LineInfo` to avoid re-analysis during output.
+    fn add(self: *Aggregator, key: []const u8, sample_line: []const u8, info: LineInfo) !void {
         const gop = try self.counts.getOrPut(self.allocator, key);
         if (gop.found_existing) {
             gop.value_ptr.* += 1;
@@ -218,6 +215,7 @@ const Aggregator = struct {
         gop.value_ptr.* = 1;
 
         try self.sample_lines.put(self.allocator, owned_key, owned_line);
+        try self.sample_infos.put(self.allocator, owned_key, info);
         try self.order.append(self.allocator, owned_key);
     }
 
@@ -230,8 +228,9 @@ const Aggregator = struct {
         for (self.order.items) |key| {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
+            const info = self.sample_infos.get(key).?;
             try printAggregatePrefix(output, count);
-            try printStyledLineBuffered(output, line, analyzeLine(line));
+            try printStyledLineBuffered(output, line, info);
 
             if (page_size > 0) {
                 batch += 1;
@@ -476,7 +475,7 @@ fn readAggregated(
             if (filter_state.checkLine(line)) |info| {
                 const key = try buildAggregateKey(allocator, args.aggregate_mode, line, info);
                 defer allocator.free(key);
-                try aggregator.add(key, line);
+                try aggregator.add(key, line, info);
             }
 
             start = nl + 1;
@@ -492,7 +491,7 @@ fn readAggregated(
         if (filter_state.checkLine(carry.items)) |info| {
             const key = try buildAggregateKey(allocator, args.aggregate_mode, carry.items, info);
             defer allocator.free(key);
-            try aggregator.add(key, carry.items);
+            try aggregator.add(key, carry.items, info);
         }
     }
 
@@ -520,13 +519,10 @@ fn readContinuous(
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
 
-    var stats = Stats{};
-
     while (true) {
         const n = try file.readStreaming(debug_io, &.{buffer});
         if (n == 0) break;
 
-        stats.bytes_read += n;
         var slice = buffer[0..n];
 
         if (carry.items.len > 0) {
@@ -538,11 +534,9 @@ fn readContinuous(
         while (true) {
             const nl = simd.findByte(slice, start, '\n') orelse break;
             const line = slice[start..nl];
-            stats.lines_read += 1;
 
             if (filter_state.checkLine(line)) |info| {
                 try printStyledLineBuffered(&output, line, info);
-                stats.lines_matched += 1;
             }
 
             start = nl + 1;
@@ -873,30 +867,29 @@ fn matchWord(line: []const u8, pos: usize, comptime word: []const u8) bool {
 
 /// Locates the `"level"` value inside a JSON log line and returns its byte range.
 /// Used by the printer to colorize only the level token, not the surrounding JSON.
+/// Continues searching after `"level"` tokens that are not followed by `: "`
+/// (e.g. when `"level"` appears as a JSON value before the actual key).
 fn extractJsonLevelPos(line: []const u8) ?LevelPos {
-    var i: usize = 0;
+    var search_pos: usize = 0;
 
     while (true) {
-        const q = simd.findByte(line, i, '"') orelse return null;
+        const q = simd.findByte(line, search_pos, '"') orelse return null;
 
         if (q + 7 <= line.len and
             std.mem.eql(u8, line[q + 1 .. q + 6], "level") and
             line[q + 6] == '"')
         {
-            i = q + 7;
-            break;
+            var i = q + 7;
+            while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
+            if (i < line.len and line[i] == '"') {
+                const start = i + 1;
+                const end = simd.findByte(line, start, '"') orelse return null;
+                return LevelPos{ .start = start, .end = end };
+            }
         }
 
-        i = q + 1;
+        search_pos = q + 1;
     }
-
-    while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-    if (i >= line.len or line[i] != '"') return null;
-
-    const start = i + 1;
-    const end = simd.findByte(line, start, '"') orelse return null;
-
-    return LevelPos{ .start = start, .end = end };
 }
 
 /// Prints a log line to stdout with ANSI coloring appropriate for its format.
@@ -1556,11 +1549,11 @@ test "Aggregator counts identical lines and preserves first-seen order" {
     var agg = try Aggregator.init(testing.allocator);
     defer agg.deinit();
 
-    try agg.add("[ERROR] one", "[ERROR] one");
-    try agg.add("[WARN] two", "[WARN] two");
-    try agg.add("[ERROR] one", "[ERROR] one");
-    try agg.add("[ERROR] one", "[ERROR] one");
-    try agg.add("[WARN] two", "[WARN] two");
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
+    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two"));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
+    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two"));
 
     try testing.expectEqual(@as(usize, 2), agg.order.items.len);
     try testing.expectEqualStrings("[ERROR] one", agg.order.items[0]);
@@ -1661,9 +1654,9 @@ test "Aggregator groups by key and keeps first sample line" {
 
     const key = "error\x1fConnection failed";
 
-    try agg.add(key, "[ERROR] Connection failed");
-    try agg.add(key, "[ERROR] Connection failed");
-    try agg.add(key, "[ERROR] Connection failed at retry");
+    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed"));
+    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed"));
+    try agg.add(key, "[ERROR] Connection failed at retry", analyzeLine("[ERROR] Connection failed at retry"));
 
     try testing.expectEqual(@as(usize, 1), agg.order.items.len);
     try testing.expectEqual(@as(usize, 3), agg.counts.get(key).?);
@@ -1678,14 +1671,16 @@ test "level_message aggregation groups same message with different timestamps" {
     const line2 = "{\"time\":\"2023-10-18T12:00:05Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
 
     {
-        const key = try buildAggregateKey(testing.allocator, .level_message, line1, analyzeLine(line1));
+        const info = analyzeLine(line1);
+        const key = try buildAggregateKey(testing.allocator, .level_message, line1, info);
         defer testing.allocator.free(key);
-        try agg.add(key, line1);
+        try agg.add(key, line1, info);
     }
     {
-        const key = try buildAggregateKey(testing.allocator, .level_message, line2, analyzeLine(line2));
+        const info = analyzeLine(line2);
+        const key = try buildAggregateKey(testing.allocator, .level_message, line2, info);
         defer testing.allocator.free(key);
-        try agg.add(key, line2);
+        try agg.add(key, line2, info);
     }
 
     try testing.expectEqual(@as(usize, 1), agg.order.items.len);
@@ -1701,14 +1696,16 @@ test "json_message aggregation separates different messages" {
     const line2 = "{\"level\":\"error\",\"message\":\"Timeout\"}";
 
     {
-        const key = try buildAggregateKey(testing.allocator, .json_message, line1, analyzeLine(line1));
+        const info = analyzeLine(line1);
+        const key = try buildAggregateKey(testing.allocator, .json_message, line1, info);
         defer testing.allocator.free(key);
-        try agg.add(key, line1);
+        try agg.add(key, line1, info);
     }
     {
-        const key = try buildAggregateKey(testing.allocator, .json_message, line2, analyzeLine(line2));
+        const info = analyzeLine(line2);
+        const key = try buildAggregateKey(testing.allocator, .json_message, line2, info);
         defer testing.allocator.free(key);
-        try agg.add(key, line2);
+        try agg.add(key, line2, info);
     }
 
     try testing.expectEqual(@as(usize, 2), agg.order.items.len);
@@ -1722,14 +1719,16 @@ test "normalized aggregation groups noisy numeric variants" {
     const line2 = "2023-10-19 [ERROR] Request 999 failed";
 
     {
-        const key = try buildAggregateKey(testing.allocator, .normalized, line1, analyzeLine(line1));
+        const info = analyzeLine(line1);
+        const key = try buildAggregateKey(testing.allocator, .normalized, line1, info);
         defer testing.allocator.free(key);
-        try agg.add(key, line1);
+        try agg.add(key, line1, info);
     }
     {
-        const key = try buildAggregateKey(testing.allocator, .normalized, line2, analyzeLine(line2));
+        const info = analyzeLine(line2);
+        const key = try buildAggregateKey(testing.allocator, .normalized, line2, info);
         defer testing.allocator.free(key);
-        try agg.add(key, line2);
+        try agg.add(key, line2, info);
     }
 
     try testing.expectEqual(@as(usize, 1), agg.order.items.len);
