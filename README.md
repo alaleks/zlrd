@@ -116,9 +116,11 @@ zlrd automatically detects log format:
 ## 🗺️ Roadmap
 
 * [x] Compressed logs (gzip)
-* [x] Aggregates log rows.
-* [ ] Regex pattern matching
-* [ ] Advanced time range filtering
+* [x] Aggregates log rows
+* [ ] Regex-based filtering — `-s` with pattern matching for grep parity
+* [ ] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
+* [ ] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
+* [ ] Homebrew tap + apt/yum packages — `brew install zlrd`
 
 ---
 
