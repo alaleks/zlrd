@@ -200,6 +200,41 @@ pub const FilterState = struct {
     }
 };
 
+/// Per-level line counter for summary display.
+pub const LevelCounter = struct {
+    counts: [7]usize = [_]usize{0} ** 7,
+    total: usize = 0,
+
+    pub fn add(self: *LevelCounter, lvl: flags.Level) void {
+        self.counts[@intFromEnum(lvl)] += 1;
+        self.total += 1;
+    }
+
+    /// Print a colored summary of matched line counts per level.
+    pub fn print(self: LevelCounter) void {
+        if (self.total == 0) return;
+        const levels = [_]flags.Level{ .Trace, .Debug, .Info, .Warn, .Error, .Fatal, .Panic };
+        for (levels) |lvl| {
+            const n = self.counts[@intFromEnum(lvl)];
+            if (n == 0) continue;
+            const style = levelStyle(lvl);
+            writeOut(style.bg);
+            writeOut(style.fg);
+            writeOut("\u{2009}");
+            var buf: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{s} {d}", .{ @tagName(lvl), n }) catch continue;
+            writeOut(s);
+            writeOut("\u{2009}");
+            writeOut(Color.reset);
+        }
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "  total {d}\n", .{self.total}) catch return;
+        writeOut(Color.dim);
+        writeOut(s);
+        writeOut(Color.reset);
+    }
+};
+
 /// Aggregates identical matched lines.
 /// Keeps first-seen order and stores each unique line only once.
 const Aggregator = struct {
@@ -492,9 +527,11 @@ pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args) !void {
         try tail_reader.follow(allocator, args);
         return;
     }
+    var counter = LevelCounter{};
     for (args.files) |path| {
-        try readStreaming(allocator, path, args);
+        try readStreaming(allocator, path, args, &counter);
     }
+    counter.print();
 }
 
 /// Read a log file with filtering and colored output.
@@ -504,6 +541,7 @@ pub fn readStreaming(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
+    counter: *LevelCounter,
 ) !void {
     if (gzip.isGzip(path)) {
         const filter_state = FilterState.init(args);
@@ -512,14 +550,14 @@ pub fn readStreaming(
     }
 
     if (args.aggregate) {
-        try readAggregated(allocator, path, args);
+        try readAggregated(allocator, path, args, counter);
         return;
     }
 
     if (args.num_lines > 0) {
-        try readWithPagination(allocator, path, args);
+        try readWithPagination(allocator, path, args, counter);
     } else {
-        try readContinuous(allocator, path, args);
+        try readContinuous(allocator, path, args, counter);
     }
 }
 
@@ -531,6 +569,7 @@ fn readAggregated(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
+    counter: *LevelCounter,
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
     defer file.close(debug_io);
@@ -572,6 +611,7 @@ fn readAggregated(
 
             // Reuse LineInfo from checkLine to avoid re-parsing in buildAggregateKey.
             if (filter_state.checkLine(line)) |info| {
+                if (info.level) |lvl| counter.add(lvl);
                 const key = try buildAggregateKey(allocator, args.aggregate_mode, line, info);
                 defer allocator.free(key);
 
@@ -590,6 +630,7 @@ fn readAggregated(
     // Process final line if present (no trailing newline).
     if (carry.items.len > 0) {
         if (filter_state.checkLine(carry.items)) |info| {
+            if (info.level) |lvl| counter.add(lvl);
             const key = try buildAggregateKey(allocator, args.aggregate_mode, carry.items, info);
             defer allocator.free(key);
 
@@ -605,6 +646,7 @@ fn readContinuous(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
+    counter: *LevelCounter,
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
     defer file.close(debug_io);
@@ -643,6 +685,7 @@ fn readContinuous(
             const line = slice[start..nl];
 
             if (filter_state.checkLine(line)) |info| {
+                if (info.level) |lvl| counter.add(lvl);
                 var match_buf: [max_search_matches]MatchRange = undefined;
                 const matches: []const MatchRange = if (filter_state.has_search_filter)
                     findSearchMatches(line, filter_state.search_expr.?, &match_buf)
@@ -664,6 +707,7 @@ fn readContinuous(
     // Flush any final line that had no trailing newline.
     if (carry.items.len > 0) {
         if (filter_state.checkLine(carry.items)) |info| {
+            if (info.level) |lvl| counter.add(lvl);
             var match_buf: [max_search_matches]MatchRange = undefined;
             const matches: []const MatchRange = if (filter_state.has_search_filter)
                 findSearchMatches(carry.items, filter_state.search_expr.?, &match_buf)
@@ -680,6 +724,7 @@ fn readWithPagination(
     allocator: std.mem.Allocator,
     path: []const u8,
     args: flags.Args,
+    counter: *LevelCounter,
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
     defer file.close(debug_io);
@@ -719,6 +764,7 @@ fn readWithPagination(
             const line = slice[start..nl];
 
             if (filter_state.checkLine(line)) |info| {
+                if (info.level) |lvl| counter.add(lvl);
                 var match_buf: [max_search_matches]MatchRange = undefined;
                 const matches: []const MatchRange = if (filter_state.has_search_filter)
                     findSearchMatches(line, filter_state.search_expr.?, &match_buf)
@@ -749,6 +795,7 @@ fn readWithPagination(
     // Flush any final line that had no trailing newline.
     if (carry.items.len > 0) {
         if (filter_state.checkLine(carry.items)) |info| {
+            if (info.level) |lvl| counter.add(lvl);
             var match_buf: [max_search_matches]MatchRange = undefined;
             const matches: []const MatchRange = if (filter_state.has_search_filter)
                 findSearchMatches(carry.items, filter_state.search_expr.?, &match_buf)
