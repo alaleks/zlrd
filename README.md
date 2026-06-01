@@ -50,6 +50,8 @@ Options:
                            Comma-separated: -l error,warn
                            Repeatable:     -l error -l fatal
   -d, --date <date>        Date filter: YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD
+      --from <time>        Time range start (HH:MM or HH:MM:SS)
+      --to <time>          Time range end (HH:MM or HH:MM:SS)
   -t, --tail               Follow file in real time
   -n, --num-lines <num>    Show last N lines
   -v, --version            Print version and exit
@@ -76,6 +78,10 @@ zlrd -s "connection failed" app.log
 # Date filter
 zlrd -d 2024-01-20 app.log
 zlrd -d 2024-01-01..2024-01-31 app.log
+
+# Time range filter (incident drill-down)
+zlrd --from 14:00 --to 15:30 app.log
+zlrd -d 2024-01-20 --from 09:00 --to 09:15 app.log
 
 # Tail mode (real-time)
 zlrd -t app.log
@@ -118,7 +124,7 @@ zlrd automatically detects log format:
 * [x] Compressed logs (gzip)
 * [x] Aggregates log rows
 * [ ] Regex-based filtering — `-s` with pattern matching for grep parity
-* [ ] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
+* [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
 * [ ] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
 * [ ] Homebrew tap + apt/yum packages — `brew install zlrd`
 

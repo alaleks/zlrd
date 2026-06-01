@@ -70,6 +70,8 @@ pub const Args = struct {
     search: ?[]const u8 = null,
     levels: ?LevelMask = null,
     date: ?[]const u8 = null,
+    from_time: ?[]const u8 = null,
+    to_time: ?[]const u8 = null,
     tail_mode: bool = false,
     help: bool = false,
     version: bool = false,
@@ -98,6 +100,8 @@ pub const ParseError = error{
     MissingDate,
     MissingNumLines,
     MissingAggregateMode,
+    MissingFromTime,
+    MissingToTime,
     UnknownArgument,
     OutOfMemory,
 };
@@ -126,6 +130,8 @@ pub fn printHelp() void {
         \\  -{c}, --{s:<16}          Show help
         \\  -{c}, --{s:<16}          Aggregate matched log rows
         \\  -{c}, --{s:<16} <mode>   Aggregate mode: exact | level-message | json-message | normalized
+        \\      --from <time>        Time range start (HH:MM or HH:MM:SS)
+        \\      --to <time>          Time range end (HH:MM or HH:MM:SS)
         \\
     , .{
         OptionFile.short,          OptionFile.long,
@@ -156,6 +162,8 @@ pub const OptionVersion = Options{ .short = 'v', .long = "version" };
 pub const OptionHelp = Options{ .short = 'h', .long = "help" };
 pub const OptionAggregate = Options{ .short = 'a', .long = "aggregate" };
 pub const OptionAggregateMode = Options{ .short = 'm', .long = "aggregate-mode" };
+pub const OptionFromTime = Options{ .short = 0, .long = "from" };
+pub const OptionToTime = Options{ .short = 0, .long = "to" };
 
 fn parseArgsFromIter(
     allocator: std.mem.Allocator,
@@ -234,6 +242,14 @@ fn parseLongFlag(
             parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
             return;
         }
+        if (std.mem.eql(u8, f, "from")) {
+            parsed.from_time = val;
+            return;
+        }
+        if (std.mem.eql(u8, f, "to")) {
+            parsed.to_time = val;
+            return;
+        }
         break :blk f;
     } else arg[2..];
 
@@ -250,7 +266,9 @@ fn parseLongFlag(
         std.mem.eql(u8, flag, "level") or
         std.mem.eql(u8, flag, "date") or
         std.mem.eql(u8, flag, "num-lines") or
-        std.mem.eql(u8, flag, "aggregate-mode"))
+        std.mem.eql(u8, flag, "aggregate-mode") or
+        std.mem.eql(u8, flag, "from") or
+        std.mem.eql(u8, flag, "to"))
     {
         const val = valueOrNext(it, flag) orelse return switch (flag[0]) {
             'f' => error.MissingFile,
@@ -259,7 +277,7 @@ fn parseLongFlag(
             'd' => error.MissingDate,
             'n' => error.MissingNumLines,
             'm' => error.MissingAggregateMode,
-            else => error.InvalidArgument,
+            else => if (std.mem.eql(u8, flag, "from")) error.MissingFromTime else error.MissingToTime,
         };
         if (std.mem.eql(u8, flag, "file")) {
             try files.append(allocator, try allocator.dupe(u8, val));
@@ -273,6 +291,10 @@ fn parseLongFlag(
             parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
         } else if (std.mem.eql(u8, flag, "aggregate-mode")) {
             parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
+        } else if (std.mem.eql(u8, flag, "from")) {
+            parsed.from_time = val;
+        } else if (std.mem.eql(u8, flag, "to")) {
+            parsed.to_time = val;
         }
         return;
     }

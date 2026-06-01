@@ -30,6 +30,8 @@ const LineInfo = struct {
     level_pos: ?LevelPos,
     /// Extracted YYYY-MM-DD date prefix, or null if absent.
     date: ?[]const u8,
+    /// Extracted HH:MM or HH:MM:SS time, or null if absent.
+    time: ?[]const u8,
     is_json: bool,
     starts_with_bracket: bool,
 };
@@ -43,6 +45,7 @@ fn analyzeLine(line: []const u8) LineInfo {
         .level = null,
         .level_pos = null,
         .date = null,
+        .time = null,
         .is_json = false,
         .starts_with_bracket = false,
     };
@@ -52,6 +55,7 @@ fn analyzeLine(line: []const u8) LineInfo {
     info.is_json = line[0] == '{';
     info.starts_with_bracket = line[0] == '[';
     info.date = extractDate(line);
+    info.time = extractTime(line);
 
     if (info.is_json) {
         info.format = .json;
@@ -340,11 +344,19 @@ fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
 
     if (range.from) |from| {
         const f10 = if (from.len >= 10) from[0..10] else return false;
-        if (std.mem.order(u8, d10, f10) == .lt) return false;
+        switch (std.mem.order(u8, d10, f10)) {
+            .lt => return false,
+            .eq => if (d.len > from.len and from.len < 10) return false,
+            else => {},
+        }
     }
     if (range.to) |to| {
         const t10 = if (to.len >= 10) to[0..10] else return false;
-        if (std.mem.order(u8, d10, t10) == .gt) return false;
+        switch (std.mem.order(u8, d10, t10)) {
+            .gt => return false,
+            .eq => if (d.len > to.len and to.len < 10) return false,
+            else => {},
+        }
     }
     return true;
 }
@@ -375,6 +387,49 @@ fn extractDate(line: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+/// Extracts a time (HH:MM or HH:MM:SS) from a log line.
+fn extractTime(line: []const u8) ?[]const u8 {
+    var i: usize = 1;
+    while (i + 5 <= line.len) : (i += 1) {
+        if (line[i - 1] == 'T' or line[i - 1] == ' ' or line[i - 1] == '[') {
+            if (isDigit(line[i]) and isDigit(line[i + 1]) and line[i + 2] == ':' and
+                isDigit(line[i + 3]) and isDigit(line[i + 4]))
+            {
+                const end = if (i + 8 <= line.len and line[i + 5] == ':' and isDigit(line[i + 6]) and isDigit(line[i + 7]))
+                    i + 8
+                else
+                    i + 5;
+                return line[i..end];
+            }
+        }
+    }
+    return null;
+}
+
+/// Returns true if `time` lies within [from_time, to_time].
+/// When prefixes match, the longer side wins (e.g. "15:00:01" > "15:00").
+fn matchTimeRange(time: ?[]const u8, from_time: ?[]const u8, to_time: ?[]const u8) bool {
+    const t = time orelse return true;
+    if (t.len < 5) return true;
+    if (from_time) |from| {
+        const len = @min(t.len, from.len);
+        switch (std.mem.order(u8, t[0..len], from[0..len])) {
+            .lt => return false,
+            .eq => if (t.len < from.len) return false,
+            else => {},
+        }
+    }
+    if (to_time) |to| {
+        const len = @min(t.len, to.len);
+        switch (std.mem.order(u8, t[0..len], to[0..len])) {
+            .gt => return false,
+            .eq => if (t.len > to.len) return false,
+            else => {},
+        }
+    }
+    return true;
 }
 
 /// Background + foreground ANSI codes for a log level.
