@@ -998,6 +998,20 @@ fn writeUpperBuffered(output: *OutputBuffer, bytes: []const u8) !void {
     }
 }
 
+/// Writes a log level label in uppercase, right-padded to 5 characters.
+fn writeLevelLabel(bytes: []const u8) void {
+    writeUpper(bytes);
+    var i: usize = bytes.len;
+    while (i < 5) : (i += 1) writeOut(" ");
+}
+
+/// Buffered version of `writeLevelLabel`.
+fn writeLevelLabelBuffered(output: *OutputBuffer, bytes: []const u8) !void {
+    try writeUpperBuffered(output, bytes);
+    var i: usize = bytes.len;
+    while (i < 5) : (i += 1) try output.write(" ");
+}
+
 /// Prints a log line to stdout with ANSI coloring appropriate for its format.
 /// Falls back to plain writeAll for lines with no recognized level.
 fn printStyledLine(line: []const u8, info: LineInfo) void {
@@ -1037,7 +1051,7 @@ fn printPlainTextWithLevel(line: []const u8, info: LineInfo) void {
         writeOut(style.bg);
         writeOut(style.fg);
         writeOut("\u{2009}");
-        writeUpper(line[r.start..r.end]);
+        writeLevelLabel(line[r.start..r.end]);
         writeOut("\u{2009}");
         writeOut(Color.reset);
         if (r.end < line.len) writeOut(line[r.end..]);
@@ -1058,7 +1072,7 @@ fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info
         try output.write(style.bg);
         try output.write(style.fg);
         try output.write("\u{2009}");
-        try writeUpperBuffered(output, line[r.start..r.end]);
+        try writeLevelLabelBuffered(output, line[r.start..r.end]);
         try output.write("\u{2009}");
         try output.write(Color.reset);
         if (r.end < line.len) try output.write(line[r.end..]);
@@ -1106,7 +1120,7 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                         writeOut(style.bg);
                         writeOut(style.fg);
                         writeOut("\u{2009}");
-                        writeUpper(str);
+                        writeLevelLabel(str);
                         writeOut("\u{2009}");
                         writeOut(Color.reset);
                         i += 1;
@@ -1222,7 +1236,7 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                         try output.write(style.bg);
                         try output.write(style.fg);
                         try output.write("\u{2009}");
-                        try writeUpperBuffered(output, str);
+                        try writeLevelLabelBuffered(output, str);
                         try output.write("\u{2009}");
                         try output.write(Color.reset);
                         i += 1;

@@ -222,7 +222,9 @@ pub const LevelCounter = struct {
             writeOut(style.fg);
             writeOut("\u{2009}");
             var buf: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{s} {d}", .{ @tagName(lvl), n }) catch continue;
+            const label = std.fmt.bufPrint(&buf, "{s}", .{@tagName(lvl)}) catch continue;
+            writeLevelLabel(label);
+            const s = std.fmt.bufPrint(&buf, " {d}", .{n}) catch continue;
             writeOut(s);
             writeOut("\u{2009}");
             writeOut(Color.reset);
@@ -1099,6 +1101,21 @@ fn writeUpperBuffered(output: *OutputBuffer, bytes: []const u8) !void {
     }
 }
 
+/// Writes a log level label in uppercase, right-padded to 5 characters
+/// (e.g. "INFO " or "ERROR") for uniform block width.
+fn writeLevelLabel(bytes: []const u8) void {
+    writeUpper(bytes);
+    var i: usize = bytes.len;
+    while (i < 5) : (i += 1) writeOut(" ");
+}
+
+/// Buffered version of `writeLevelLabel`.
+fn writeLevelLabelBuffered(output: *OutputBuffer, bytes: []const u8) !void {
+    try writeUpperBuffered(output, bytes);
+    var i: usize = bytes.len;
+    while (i < 5) : (i += 1) try output.write(" ");
+}
+
 /// Finds all non-overlapping search matches for `expr` in `line`.
 /// Returns a slice of `buf` containing the matches, sorted by position.
 fn findSearchMatches(line: []const u8, expr: []const u8, buf: []MatchRange) []MatchRange {
@@ -1239,7 +1256,7 @@ fn printPlainTextWithLevel(line: []const u8, info: LineInfo, search_matches: []c
         writeOut(style.bg);
         writeOut(style.fg);
         writeOut("\u{2009}");
-        writeUpper(line[r.start..r.end]);
+        writeLevelLabel(line[r.start..r.end]);
         writeOut("\u{2009}");
         writeOut(Color.reset);
         if (r.end < line.len) writeRangeHighlighted(line, r.end, line.len, search_matches);
@@ -1260,7 +1277,7 @@ fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info
         try output.write(style.bg);
         try output.write(style.fg);
         try output.write("\u{2009}");
-        try writeUpperBuffered(output, line[r.start..r.end]);
+        try writeLevelLabelBuffered(output, line[r.start..r.end]);
         try output.write("\u{2009}");
         try output.write(Color.reset);
         if (r.end < line.len) try writeRangeHighlightedBuffered(output, line, r.end, line.len, search_matches);
@@ -1313,7 +1330,7 @@ fn printJsonStyled(line: []const u8, info: LineInfo, search_matches: []const Mat
                         writeOut(style.bg);
                         writeOut(style.fg);
                         writeOut("\u{2009}");
-                        writeUpper(str);
+                        writeLevelLabel(str);
                         writeOut("\u{2009}");
                         writeOut(Color.reset);
                         i += 1;
@@ -1430,7 +1447,7 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                         try output.write(style.bg);
                         try output.write(style.fg);
                         try output.write("\u{2009}");
-                        try writeUpperBuffered(output, str);
+                        try writeLevelLabelBuffered(output, str);
                         try output.write("\u{2009}");
                         try output.write(Color.reset);
                         i += 1;
