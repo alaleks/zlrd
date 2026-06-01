@@ -341,14 +341,19 @@ fn matchDateRange(line: []const u8, range: DateRange) bool {
 }
 
 /// Returns true if `date` lies within `range`.
-/// `null` date never matches a range that has at least one bound.
+/// `null` date never matches. Both sides are truncated to 10 chars (YYYY-MM-DD)
+/// before lexicographic comparison to handle inputs of differing lengths.
 fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
     const d = date orelse return false;
+    const d10 = if (d.len >= 10) d[0..10] else return false;
+
     if (range.from) |from| {
-        if (std.mem.order(u8, d, from) == .lt) return false;
+        const f10 = if (from.len >= 10) from[0..10] else return false;
+        if (std.mem.order(u8, d10, f10) == .lt) return false;
     }
     if (range.to) |to| {
-        if (std.mem.order(u8, d, to) == .gt) return false;
+        const t10 = if (to.len >= 10) to[0..10] else return false;
+        if (std.mem.order(u8, d10, t10) == .gt) return false;
     }
     return true;
 }
@@ -953,19 +958,27 @@ fn extractJsonLevelPos(line: []const u8) ?LevelPos {
 
 /// Writes bytes to stdout in uppercase.
 fn writeUpper(bytes: []const u8) void {
-    for (bytes) |b| {
-        var buf: [1]u8 = undefined;
-        buf[0] = std.ascii.toUpper(b);
-        writeOut(&buf);
+    var buf: [16]u8 = undefined;
+    const n = @min(bytes.len, buf.len);
+    for (bytes[0..n], 0..) |b, j| buf[j] = std.ascii.toUpper(b);
+    writeOut(buf[0..n]);
+    for (bytes[n..]) |b| {
+        var tmp: [1]u8 = undefined;
+        tmp[0] = std.ascii.toUpper(b);
+        writeOut(&tmp);
     }
 }
 
 /// Writes bytes to an OutputBuffer in uppercase.
 fn writeUpperBuffered(output: *OutputBuffer, bytes: []const u8) !void {
-    for (bytes) |b| {
-        var buf: [1]u8 = undefined;
-        buf[0] = std.ascii.toUpper(b);
-        try output.write(&buf);
+    var buf: [16]u8 = undefined;
+    const n = @min(bytes.len, buf.len);
+    for (bytes[0..n], 0..) |b, j| buf[j] = std.ascii.toUpper(b);
+    try output.write(buf[0..n]);
+    for (bytes[n..]) |b| {
+        var tmp: [1]u8 = undefined;
+        tmp[0] = std.ascii.toUpper(b);
+        try output.write(&tmp);
     }
 }
 
