@@ -972,7 +972,9 @@ fn printPlainTextWithLevel(line: []const u8, info: LineInfo) void {
         if (r.start > 0) writeOut(line[0..r.start]);
         writeOut(style.bg);
         writeOut(style.fg);
+        writeOut("\u{2009}");
         writeUpper(line[r.start..r.end]);
+        writeOut("\u{2009}");
         writeOut(Color.reset);
         if (r.end < line.len) writeOut(line[r.end..]);
         writeOut("\n");
@@ -991,7 +993,9 @@ fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info
         if (r.start > 0) try output.write(line[0..r.start]);
         try output.write(style.bg);
         try output.write(style.fg);
+        try output.write("\u{2009}");
         try writeUpperBuffered(output, line[r.start..r.end]);
+        try output.write("\u{2009}");
         try output.write(Color.reset);
         if (r.end < line.len) try output.write(line[r.end..]);
         try output.write("\n");
@@ -1037,9 +1041,9 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                         const style = levelStyle(info.level.?);
                         writeOut(style.bg);
                         writeOut(style.fg);
-                        writeOut("\"");
+                        writeOut("\u{2009}");
                         writeUpper(str);
-                        writeOut("\"");
+                        writeOut("\u{2009}");
                         writeOut(Color.reset);
                         i += 1;
                         continue;
@@ -1153,9 +1157,9 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                         const style = levelStyle(info.level.?);
                         try output.write(style.bg);
                         try output.write(style.fg);
-                        try output.write("\"");
+                        try output.write("\u{2009}");
                         try writeUpperBuffered(output, str);
-                        try output.write("\"");
+                        try output.write("\u{2009}");
                         try output.write(Color.reset);
                         i += 1;
                         continue;

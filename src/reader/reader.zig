@@ -1109,7 +1109,9 @@ fn printPlainTextWithLevel(line: []const u8, info: LineInfo, search_matches: []c
         if (r.start > 0) writeRangeHighlighted(line, 0, r.start, search_matches);
         writeOut(style.bg);
         writeOut(style.fg);
+        writeOut("\u{2009}");
         writeUpper(line[r.start..r.end]);
+        writeOut("\u{2009}");
         writeOut(Color.reset);
         if (r.end < line.len) writeRangeHighlighted(line, r.end, line.len, search_matches);
         writeOut("\n");
@@ -1128,7 +1130,9 @@ fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info
         if (r.start > 0) try writeRangeHighlightedBuffered(output, line, 0, r.start, search_matches);
         try output.write(style.bg);
         try output.write(style.fg);
+        try output.write("\u{2009}");
         try writeUpperBuffered(output, line[r.start..r.end]);
+        try output.write("\u{2009}");
         try output.write(Color.reset);
         if (r.end < line.len) try writeRangeHighlightedBuffered(output, line, r.end, line.len, search_matches);
         try output.write("\n");
@@ -1179,9 +1183,9 @@ fn printJsonStyled(line: []const u8, info: LineInfo, search_matches: []const Mat
                         const style = levelStyle(info.level.?);
                         writeOut(style.bg);
                         writeOut(style.fg);
-                        writeOut("\"");
+                        writeOut("\u{2009}");
                         writeUpper(str);
-                        writeOut("\"");
+                        writeOut("\u{2009}");
                         writeOut(Color.reset);
                         i += 1;
                         continue;
@@ -1296,9 +1300,9 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                         const style = levelStyle(info.level.?);
                         try output.write(style.bg);
                         try output.write(style.fg);
-                        try output.write("\"");
+                        try output.write("\u{2009}");
                         try writeUpperBuffered(output, str);
-                        try output.write("\"");
+                        try output.write("\u{2009}");
                         try output.write(Color.reset);
                         i += 1;
                         continue;
