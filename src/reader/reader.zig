@@ -153,11 +153,11 @@ pub const FilterState = struct {
     pub fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
         if (line.len == 0) return null;
 
-        const info = analyzeLine(line);
-
         if (self.has_search_filter) {
             if (!matchSearch(line, self.search_expr.?)) return null;
         }
+
+        const info = analyzeLine(line);
 
         if (self.has_level_filter) {
             const lvl = info.level orelse return null;
@@ -185,20 +185,6 @@ pub const FilterState = struct {
     }
 };
 
-/// Per-session read statistics (non-interactive mode only).
-const Stats = struct {
-    lines_read: usize = 0,
-    lines_matched: usize = 0,
-    bytes_read: usize = 0,
-};
-
-/// One aggregated log line with its occurrence count.
-const AggregateEntry = struct {
-    key: []const u8,
-    sample_line: []const u8,
-    count: usize,
-};
-
 /// Aggregates identical matched lines.
 /// Keeps first-seen order and stores each unique line only once.
 const Aggregator = struct {
@@ -206,6 +192,7 @@ const Aggregator = struct {
     arena: std.heap.ArenaAllocator,
     counts: std.StringHashMapUnmanaged(usize),
     sample_lines: std.StringHashMapUnmanaged([]const u8),
+    sample_infos: std.StringHashMapUnmanaged(LineInfo),
     order: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) !Aggregator {
@@ -214,6 +201,7 @@ const Aggregator = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .counts = .{},
             .sample_lines = .{},
+            .sample_infos = .{},
             .order = try std.ArrayList([]const u8).initCapacity(allocator, 128),
         };
     }
@@ -221,13 +209,15 @@ const Aggregator = struct {
     fn deinit(self: *Aggregator) void {
         self.counts.deinit(self.allocator);
         self.sample_lines.deinit(self.allocator);
+        self.sample_infos.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.arena.deinit();
     }
 
     /// Add one matched line under a precomputed aggregation key.
-    /// The first line seen for a key is kept as the sample line for display.
-    fn add(self: *Aggregator, key: []const u8, sample_line: []const u8) !void {
+    /// The first line seen for a key is kept as the sample line for display
+    /// together with its precomputed `LineInfo` to avoid re-analysis during output.
+    fn add(self: *Aggregator, key: []const u8, sample_line: []const u8, info: LineInfo) !void {
         const gop = try self.counts.getOrPut(self.allocator, key);
         if (gop.found_existing) {
             gop.value_ptr.* += 1;
@@ -241,6 +231,7 @@ const Aggregator = struct {
         gop.value_ptr.* = 1;
 
         try self.sample_lines.put(self.allocator, owned_key, owned_line);
+        try self.sample_infos.put(self.allocator, owned_key, info);
         try self.order.append(self.allocator, owned_key);
     }
 
@@ -253,8 +244,9 @@ const Aggregator = struct {
         for (self.order.items) |key| {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
+            const info = self.sample_infos.get(key).?;
             try printAggregatePrefix(output, count);
-            try printStyledLineBuffered(output, line, analyzeLine(line), &.{});
+            try printStyledLineBuffered(output, line, info, &.{});
 
             if (page_size > 0) {
                 batch += 1;
@@ -508,7 +500,7 @@ fn readAggregated(
                 const key = try buildAggregateKey(allocator, args.aggregate_mode, line, info);
                 defer allocator.free(key);
 
-                try aggregator.add(key, line);
+                try aggregator.add(key, line, info);
             }
 
             start = nl + 1;
@@ -526,7 +518,7 @@ fn readAggregated(
             const key = try buildAggregateKey(allocator, args.aggregate_mode, carry.items, info);
             defer allocator.free(key);
 
-            try aggregator.add(key, carry.items);
+            try aggregator.add(key, carry.items, info);
         }
     }
 
@@ -555,8 +547,6 @@ fn readContinuous(
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
 
-    var stats = Stats{};
-
     while (true) {
         const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
             error.EndOfStream => break,
@@ -564,7 +554,6 @@ fn readContinuous(
         };
         if (n == 0) break;
 
-        stats.bytes_read += n;
         var slice = buffer[0..n];
 
         if (carry.items.len > 0) {
@@ -577,7 +566,6 @@ fn readContinuous(
         while (true) {
             const nl = simd.findByte(slice, start, '\n') orelse break;
             const line = slice[start..nl];
-            stats.lines_read += 1;
 
             if (filter_state.checkLine(line)) |info| {
                 var match_buf: [max_search_matches]MatchRange = undefined;
@@ -586,7 +574,6 @@ fn readContinuous(
                 else
                     &.{};
                 try printStyledLineBuffered(&output, line, info, matches);
-                stats.lines_matched += 1;
             }
 
             start = nl + 1;
@@ -681,6 +668,18 @@ fn readWithPagination(
         carry.clearRetainingCapacity();
         if (start < slice.len) {
             try carry.appendSlice(allocator, slice[start..]);
+        }
+    }
+
+    // Flush any final line that had no trailing newline.
+    if (carry.items.len > 0) {
+        if (filter_state.checkLine(carry.items)) |info| {
+            var match_buf: [max_search_matches]MatchRange = undefined;
+            const matches: []const MatchRange = if (filter_state.has_search_filter)
+                findSearchMatches(carry.items, filter_state.search_expr.?, &match_buf)
+            else
+                &.{};
+            try printStyledLineBuffered(&output, carry.items, info, matches);
         }
     }
 }
@@ -1779,11 +1778,11 @@ test "Aggregator counts identical lines and preserves first-seen order" {
     var agg = try Aggregator.init(std.testing.allocator);
     defer agg.deinit();
 
-    try agg.add("[ERROR] one", "[ERROR] one");
-    try agg.add("[WARN] two", "[WARN] two");
-    try agg.add("[ERROR] one", "[ERROR] one");
-    try agg.add("[ERROR] one", "[ERROR] one");
-    try agg.add("[WARN] two", "[WARN] two");
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
+    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two"));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
+    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two"));
 
     try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
     try std.testing.expectEqualStrings("[ERROR] one", agg.order.items[0]);
@@ -1882,9 +1881,9 @@ test "Aggregator groups by key and keeps first sample line" {
 
     const key = "error\x1fConnection failed";
 
-    try agg.add(key, "[ERROR] Connection failed");
-    try agg.add(key, "[ERROR] Connection failed");
-    try agg.add(key, "[ERROR] Connection failed at retry");
+    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed"));
+    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed"));
+    try agg.add(key, "[ERROR] Connection failed at retry", analyzeLine("[ERROR] Connection failed at retry"));
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
     try std.testing.expectEqual(@as(usize, 3), agg.counts.get(key).?);
@@ -1901,12 +1900,12 @@ test "level_message aggregation groups same message with different timestamps" {
     {
         const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
         defer std.testing.allocator.free(key);
-        try agg.add(key, line1);
+        try agg.add(key, line1, analyzeLine(line1));
     }
     {
         const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
         defer std.testing.allocator.free(key);
-        try agg.add(key, line2);
+        try agg.add(key, line2, analyzeLine(line2));
     }
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
@@ -1924,12 +1923,12 @@ test "json_message aggregation separates different messages" {
     {
         const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
         defer std.testing.allocator.free(key);
-        try agg.add(key, line1);
+        try agg.add(key, line1, analyzeLine(line1));
     }
     {
         const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
         defer std.testing.allocator.free(key);
-        try agg.add(key, line2);
+        try agg.add(key, line2, analyzeLine(line2));
     }
 
     try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
@@ -1945,12 +1944,12 @@ test "normalized aggregation groups noisy numeric variants" {
     {
         const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
         defer std.testing.allocator.free(key);
-        try agg.add(key, line1);
+        try agg.add(key, line1, analyzeLine(line1));
     }
     {
         const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
         defer std.testing.allocator.free(key);
-        try agg.add(key, line2);
+        try agg.add(key, line2, analyzeLine(line2));
     }
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
@@ -1979,4 +1978,151 @@ test "extractMessage uses plain tail after bracketed level" {
 
     const msg = extractMessage(line, info).?;
     try std.testing.expectEqualStrings("connection failed", msg);
+}
+
+test "extractJsonLevelPos: finds level value" {
+    const line = "{\"time\":\"...\",\"level\":\"error\",\"msg\":\"test\"}";
+    const pos = extractJsonLevelPos(line).?;
+    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
+}
+
+test "extractJsonLevelPos: returns null without level" {
+    try std.testing.expect(extractJsonLevelPos("{\"time\":\"...\",\"msg\":\"test\"}") == null);
+}
+
+test "extractJsonLevelPos: skips level-as-value before real key" {
+    const line = "{\"msg\":\"level\",\"level\":\"error\"}";
+    const pos = extractJsonLevelPos(line).?;
+    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
+}
+
+test "findSearchMatches: single term" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findSearchMatches("hello world hello", "hello", &buf);
+    try std.testing.expectEqual(@as(usize, 2), m.len);
+    try std.testing.expectEqual(@as(usize, 0), m[0].start);
+    try std.testing.expectEqual(@as(usize, 5), m[0].end);
+    try std.testing.expectEqual(@as(usize, 12), m[1].start);
+    try std.testing.expectEqual(@as(usize, 17), m[1].end);
+}
+
+test "findSearchMatches: case-insensitive" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findSearchMatches("HELLO world", "hello", &buf);
+    try std.testing.expectEqual(@as(usize, 1), m.len);
+    try std.testing.expectEqual(@as(usize, 0), m[0].start);
+    try std.testing.expectEqual(@as(usize, 5), m[0].end);
+}
+
+test "findSearchMatches: OR terms" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findSearchMatches("hello world", "hello|world", &buf);
+    try std.testing.expectEqual(@as(usize, 2), m.len);
+    try std.testing.expectEqualStrings("hello", "hello world"[m[0].start..m[0].end]);
+    try std.testing.expectEqualStrings("world", "hello world"[m[1].start..m[1].end]);
+}
+
+test "findSearchMatches: AND terms" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findSearchMatches("hello world", "hello&world", &buf);
+    try std.testing.expectEqual(@as(usize, 2), m.len);
+}
+
+test "findSearchMatches: overlapping dedup" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    // "aaaa" — "aa" matches at 0, 2 (non-overlapping adjacent)
+    const m = findSearchMatches("aaaa", "aa", &buf);
+    try std.testing.expectEqual(@as(usize, 2), m.len);
+    try std.testing.expectEqual(@as(usize, 0), m[0].start);
+    try std.testing.expectEqual(@as(usize, 2), m[0].end);
+    try std.testing.expectEqual(@as(usize, 2), m[1].start);
+    try std.testing.expectEqual(@as(usize, 4), m[1].end);
+}
+
+test "findSearchMatches: overlapping merge" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    // "aaaa" — "aa" matches at 0,2; "aaa" at 0 → merged to 0-4
+    const m = findSearchMatches("aaaa", "aa|aaa", &buf);
+    try std.testing.expectEqual(@as(usize, 1), m.len);
+    try std.testing.expectEqual(@as(usize, 0), m[0].start);
+    try std.testing.expectEqual(@as(usize, 4), m[0].end);
+}
+
+test "findSearchMatches: no match" {
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findSearchMatches("hello", "world", &buf);
+    try std.testing.expectEqual(@as(usize, 0), m.len);
+}
+
+test "charAtIgnoreCase: match" {
+    try std.testing.expect(charAtIgnoreCase("Hello World", 0, "hello"));
+    try std.testing.expect(charAtIgnoreCase("Hello World", 6, "WORLD"));
+    try std.testing.expect(!charAtIgnoreCase("Hello World", 0, "world"));
+}
+
+test "charAtIgnoreCase: bounds check" {
+    try std.testing.expect(!charAtIgnoreCase("hi", 1, "world"));
+    try std.testing.expect(!charAtIgnoreCase("hi", 3, "x"));
+}
+
+test "isValidDateString: valid dates" {
+    try std.testing.expect(isValidDateString("2023-10-15"));
+    try std.testing.expect(isValidDateString("0000-00-00"));
+    try std.testing.expect(isValidDateString("9999-99-99"));
+}
+
+test "isValidDateString: invalid inputs" {
+    try std.testing.expect(!isValidDateString("2023-1-15"));
+    try std.testing.expect(!isValidDateString("20231015"));
+    try std.testing.expect(!isValidDateString("2023-10-15T12:00:00Z"));
+    try std.testing.expect(!isValidDateString(""));
+    try std.testing.expect(!isValidDateString("2023-10"));
+}
+
+test "extractPlainMessage: strips bracketed prefix with colon" {
+    const line = "[ERROR]: connection failed";
+    const info = analyzeLine(line);
+    try std.testing.expectEqualStrings("connection failed", extractPlainMessage(line, info).?);
+}
+
+test "extractPlainMessage: strips bracketed prefix with dash" {
+    const line = "[WARN] - something happened";
+    const info = analyzeLine(line);
+    try std.testing.expectEqualStrings("something happened", extractPlainMessage(line, info).?);
+}
+
+test "extractPlainMessage: returns full line without brackets" {
+    const line = "Just a plain message";
+    const info = analyzeLine(line);
+    try std.testing.expectEqualStrings("Just a plain message", extractPlainMessage(line, info).?);
+}
+
+test "extractPlainMessage: bracket-only line" {
+    const line = "[ERROR]";
+    const info = analyzeLine(line);
+    try std.testing.expect(extractPlainMessage(line, info) == null);
+}
+
+test "buildNormalizedKey: collapses digits and spaces" {
+    const line = "error code 12345 at line 99";
+    const info = analyzeLine(line);
+    const key = try buildNormalizedKey(std.testing.allocator, line, info);
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqualStrings("error code # at line #", key);
+}
+
+test "buildNormalizedKey: replaces ISO date" {
+    const line = "request 2023-10-18 failed";
+    const info = analyzeLine(line);
+    const key = try buildNormalizedKey(std.testing.allocator, line, info);
+    defer std.testing.allocator.free(key);
+    try std.testing.expect(std.mem.indexOf(u8, key, "<date>") != null);
+}
+
+test "buildNormalizedKey: collapses multiple spaces" {
+    const line = "error    multiple    spaces";
+    const info = analyzeLine(line);
+    const key = try buildNormalizedKey(std.testing.allocator, line, info);
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqualStrings("error multiple spaces", key);
 }
