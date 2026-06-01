@@ -75,21 +75,29 @@ fn analyzeLine(line: []const u8) LineInfo {
 }
 
 /// ANSI escape codes for terminal coloring.
+/// Theme: GitHub Dark palette on terminal background #0d1117.
 const Color = struct {
     pub const reset = "\x1b[0m";
-    pub const bold = "\x1b[1m";
     pub const dim = "\x1b[2m";
 
-    pub const red = "\x1b[31m";
-    pub const yellow = "\x1b[33m";
-    pub const green = "\x1b[32m";
-    pub const blue = "\x1b[34m";
-    pub const gray = "\x1b[90m";
-    pub const key = "\x1b[38;5;66m";
+    /// Main text: #e6edf3
+    pub const text = "\x1b[38;2;230;237;243m";
+    /// Dim/muted text: #8b949e
+    pub const muted = "\x1b[38;2;139;148;158m";
 
-    pub const number = "\x1b[38;5;214m";
-    pub const boolean = "\x1b[38;5;135m";
-    pub const nullv = "\x1b[38;5;244m";
+    /// JSON key: #58a6ff
+    pub const json_key = "\x1b[38;2;88;166;255m";
+    /// JSON string value: #a5d6ff
+    pub const json_string = "\x1b[38;2;165;214;255m";
+    /// JSON number: #79c0ff
+    pub const json_number = "\x1b[38;2;121;192;255m";
+    /// JSON true/false/null: #56d364
+    pub const json_bool_null = "\x1b[38;2;86;211;100m";
+
+    /// Search highlight fg: #ffd700
+    pub const search_fg = "\x1b[38;2;255;215;0m";
+    /// Search underline: dotted
+    pub const search_underline = "\x1b[4:3m";
 };
 
 /// Byte range of a level value within a line.
@@ -97,6 +105,14 @@ const LevelPos = struct {
     start: usize,
     end: usize,
 };
+
+/// Byte range of a search match within a line.
+const MatchRange = struct {
+    start: usize,
+    end: usize,
+};
+
+const max_search_matches = 64;
 
 /// Inclusive date range for the `-d` filter.
 /// Both bounds are optional; a missing bound means open-ended.
@@ -158,7 +174,14 @@ pub const FilterState = struct {
     /// Convenience wrapper: filter and print in one call.
     /// Intended for tail.zig so it does not need to import `LineInfo` or `printStyledLine`.
     pub fn printIfMatch(self: FilterState, line: []const u8) void {
-        if (self.checkLine(line)) |info| printStyledLine(line, info);
+        if (self.checkLine(line)) |info| {
+            var match_buf: [max_search_matches]MatchRange = undefined;
+            const matches: []const MatchRange = if (self.has_search_filter)
+                findSearchMatches(line, self.search_expr.?, &match_buf)
+            else
+                &.{};
+            printStyledLine(line, info, matches);
+        }
     }
 };
 
@@ -231,7 +254,7 @@ const Aggregator = struct {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
             try printAggregatePrefix(output, count);
-            try printStyledLineBuffered(output, line, analyzeLine(line));
+            try printStyledLineBuffered(output, line, analyzeLine(line), &.{});
 
             if (page_size > 0) {
                 batch += 1;
@@ -363,14 +386,21 @@ fn extractDate(line: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Maps a log level to its ANSI color code.
-inline fn levelColor(lvl: flags.Level) []const u8 {
+/// Background + foreground ANSI codes for a log level.
+const LevelStyle = struct {
+    bg: []const u8,
+    fg: []const u8,
+};
+
+/// Maps a log level to its background and foreground ANSI codes.
+inline fn levelStyle(lvl: flags.Level) LevelStyle {
     return switch (lvl) {
-        .Error, .Fatal, .Panic => Color.red,
-        .Warn => Color.yellow,
-        .Info => Color.green,
-        .Debug => Color.blue,
-        .Trace => Color.gray,
+        .Trace => .{ .bg = "\x1b[48;2;48;54;61m", .fg = "\x1b[38;2;139;148;158m" },
+        .Debug => .{ .bg = "\x1b[48;2;26;58;92m", .fg = "\x1b[38;2;88;166;255m" },
+        .Info => .{ .bg = "\x1b[48;2;26;61;43m", .fg = "\x1b[38;2;63;185;80m" },
+        .Warn => .{ .bg = "\x1b[48;2;61;46;0m", .fg = "\x1b[38;2;227;179;65m" },
+        .Error => .{ .bg = "\x1b[48;2;61;26;26m", .fg = "\x1b[38;2;248;81;73m" },
+        .Fatal, .Panic => .{ .bg = "\x1b[48;2;248;81;73m", .fg = "\x1b[38;2;255;255;255m" },
     };
 }
 
@@ -454,7 +484,10 @@ fn readAggregated(
     defer output.deinit();
 
     while (true) {
-        const n = try file.readStreaming(debug_io, &.{buffer});
+        const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
         if (n == 0) break;
 
         var slice = buffer[0..n];
@@ -525,7 +558,10 @@ fn readContinuous(
     var stats = Stats{};
 
     while (true) {
-        const n = try file.readStreaming(debug_io, &.{buffer});
+        const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
         if (n == 0) break;
 
         stats.bytes_read += n;
@@ -544,7 +580,12 @@ fn readContinuous(
             stats.lines_read += 1;
 
             if (filter_state.checkLine(line)) |info| {
-                try printStyledLineBuffered(&output, line, info);
+                var match_buf: [max_search_matches]MatchRange = undefined;
+                const matches: []const MatchRange = if (filter_state.has_search_filter)
+                    findSearchMatches(line, filter_state.search_expr.?, &match_buf)
+                else
+                    &.{};
+                try printStyledLineBuffered(&output, line, info, matches);
                 stats.lines_matched += 1;
             }
 
@@ -561,7 +602,12 @@ fn readContinuous(
     // Flush any final line that had no trailing newline.
     if (carry.items.len > 0) {
         if (filter_state.checkLine(carry.items)) |info| {
-            try printStyledLineBuffered(&output, carry.items, info);
+            var match_buf: [max_search_matches]MatchRange = undefined;
+            const matches: []const MatchRange = if (filter_state.has_search_filter)
+                findSearchMatches(carry.items, filter_state.search_expr.?, &match_buf)
+            else
+                &.{};
+            try printStyledLineBuffered(&output, carry.items, info, matches);
         }
     }
 }
@@ -592,7 +638,10 @@ fn readWithPagination(
     var page: usize = 1;
 
     while (true) {
-        const n = try file.readStreaming(debug_io, &.{buffer});
+        const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
         if (n == 0) break;
 
         var slice = buffer[0..n];
@@ -608,7 +657,12 @@ fn readWithPagination(
             const line = slice[start..nl];
 
             if (filter_state.checkLine(line)) |info| {
-                try printStyledLineBuffered(&output, line, info);
+                var match_buf: [max_search_matches]MatchRange = undefined;
+                const matches: []const MatchRange = if (filter_state.has_search_filter)
+                    findSearchMatches(line, filter_state.search_expr.?, &match_buf)
+                else
+                    &.{};
+                try printStyledLineBuffered(&output, line, info, matches);
                 batch += 1;
 
                 if (batch >= args.num_lines) {
@@ -874,97 +928,214 @@ fn matchWord(line: []const u8, pos: usize, comptime word: []const u8) bool {
 
 /// Locates the `"level"` value inside a JSON log line and returns its byte range.
 /// Used by the printer to colorize only the level token, not the surrounding JSON.
+/// Continues searching after `"level"` tokens that are not followed by `: "`.
 fn extractJsonLevelPos(line: []const u8) ?LevelPos {
-    var i: usize = 0;
+    var search_pos: usize = 0;
 
     while (true) {
-        const q = simd.findByte(line, i, '"') orelse return null;
+        const q = simd.findByte(line, search_pos, '"') orelse return null;
 
-        // q+7 <= line.len ensures line[q+6] is a valid index.
         if (q + 7 <= line.len and
             std.mem.eql(u8, line[q + 1 .. q + 6], "level") and
             line[q + 6] == '"')
         {
-            i = q + 7;
-            break;
+            var i = q + 7;
+            while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
+            if (i < line.len and line[i] == '"') {
+                const start = i + 1;
+                const end = simd.findByte(line, start, '"') orelse return null;
+                return LevelPos{ .start = start, .end = end };
+            }
         }
 
-        i = q + 1;
+        search_pos = q + 1;
     }
+}
 
-    while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-    if (i >= line.len or line[i] != '"') return null;
+/// Writes bytes to stdout in uppercase.
+fn writeUpper(bytes: []const u8) void {
+    for (bytes) |b| {
+        var buf: [1]u8 = undefined;
+        buf[0] = std.ascii.toUpper(b);
+        writeOut(&buf);
+    }
+}
 
-    const start = i + 1;
-    const end = simd.findByte(line, start, '"') orelse return null;
+/// Writes bytes to an OutputBuffer in uppercase.
+fn writeUpperBuffered(output: *OutputBuffer, bytes: []const u8) !void {
+    for (bytes) |b| {
+        var buf: [1]u8 = undefined;
+        buf[0] = std.ascii.toUpper(b);
+        try output.write(&buf);
+    }
+}
 
-    return LevelPos{ .start = start, .end = end };
+/// Finds all non-overlapping search matches for `expr` in `line`.
+/// Returns a slice of `buf` containing the matches, sorted by position.
+fn findSearchMatches(line: []const u8, expr: []const u8, buf: []MatchRange) []MatchRange {
+    var count: usize = 0;
+    // Collect individual terms: split by | then by &
+    var terms: [max_search_matches][]const u8 = undefined;
+    var term_count: usize = 0;
+    var or_it = std.mem.splitScalar(u8, expr, '|');
+    while (or_it.next()) |or_term| {
+        if (or_term.len == 0) continue;
+        var and_it = std.mem.splitScalar(u8, or_term, '&');
+        while (and_it.next()) |and_term| {
+            if (and_term.len == 0 or term_count >= terms.len) continue;
+            terms[term_count] = and_term;
+            term_count += 1;
+        }
+    }
+    // Find all matches, case-insensitive, non-overlapping per term
+    for (terms[0..term_count]) |term| {
+        var pos: usize = 0;
+        while (pos + term.len <= line.len) {
+            if (charAtIgnoreCase(line, pos, term)) {
+                if (count < buf.len) {
+                    buf[count] = .{ .start = pos, .end = pos + term.len };
+                    count += 1;
+                }
+                pos += term.len;
+            } else {
+                pos += 1;
+            }
+        }
+    }
+    // Sort and deduplicate overlapping ranges
+    if (count > 1) {
+        std.mem.sort(MatchRange, buf[0..count], {}, struct {
+            fn lt(_: void, a: MatchRange, b: MatchRange) bool {
+                return a.start < b.start;
+            }
+        }.lt);
+        var j: usize = 1;
+        for (buf[1..count]) |m| {
+            if (m.start >= buf[j - 1].end) {
+                buf[j] = m;
+                j += 1;
+            } else if (m.end > buf[j - 1].end) {
+                buf[j - 1].end = m.end;
+            }
+        }
+        return buf[0..j];
+    }
+    return buf[0..count];
+}
+
+/// Returns true if `line[pos..]` starts with `needle`, case-insensitive.
+fn charAtIgnoreCase(line: []const u8, pos: usize, needle: []const u8) bool {
+    if (pos + needle.len > line.len) return false;
+    for (needle, 0..) |c, j| {
+        if (std.ascii.toLower(line[pos + j]) != std.ascii.toLower(c)) return false;
+    }
+    return true;
 }
 
 /// Prints a log line to stdout with ANSI coloring appropriate for its format.
 /// Falls back to plain writeAll for lines with no recognized level.
-fn printStyledLine(line: []const u8, info: LineInfo) void {
+fn printStyledLine(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
     if (line.len == 0) return;
 
     if (info.is_json) {
-        printJsonStyled(line, info);
+        printJsonStyled(line, info, search_matches);
     } else if (info.level != null) {
-        printPlainTextWithLevel(line, info);
+        printPlainTextWithLevel(line, info, search_matches);
     } else {
-        writeOut(line);
+        writeRangeHighlighted(line, 0, line.len, search_matches);
         writeOut("\n");
     }
 }
 
 /// Buffered version of `printStyledLine`, used in read loops to reduce syscalls.
-fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
+fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
     if (line.len == 0) return;
 
     if (info.is_json) {
-        try printJsonStyledBuffered(output, line, info);
+        try printJsonStyledBuffered(output, line, info, search_matches);
     } else if (info.level != null) {
-        try printPlainTextWithLevelBuffered(output, line, info);
+        try printPlainTextWithLevelBuffered(output, line, info, search_matches);
     } else {
-        try output.write(line);
+        try writeRangeHighlightedBuffered(output, line, 0, line.len, search_matches);
         try output.write("\n");
     }
 }
 
-/// Writes a plain-text line to stdout, coloring the level token at `info.level_pos`.
-fn printPlainTextWithLevel(line: []const u8, info: LineInfo) void {
-    const color = levelColor(info.level.?);
+/// Writes a byte range of `line` to stdout, inserting search highlight
+/// ANSI codes around `matches` that fall within the range.
+fn writeRangeHighlighted(line: []const u8, start: usize, end: usize, matches: []const MatchRange) void {
+    if (matches.len == 0) return writeOut(line[start..end]);
+    var pos = start;
+    for (matches) |m| {
+        if (m.end <= pos) continue;
+        if (m.start >= end) break;
+        const seg_start = @max(pos, m.start);
+        const seg_end = @min(end, m.end);
+        if (pos < seg_start) writeOut(line[pos..seg_start]);
+        writeOut(Color.search_fg);
+        writeOut(Color.search_underline);
+        writeOut(line[seg_start..seg_end]);
+        writeOut(Color.reset);
+        pos = seg_end;
+    }
+    if (pos < end) writeOut(line[pos..end]);
+}
+
+/// Buffered version of `writeRangeHighlighted`.
+fn writeRangeHighlightedBuffered(output: *OutputBuffer, line: []const u8, start: usize, end: usize, matches: []const MatchRange) !void {
+    if (matches.len == 0) return output.write(line[start..end]);
+    var pos = start;
+    for (matches) |m| {
+        if (m.end <= pos) continue;
+        if (m.start >= end) break;
+        const seg_start = @max(pos, m.start);
+        const seg_end = @min(end, m.end);
+        if (pos < seg_start) try output.write(line[pos..seg_start]);
+        try output.write(Color.search_fg);
+        try output.write(Color.search_underline);
+        try output.write(line[seg_start..seg_end]);
+        try output.write(Color.reset);
+        pos = seg_end;
+    }
+    if (pos < end) try output.write(line[pos..end]);
+}
+
+/// Writes a plain-text line to stdout, coloring the level token at `info.level_pos`
+/// with a background + foreground color pair. Renders the level value in uppercase.
+fn printPlainTextWithLevel(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
+    const style = levelStyle(info.level.?);
 
     if (info.level_pos) |r| {
-        if (r.start > 0) writeOut(line[0..r.start]);
-        writeOut(Color.bold);
-        writeOut(color);
-        writeOut(line[r.start..r.end]);
+        if (r.start > 0) writeRangeHighlighted(line, 0, r.start, search_matches);
+        writeOut(style.bg);
+        writeOut(style.fg);
+        writeUpper(line[r.start..r.end]);
         writeOut(Color.reset);
-        if (r.end < line.len) writeOut(line[r.end..]);
+        if (r.end < line.len) writeRangeHighlighted(line, r.end, line.len, search_matches);
         writeOut("\n");
         return;
     }
 
-    writeOut(line);
+    writeRangeHighlighted(line, 0, line.len, search_matches);
     writeOut("\n");
 }
 
 /// Buffered version of `printPlainTextWithLevel`.
-fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
-    const color = levelColor(info.level.?);
+fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
+    const style = levelStyle(info.level.?);
 
     if (info.level_pos) |r| {
-        if (r.start > 0) try output.write(line[0..r.start]);
-        try output.write(Color.bold);
-        try output.write(color);
-        try output.write(line[r.start..r.end]);
+        if (r.start > 0) try writeRangeHighlightedBuffered(output, line, 0, r.start, search_matches);
+        try output.write(style.bg);
+        try output.write(style.fg);
+        try writeUpperBuffered(output, line[r.start..r.end]);
         try output.write(Color.reset);
-        if (r.end < line.len) try output.write(line[r.end..]);
+        if (r.end < line.len) try writeRangeHighlightedBuffered(output, line, r.end, line.len, search_matches);
         try output.write("\n");
         return;
     }
 
-    try output.write(line);
+    try writeRangeHighlightedBuffered(output, line, 0, line.len, search_matches);
     try output.write("\n");
 }
 
@@ -983,10 +1154,10 @@ inline fn isUnescapedQuote(line: []const u8, i: usize) bool {
 }
 
 /// Writes a JSON log line to stdout with syntax highlighting.
-/// Keys are colored with `Color.key`, string values are plain, numbers with
-/// `Color.number`, booleans with `Color.boolean`, nulls with `Color.nullv`.
-/// The `"level"` value is additionally colored by severity via `levelColor`.
-fn printJsonStyled(line: []const u8, info: LineInfo) void {
+/// Keys use `Color.json_key`, strings `Color.json_string`, numbers
+/// `Color.json_number`, booleans and nulls `Color.json_bool_null`.
+/// The `"level"` value gets a background + foreground color from `levelStyle`.
+fn printJsonStyled(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
@@ -1005,10 +1176,11 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
 
                 if (info.level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
-                        writeOut(Color.bold);
-                        writeOut(levelColor(info.level.?));
+                        const style = levelStyle(info.level.?);
+                        writeOut(style.bg);
+                        writeOut(style.fg);
                         writeOut("\"");
-                        writeOut(str);
+                        writeUpper(str);
                         writeOut("\"");
                         writeOut(Color.reset);
                         i += 1;
@@ -1020,15 +1192,17 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                 var j = i + 1;
                 while (j < line.len and line[j] == ' ') : (j += 1) {}
                 if (j < line.len and line[j] == ':') {
-                    writeOut(Color.key);
+                    writeOut(Color.json_key);
                     writeOut("\"");
-                    writeOut(str);
+                    writeRangeHighlighted(line, str_start, i, search_matches);
                     writeOut("\"");
                     writeOut(Color.reset);
                 } else {
+                    writeOut(Color.json_string);
                     writeOut("\"");
-                    writeOut(str);
+                    writeRangeHighlighted(line, str_start, i, search_matches);
                     writeOut("\"");
+                    writeOut(Color.reset);
                 }
             }
             i += 1;
@@ -1048,29 +1222,29 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                     line[i] == 'e' or line[i] == 'E' or
                     line[i] == '+' or line[i] == '-')) : (i += 1)
             {}
-            writeOut(Color.number);
-            writeOut(line[start..i]);
+            writeOut(Color.json_number);
+            writeRangeHighlighted(line, start, i, search_matches);
             writeOut(Color.reset);
             continue;
         }
 
         if (matchWord(line, i, "true")) {
-            writeOut(Color.boolean);
-            writeOut("true");
+            writeOut(Color.json_bool_null);
+            writeRangeHighlighted(line, i, i + 4, search_matches);
             writeOut(Color.reset);
             i += 4;
             continue;
         }
         if (matchWord(line, i, "false")) {
-            writeOut(Color.boolean);
-            writeOut("false");
+            writeOut(Color.json_bool_null);
+            writeRangeHighlighted(line, i, i + 5, search_matches);
             writeOut(Color.reset);
             i += 5;
             continue;
         }
         if (matchWord(line, i, "null")) {
-            writeOut(Color.nullv);
-            writeOut("null");
+            writeOut(Color.json_bool_null);
+            writeRangeHighlighted(line, i, i + 4, search_matches);
             writeOut(Color.reset);
             i += 4;
             continue;
@@ -1084,7 +1258,7 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
                 writeOut(Color.reset);
             },
             ':' => {
-                writeOut(Color.gray);
+                writeOut(Color.muted);
                 writeOut(":");
                 writeOut(Color.reset);
             },
@@ -1100,7 +1274,7 @@ fn printJsonStyled(line: []const u8, info: LineInfo) void {
 }
 
 /// Buffered version of `printJsonStyled`, used in read loops to reduce syscalls.
-fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
+fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
@@ -1119,10 +1293,11 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
 
                 if (info.level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
-                        try output.write(Color.bold);
-                        try output.write(levelColor(info.level.?));
+                        const style = levelStyle(info.level.?);
+                        try output.write(style.bg);
+                        try output.write(style.fg);
                         try output.write("\"");
-                        try output.write(str);
+                        try writeUpperBuffered(output, str);
                         try output.write("\"");
                         try output.write(Color.reset);
                         i += 1;
@@ -1133,15 +1308,17 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                 var j = i + 1;
                 while (j < line.len and line[j] == ' ') : (j += 1) {}
                 if (j < line.len and line[j] == ':') {
-                    try output.write(Color.key);
+                    try output.write(Color.json_key);
                     try output.write("\"");
-                    try output.write(str);
+                    try writeRangeHighlightedBuffered(output, line, str_start, i, search_matches);
                     try output.write("\"");
                     try output.write(Color.reset);
                 } else {
+                    try output.write(Color.json_string);
                     try output.write("\"");
-                    try output.write(str);
+                    try writeRangeHighlightedBuffered(output, line, str_start, i, search_matches);
                     try output.write("\"");
+                    try output.write(Color.reset);
                 }
             }
             i += 1;
@@ -1161,29 +1338,29 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                     line[i] == 'e' or line[i] == 'E' or
                     line[i] == '+' or line[i] == '-')) : (i += 1)
             {}
-            try output.write(Color.number);
-            try output.write(line[start..i]);
+            try output.write(Color.json_number);
+            try writeRangeHighlightedBuffered(output, line, start, i, search_matches);
             try output.write(Color.reset);
             continue;
         }
 
         if (matchWord(line, i, "true")) {
-            try output.write(Color.boolean);
-            try output.write("true");
+            try output.write(Color.json_bool_null);
+            try writeRangeHighlightedBuffered(output, line, i, i + 4, search_matches);
             try output.write(Color.reset);
             i += 4;
             continue;
         }
         if (matchWord(line, i, "false")) {
-            try output.write(Color.boolean);
-            try output.write("false");
+            try output.write(Color.json_bool_null);
+            try writeRangeHighlightedBuffered(output, line, i, i + 5, search_matches);
             try output.write(Color.reset);
             i += 5;
             continue;
         }
         if (matchWord(line, i, "null")) {
-            try output.write(Color.nullv);
-            try output.write("null");
+            try output.write(Color.json_bool_null);
+            try writeRangeHighlightedBuffered(output, line, i, i + 4, search_matches);
             try output.write(Color.reset);
             i += 4;
             continue;
@@ -1197,7 +1374,7 @@ fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
                 try output.write(Color.reset);
             },
             ':' => {
-                try output.write(Color.gray);
+                try output.write(Color.muted);
                 try output.write(":");
                 try output.write(Color.reset);
             },
@@ -1284,7 +1461,14 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
 /// In loops, build `FilterState` once with `FilterState.init` and call `checkLine` directly.
 pub fn handleLine(line: []const u8, args: flags.Args) void {
     const filter_state = FilterState.init(args);
-    if (filter_state.checkLine(line)) |info| printStyledLine(line, info);
+    if (filter_state.checkLine(line)) |info| {
+        var match_buf: [max_search_matches]MatchRange = undefined;
+        const matches: []const MatchRange = if (filter_state.has_search_filter)
+            findSearchMatches(line, filter_state.search_expr.?, &match_buf)
+        else
+            &.{};
+        printStyledLine(line, info, matches);
+    }
 }
 
 // ============================================================================
@@ -1539,14 +1723,14 @@ test "FilterState.checkLine should filter by date" {
     try std.testing.expect(state.checkLine(out_of_range) == null);
 }
 
-test "levelColor should return correct ANSI codes" {
-    try std.testing.expectEqualStrings(Color.red, levelColor(.Error));
-    try std.testing.expectEqualStrings(Color.red, levelColor(.Fatal));
-    try std.testing.expectEqualStrings(Color.red, levelColor(.Panic));
-    try std.testing.expectEqualStrings(Color.yellow, levelColor(.Warn));
-    try std.testing.expectEqualStrings(Color.green, levelColor(.Info));
-    try std.testing.expectEqualStrings(Color.blue, levelColor(.Debug));
-    try std.testing.expectEqualStrings(Color.gray, levelColor(.Trace));
+test "levelStyle should return correct bg+fg codes" {
+    try std.testing.expectEqualStrings("\x1b[48;2;61;26;26m", levelStyle(.Error).bg);
+    try std.testing.expectEqualStrings("\x1b[48;2;248;81;73m", levelStyle(.Fatal).bg);
+    try std.testing.expectEqualStrings("\x1b[48;2;248;81;73m", levelStyle(.Panic).bg);
+    try std.testing.expectEqualStrings("\x1b[48;2;61;46;0m", levelStyle(.Warn).bg);
+    try std.testing.expectEqualStrings("\x1b[48;2;26;61;43m", levelStyle(.Info).bg);
+    try std.testing.expectEqualStrings("\x1b[48;2;26;58;92m", levelStyle(.Debug).bg);
+    try std.testing.expectEqualStrings("\x1b[48;2;48;54;61m", levelStyle(.Trace).bg);
 }
 
 test "handleLine should not crash on various inputs" {

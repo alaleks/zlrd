@@ -671,7 +671,6 @@ test "processLine: aggregate requires key builder" {
     );
 }
 
-
 test "flushFinalCarry: non-aggregate mode prints line" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -925,5 +924,3 @@ test "BatchAggregator deinit after no additions is safe" {
     var agg = try BatchAggregator.init(testing.allocator);
     agg.deinit();
 }
-
-
