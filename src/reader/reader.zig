@@ -1291,43 +1291,64 @@ fn printJsonOutputLine(line: []const u8, info: LineInfo) void {
     const date = if (info.date) |d| d else "";
     const time = if (info.time) |t| t else "";
 
-    var buf: [8192]u8 = undefined;
-    // JSON-escape the raw line (quote, backslash, control chars).
-    var raw_buf: [16384]u8 = undefined;
-    var ri: usize = 0;
-    for (line) |c| {
-        if (ri + 2 >= raw_buf.len) return;
-        if (c == '"') {
-            raw_buf[ri] = '\\';
-            ri += 1;
-            raw_buf[ri] = '"';
-        } else if (c == '\\') {
-            raw_buf[ri] = '\\';
-            ri += 1;
-            raw_buf[ri] = '\\';
-        } else if (c == '\n') {
-            raw_buf[ri] = '\\';
-            ri += 1;
-            raw_buf[ri] = 'n';
-        } else if (c == '\r') {
-            raw_buf[ri] = '\\';
-            ri += 1;
-            raw_buf[ri] = 'r';
-        } else if (c == '\t') {
-            raw_buf[ri] = '\\';
-            ri += 1;
-            raw_buf[ri] = 't';
-        } else if (c < 0x20) continue else {
-            raw_buf[ri] = c;
-        }
-        ri += 1;
-    }
-    const raw_json = raw_buf[0..ri];
+    // Single 4KB stack buffer for the full JSON line.
+    var buf: [4096]u8 = undefined;
+    var wi: usize = 0;
 
-    const s = std.fmt.bufPrint(&buf, "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"{s}\"}}", .{ lvl, date, time, raw_json }) catch return;
-    writeOut(s);
-    writeOut("\n");
+    // Write prefix: {"level":"...","date":"...","time":"...","raw":"
+    const prefix = std.fmt.bufPrint(buf[wi..], "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
+    wi += prefix.len;
+
+    // Copy raw line with JSON escaping inline.
+    var i: usize = 0;
+    while (i < line.len and wi + 2 < buf.len) {
+        const c = line[i];
+        switch (c) {
+            '"' => {
+                buf[wi] = '\\';
+                wi += 1;
+                buf[wi] = '"';
+            },
+            '\\' => {
+                buf[wi] = '\\';
+                wi += 1;
+                buf[wi] = '\\';
+            },
+            '\n' => {
+                buf[wi] = '\\';
+                wi += 1;
+                buf[wi] = 'n';
+            },
+            '\r' => {
+                buf[wi] = '\\';
+                wi += 1;
+                buf[wi] = 'r';
+            },
+            '\t' => {
+                buf[wi] = '\\';
+                wi += 1;
+                buf[wi] = 't';
+            },
+            0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {},
+            else => buf[wi] = c,
+        }
+        wi += 1;
+        i += 1;
+    }
+    if (i < line.len) return;
+
+    // Closing: "}\n
+    if (wi + 3 > buf.len) return;
+    buf[wi] = '"';
+    wi += 1;
+    buf[wi] = '}';
+    wi += 1;
+    buf[wi] = '\n';
+    wi += 1;
+    writeOut(buf[0..wi]);
 }
+
+/// Writes a plain-text line, coloring the level token at `info.level_pos`
 /// with a background + foreground color pair. Renders the level value in uppercase.
 fn printPlainTextWithLevel(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
     const style = levelStyle(info.level.?);
