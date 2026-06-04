@@ -29,7 +29,10 @@ pub fn main(opts: struct {
     defer parsed_args.deinit(allocator);
 
     if (parsed_args.version) {
-        std.Io.File.stdout().writeStreamingAll(io, "zlrd " ++ build_options.version ++ "\n") catch {};
+        const ver_name = "\x1b[2m\x1b[38;2;88;166;255mz\x1b[38;2;63;185;80ml\x1b[38;2;227;179;65mr\x1b[38;2;248;81;73md\x1b[0m";
+        std.Io.File.stdout().writeStreamingAll(io, ver_name ++ " " ++ build_options.version ++ "\n\n") catch {};
+        std.Io.File.stdout().writeStreamingAll(io, "\x1b[4mhttps://github.com/alaleks/zlrd\x1b[0m\n\n") catch {};
+        std.Io.File.stdout().writeStreamingAll(io, "\x1b[2m⭐ Star if you like it · PRs welcome!\x1b[0m\n") catch {};
         return;
     }
 
@@ -83,6 +86,9 @@ pub fn main(opts: struct {
         if (!all_ok) std.process.exit(1);
     }
 
+    if (!parsed_args.output_json and !parsed_args.tail_mode) {
+        if (std.Io.File.stdout().isTty(io) catch false) printBanner(io);
+    }
     processFiles(allocator, parsed_args) catch |err| {
         printError(io, err);
         std.process.exit(1);
@@ -91,6 +97,31 @@ pub fn main(opts: struct {
 
 fn writeStderr(io: std.Io, msg: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+}
+
+fn printBanner(io: std.Io) void {
+    const w = std.Io.File.stdout();
+    const dim = "\x1b[2m";
+    const rst = "\x1b[0m";
+    const ul = "\x1b[4m";
+    const ver = build_options.version;
+
+    // z=DEBUG(blue) l=INFO(green) r=WARN(yellow) d=ERROR(red)
+    const name = "\x1b[2m\x1b[38;2;88;166;255mz\x1b[38;2;63;185;80ml\x1b[38;2;227;179;65mr\x1b[38;2;248;81;73md\x1b[0m\x1b[2m";
+
+    var buf: [256]u8 = undefined;
+    const header = std.fmt.bufPrint(&buf, "{s} {s}\n", .{ name, ver }) catch return;
+    w.writeStreamingAll(io, header) catch {};
+    w.writeStreamingAll(io, rst) catch {};
+    w.writeStreamingAll(io, "\n") catch {};
+    w.writeStreamingAll(io, ul) catch {};
+    w.writeStreamingAll(io, "https://github.com/alaleks/zlrd") catch {};
+    w.writeStreamingAll(io, rst) catch {};
+    w.writeStreamingAll(io, "\n\n") catch {};
+    w.writeStreamingAll(io, dim) catch {};
+    w.writeStreamingAll(io, "⭐ Star if you like it · PRs welcome!") catch {};
+    w.writeStreamingAll(io, rst) catch {};
+    w.writeStreamingAll(io, "\n") catch {};
 }
 
 fn findLogFiles(allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
