@@ -73,7 +73,9 @@ zlrd -l error,warn app.log
 zlrd -l error -l fatal app.log
 
 # Search (like grep)
-zlrd -s "connection failed" app.log
+zlrd -s "connection|timeout" app.log
+zlrd -s "goroutine" app.log
+zlrd -s "error&connection" app.log
 
 # Date filter
 zlrd -d 2024-01-20 app.log
@@ -123,7 +125,7 @@ zlrd automatically detects log format:
 
 * [x] Compressed logs (gzip)
 * [x] Aggregates log rows
-* [ ] Regex-based filtering — `-s` with pattern matching for grep parity
+* [x] Regex-based filtering — `-s` with pattern matching for grep parity
 * [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
 * [ ] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
 * [ ] Homebrew tap + apt/yum packages — `brew install zlrd`

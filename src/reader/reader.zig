@@ -8,6 +8,7 @@ const simd = @import("simd.zig");
 const tail_reader = @import("tail.zig");
 const formats = @import("formats.zig");
 const gzip = @import("gzip.zig");
+const regex = @import("regex.zig");
 const debug_io = std.Options.debug_io;
 
 /// Write bytes to stdout. Swallows errors — log output is best-effort.
@@ -138,14 +139,25 @@ pub const FilterState = struct {
     has_level_filter: bool,
     enabled_levels: ?flags.LevelMask,
     has_search_filter: bool,
+    has_regex: bool,
+    regex_list: regex.RegexList,
     search_expr: ?[]const u8,
 
     /// Builds a `FilterState` from parsed CLI arguments.
-    /// Date filtering is disabled in tail mode because tail follows live output
-    /// where date-based skipping would drop all newly written lines.
+    /// Tries to compile regex; falls back to literal matching on failure.
+    /// Date filtering is disabled in tail mode.
     pub fn init(args: flags.Args) FilterState {
         const has_date = !args.tail_mode and args.date != null;
         const has_time = !args.tail_mode and (args.from_time != null or args.to_time != null);
+        const has_search = args.search != null;
+        var rx_list: regex.RegexList = undefined;
+        var has_rx = false;
+        if (has_search) {
+            if (regex.RegexList.compile(args.search.?)) |rl| {
+                rx_list = rl;
+                has_rx = true;
+            }
+        }
         return .{
             .has_date_filter = has_date,
             .date_range = if (has_date) parseDateRange(args.date.?) else .{ .from = null, .to = null },
@@ -154,9 +166,16 @@ pub const FilterState = struct {
             .to_time = args.to_time,
             .has_level_filter = args.levels != null,
             .enabled_levels = args.levels,
-            .has_search_filter = args.search != null,
+            .has_search_filter = has_search and !has_rx,
+            .has_regex = has_rx,
+            .regex_list = rx_list,
             .search_expr = args.search,
         };
+    }
+
+    /// Free compiled regex if present.
+    pub fn deinit(self: *FilterState) void {
+        if (self.has_regex) self.regex_list.deinit();
     }
 
     /// Returns the cached `LineInfo` if `line` passes all active filters, null otherwise.
@@ -164,7 +183,9 @@ pub const FilterState = struct {
     pub fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
         if (line.len == 0) return null;
 
-        if (self.has_search_filter) {
+        if (self.has_regex) {
+            if (!self.regex_list.allMatch(line)) return null;
+        } else if (self.has_search_filter) {
             if (!matchSearch(line, self.search_expr.?)) return null;
         }
 
@@ -546,8 +567,9 @@ pub fn readStreaming(
     counter: *LevelCounter,
 ) !void {
     if (gzip.isGzip(path)) {
-        const filter_state = FilterState.init(args);
-        try gzip.readGzip(allocator, path, args, filter_state, null);
+        var filter_state = FilterState.init(args);
+        defer filter_state.deinit();
+        try gzip.readGzip(allocator, path, args, &filter_state, null);
         return;
     }
 
@@ -583,7 +605,8 @@ fn readAggregated(
     var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
     defer carry.deinit(allocator);
 
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
 
     var aggregator = try Aggregator.init(allocator);
     defer aggregator.deinit();
@@ -661,7 +684,8 @@ fn readContinuous(
     var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
     defer carry.deinit(allocator);
 
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
 
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
@@ -738,7 +762,8 @@ fn readWithPagination(
     var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
     defer carry.deinit(allocator);
 
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
 
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
@@ -1610,7 +1635,8 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
 /// Constructs a `FilterState` on every call — do not use in tight loops.
 /// In loops, build `FilterState` once with `FilterState.init` and call `checkLine` directly.
 pub fn handleLine(line: []const u8, args: flags.Args) void {
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
     if (filter_state.checkLine(line)) |info| {
         var match_buf: [max_search_matches]MatchRange = undefined;
         const matches: []const MatchRange = if (filter_state.has_search_filter)
@@ -1819,10 +1845,11 @@ test "FilterState.init should initialize from args" {
         .search = "error",
         .num_lines = 0,
     };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expect(state.has_date_filter);
     try std.testing.expect(state.has_level_filter);
-    try std.testing.expect(state.has_search_filter);
+    try std.testing.expect(state.has_regex);
     try std.testing.expectEqualStrings("error", state.search_expr.?);
 }
 
@@ -1836,7 +1863,8 @@ test "FilterState.checkLine should filter by level" {
         .search = null,
         .num_lines = 0,
     };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expectEqual(flags.Level.Error, state.checkLine("[ERROR] Something went wrong").?.level.?);
     try std.testing.expect(state.checkLine("[INFO] Everything is fine") == null);
 }
@@ -1851,7 +1879,8 @@ test "FilterState.checkLine should filter by search" {
         .search = "connection",
         .num_lines = 0,
     };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expect(state.checkLine("[ERROR] Connection failed") != null);
     try std.testing.expect(state.checkLine("[INFO] Operation successful") == null);
 }
@@ -1866,7 +1895,8 @@ test "FilterState.checkLine should filter by date" {
         .search = null,
         .num_lines = 0,
     };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     const in_range = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"info\",\"msg\":\"test\"}";
     try std.testing.expect(state.checkLine(in_range) != null);
     const out_of_range = "{\"time\":\"2023-10-25T12:00:00Z\",\"level\":\"info\",\"msg\":\"test\"}";
@@ -1893,7 +1923,8 @@ test "handleLine should not crash on various inputs" {
         .search = null,
         .num_lines = 0,
     };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     _ = state.checkLine("[ERROR] Test");
     _ = state.checkLine("");
 }
@@ -1952,7 +1983,8 @@ test "FilterState with aggregation semantics still filters before counting" {
         .aggregate = true,
     };
 
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
 
     try std.testing.expect(state.checkLine("[ERROR] Connection failed") != null);
     try std.testing.expect(state.checkLine("[ERROR] Timeout") == null);
@@ -2339,7 +2371,8 @@ test "FilterState: time filter rejects early time" {
         .from_time = "14:00",
         .to_time = "15:00",
     };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expect(state.checkLine("2023-10-15T14:30:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-15T13:00:00Z [INFO] msg") == null);
     try std.testing.expect(state.checkLine("2023-10-15T16:00:00Z [INFO] msg") == null);
@@ -2348,7 +2381,8 @@ test "FilterState: time filter rejects early time" {
 test "FilterState: --from only" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .from_time = "14:00" };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expect(state.checkLine("2023-10-15T15:00:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-15T13:00:00Z [INFO] msg") == null);
 }
@@ -2356,15 +2390,84 @@ test "FilterState: --from only" {
 test "FilterState: time filter disabled in tail mode" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .tail_mode = true, .from_time = "14:00" };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expect(!state.has_time_filter);
 }
 
 test "FilterState: date + time combined filter" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .date = "2023-10-15", .from_time = "14:00", .to_time = "15:00" };
-    const state = FilterState.init(args);
+    var state = FilterState.init(args);
+    defer state.deinit();
     try std.testing.expect(state.checkLine("2023-10-15T14:30:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-16T14:30:00Z [INFO] msg") == null);
     try std.testing.expect(state.checkLine("2023-10-15T13:00:00Z [INFO] msg") == null);
+}
+
+test "FilterState: regex matches simple pattern" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{ .files = &file, .search = ".*error.*" };
+    var state = FilterState.init(args);
+    defer state.deinit();
+    try std.testing.expect(state.has_regex);
+    try std.testing.expect(state.checkLine("some error occurred") != null);
+    try std.testing.expect(state.checkLine("no issue here") == null);
+}
+
+test "FilterState: regex OR via pipe" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{ .files = &file, .search = "error|timeout" };
+    var state = FilterState.init(args);
+    defer state.deinit();
+    try std.testing.expect(state.checkLine("connection timeout") != null);
+    try std.testing.expect(state.checkLine("some error") != null);
+    try std.testing.expect(state.checkLine("all good") == null);
+}
+
+test "FilterState: regex AND via ampersand" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{ .files = &file, .search = "error&connection" };
+    var state = FilterState.init(args);
+    defer state.deinit();
+    try std.testing.expect(state.checkLine("error: connection failed") != null);
+    try std.testing.expect(state.checkLine("error: timeout") == null);
+}
+
+test "FilterState: invalid regex falls back to literal" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{ .files = &file, .search = "[invalid" };
+    var state = FilterState.init(args);
+    defer state.deinit();
+    try std.testing.expect(!state.has_regex);
+    try std.testing.expect(state.has_search_filter);
+    try std.testing.expect(state.checkLine("[invalid") != null);
+}
+
+test "Regex.compile: valid pattern" {
+    var re = regex.Regex.compile("hello").?;
+    defer re.deinit();
+    try std.testing.expect(re.isMatch("hello world"));
+    try std.testing.expect(re.isMatch("HELLO"));
+    try std.testing.expect(!re.isMatch("world"));
+}
+
+test "Regex.compile: invalid pattern returns null" {
+    try std.testing.expect(regex.Regex.compile("[unclosed") == null);
+}
+
+test "RegexList: AND logic" {
+    var rl = regex.RegexList.compile("error&connection").?;
+    defer rl.deinit();
+    try std.testing.expect(rl.allMatch("error: connection failed"));
+    try std.testing.expect(!rl.allMatch("error: timeout"));
+    try std.testing.expect(!rl.allMatch("connection: ok"));
+}
+
+test "RegexList: single pattern" {
+    var rl = regex.RegexList.compile("hello|world").?;
+    defer rl.deinit();
+    try std.testing.expect(rl.allMatch("hello"));
+    try std.testing.expect(rl.allMatch("world"));
+    try std.testing.expect(!rl.allMatch("nope"));
 }
