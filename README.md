@@ -52,6 +52,7 @@ Options:
   -d, --date <date>        Date filter: YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD
       --from <time>        Time range start (HH:MM or HH:MM:SS)
       --to <time>          Time range end (HH:MM or HH:MM:SS)
+      --output json        Output as JSONL for pipeline processing
   -t, --tail               Follow file in real time
   -n, --num-lines <num>    Show last N lines
   -v, --version            Print version and exit
@@ -127,7 +128,7 @@ zlrd automatically detects log format:
 * [x] Aggregates log rows
 * [x] Regex-based filtering — `-s` with pattern matching for grep parity
 * [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
-* [ ] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
+* [x] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
 * [ ] Homebrew tap + apt/yum packages — `brew install zlrd`
 
 ---

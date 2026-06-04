@@ -78,6 +78,7 @@ pub const Args = struct {
     num_lines: usize = 0,
     aggregate: bool = false,
     aggregate_mode: AggregateMode = .exact,
+    output_json: bool = false,
 
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
@@ -132,6 +133,7 @@ pub fn printHelp() void {
         \\  -{c}, --{s:<16} <mode>   Aggregate mode: exact | level-message | json-message | normalized
         \\      --from <time>        Time range start (HH:MM or HH:MM:SS)
         \\      --to <time>          Time range end (HH:MM or HH:MM:SS)
+        \\      --output json        Output as JSONL (pipe to jq)
         \\
     , .{
         OptionFile.short,          OptionFile.long,
@@ -164,6 +166,7 @@ pub const OptionAggregate = Options{ .short = 'a', .long = "aggregate" };
 pub const OptionAggregateMode = Options{ .short = 'm', .long = "aggregate-mode" };
 pub const OptionFromTime = Options{ .short = 0, .long = "from" };
 pub const OptionToTime = Options{ .short = 0, .long = "to" };
+pub const OptionOutput = Options{ .short = 0, .long = "output" };
 
 fn parseArgsFromIter(
     allocator: std.mem.Allocator,
@@ -250,6 +253,10 @@ fn parseLongFlag(
             parsed.to_time = val;
             return;
         }
+        if (std.mem.eql(u8, f, "output")) {
+            if (std.mem.eql(u8, val, "json")) parsed.output_json = true;
+            return;
+        }
         break :blk f;
     } else arg[2..];
 
@@ -259,6 +266,11 @@ fn parseLongFlag(
     }
     if (std.mem.eql(u8, flag, "aggregate")) {
         parsed.aggregate = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "output")) {
+        const val = valueOrNext(it, flag) orelse return;
+        if (std.mem.eql(u8, val, "json")) parsed.output_json = true;
         return;
     }
     if (std.mem.eql(u8, flag, "file") or
