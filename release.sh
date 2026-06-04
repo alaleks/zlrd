@@ -212,10 +212,12 @@ echo ""
 
 if [[ "$ASSUME_YES" != "true" ]]; then
   read -r -p "Create and push signed tag $NEW_TAG? [y/N] " CONFIRM
-  if [[ "${CONFIRM,,}" != "y" ]]; then
+  shopt -s nocasematch
+  if [[ "$CONFIRM" != "y" ]]; then
     echo "Aborted."
     exit 0
   fi
+  shopt -u nocasematch
 fi
 
 # -----------------------------
