@@ -303,6 +303,11 @@ const OutputBuffer = struct {
 
     /// Appends a raw byte slice to the internal buffer, flushing if full.
     fn write(self: *OutputBuffer, s: []const u8) !void {
+        if (s.len >= self.max_size) {
+            try self.flush();
+            try self.file.writeStreamingAll(debug_io, s);
+            return;
+        }
         try self.buffer.appendSlice(self.allocator, s);
         if (self.buffer.items.len >= self.max_size) try self.flush();
     }
@@ -484,8 +489,8 @@ pub fn readStreaming(
     args: flags.Args,
 ) !void {
     if (gzip.isGzip(path)) {
-        const filter_state = FilterState.init(args);
-        try gzip.readGzip(allocator, path, filter_state);
+        var filter_state = FilterState.init(args);
+        try gzip.readGzip(allocator, path, args, &filter_state, buildAggregateKeyForLine);
         return;
     }
 

@@ -175,7 +175,7 @@ fn parseArgsFromIter(
     _ = it.next();
 
     var files = try std.ArrayList([]const u8).initCapacity(allocator, 4);
-    errdefer files.deinit(allocator);
+    errdefer freeFileList(allocator, &files);
 
     var parsed = Args{
         .files = &.{},
@@ -204,11 +204,26 @@ fn parseArgsFromIter(
             continue;
         }
 
-        try files.append(allocator, try allocator.dupe(u8, arg));
+        try appendFile(allocator, &files, arg);
     }
 
     parsed.files = try files.toOwnedSlice(allocator);
     return parsed;
+}
+
+fn freeFileList(allocator: std.mem.Allocator, files: *std.ArrayList([]const u8)) void {
+    for (files.items) |f| allocator.free(f);
+    files.deinit(allocator);
+}
+
+fn appendFile(
+    allocator: std.mem.Allocator,
+    files: *std.ArrayList([]const u8),
+    path: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned);
+    try files.append(allocator, owned);
 }
 
 fn parseLongFlag(
@@ -222,7 +237,7 @@ fn parseLongFlag(
         const val = arg[eq_pos + 1 ..];
         const f = arg[2..eq_pos];
         if (std.mem.eql(u8, f, "file")) {
-            try files.append(allocator, try allocator.dupe(u8, val));
+            try appendFile(allocator, files, val);
             return;
         }
         if (std.mem.eql(u8, f, "search")) {
@@ -292,7 +307,7 @@ fn parseLongFlag(
             else => if (std.mem.eql(u8, flag, "from")) error.MissingFromTime else error.MissingToTime,
         };
         if (std.mem.eql(u8, flag, "file")) {
-            try files.append(allocator, try allocator.dupe(u8, val));
+            try appendFile(allocator, files, val);
         } else if (std.mem.eql(u8, flag, "search")) {
             parsed.search = val;
         } else if (std.mem.eql(u8, flag, "level")) {
@@ -327,11 +342,11 @@ fn parseShortFlags(
             'f' => {
                 const rest = flags_str[i + 1 ..];
                 if (rest.len > 0) {
-                    try files.append(allocator, try allocator.dupe(u8, rest));
+                    try appendFile(allocator, files, rest);
                     return;
                 }
                 const val = valueOrNext(it, "file") orelse return error.MissingFile;
-                try files.append(allocator, try allocator.dupe(u8, val));
+                try appendFile(allocator, files, val);
                 return;
             },
             's' => {
@@ -586,13 +601,9 @@ test "help flag stops parsing" {
 }
 
 test "memory cleanup on error" {
-    // Use arena so leaked allocations from partial parsing are freed together.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
     const fake = FakeIter{ .argv = &.{ "zlrd", "-f", "a.log", "-f", "b.log", "--bad-flag" } };
     var it = fake;
-    _ = parseArgsFromIter(allocator, &it) catch {};
+    try testing.expectError(error.UnknownArgument, parseArgsFromIter(testing.allocator, &it));
 }
 
 test "empty file list is allowed" {

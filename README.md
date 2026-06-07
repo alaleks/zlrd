@@ -122,6 +122,22 @@ zlrd automatically detects log format:
 
 ---
 
+## 🤖 Agent Mode (planned)
+
+Run zlrd as a background monitoring agent:
+
+```bash
+zlrd --agent --agent-port 9090 /var/log/app/*.log
+```
+
+- **Stateless watcher** — periodic scan, JSON metrics, threshold alerts
+- **Sidecar** — gRPC streaming to central collector for multi-node clusters
+- **eBPF probes** — kernel-level OOM/segfault/panic detection with near-zero overhead
+- HTTP endpoints: `/metrics` (Prometheus), `/health`, `/events`
+- Webhook alerts: Slack, Discord, Telegram
+
+---
+
 ## 🗺️ Roadmap
 
 * [x] Compressed logs (gzip)
@@ -130,6 +146,9 @@ zlrd automatically detects log format:
 * [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
 * [x] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
 * [ ] Homebrew tap + apt/yum packages — `brew install zlrd`
+* [ ] Agent mode (`--agent`) — background monitoring, alerting, HTTP metrics
+* [ ] Sidecar agent — gRPC streaming to central collector, multi-node
+* [ ] eBPF agent — kernel-level probes (OOM, segfault, panic) with zero overhead
 
 ---
 

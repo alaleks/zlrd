@@ -21,6 +21,45 @@ fn readAt(f: std.Io.File, pos: u64, buf: []u8) !usize {
     return f.readPositional(tail_io, &.{buf}, pos);
 }
 
+fn findLastNLinesStart(f: *OpenFile, file_size: u64, n: usize, scan_buf: []u8) !u64 {
+    if (file_size == 0 or n == 0) return 0;
+
+    var target_newlines = n;
+    var last_byte: [1]u8 = undefined;
+    if (try readAt(f.fd, file_size - 1, &last_byte) == 1 and last_byte[0] == '\n') {
+        target_newlines += 1;
+    }
+
+    var newlines_found: usize = 0;
+    var scan_end: u64 = file_size;
+    const max_chunk: u64 = @intCast(scan_buf.len);
+
+    while (scan_end > 0) {
+        const chunk_size_u64 = @min(scan_end, max_chunk);
+        const chunk_size: usize = @intCast(chunk_size_u64);
+        const chunk_start = scan_end - chunk_size_u64;
+
+        const bytes_read = try readAt(f.fd, chunk_start, scan_buf[0..chunk_size]);
+        if (bytes_read == 0) break;
+
+        var idx: usize = bytes_read;
+        while (idx > 0) {
+            idx -= 1;
+            if (scan_buf[idx] == '\n') {
+                newlines_found += 1;
+                if (newlines_found == target_newlines) {
+                    return chunk_start + idx + 1;
+                }
+            }
+        }
+
+        if (chunk_start == 0) break;
+        scan_end = chunk_start;
+    }
+
+    return 0;
+}
+
 /// Batch-local aggregator used by tail reads.
 /// Keeps first-seen order within one read batch and prints once per key.
 const BatchAggregator = struct {
@@ -188,34 +227,7 @@ pub fn readLastNLines(
 ) !u64 {
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
 
-    const scan_buf = try allocator.alloc(u8, READ_BUF_SIZE);
-    defer allocator.free(scan_buf);
-
-    var newlines_found: usize = 0;
-    var read_from: u64 = 0;
-    var scan_end: u64 = file_size;
-
-    outer: while (scan_end > 0) {
-        const chunk_size: u64 = @min(scan_end, READ_BUF_SIZE);
-        const chunk_start: u64 = scan_end - chunk_size;
-
-        const bytes_read = try readAt(f.fd, chunk_start, scan_buf[0..chunk_size]);
-
-        var idx: usize = bytes_read;
-        while (idx > 0) {
-            idx -= 1;
-            if (scan_buf[idx] == '\n') {
-                newlines_found += 1;
-                if (newlines_found == n) {
-                    read_from = chunk_start + idx + 1;
-                    break :outer;
-                }
-            }
-        }
-
-        if (chunk_start == 0) break;
-        scan_end = chunk_start;
-    }
+    const read_from = try findLastNLinesStart(f, file_size, n, read_buf);
 
     f.position = read_from;
 
@@ -397,6 +409,46 @@ test "readLastNLines handles empty file" {
 
     const stat = try file.stat(tail_io);
     try testing.expectEqual(@as(u64, 0), stat.size);
+}
+
+test "findLastNLinesStart ignores trailing newline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tail_io, .{
+        .sub_path = "tail.log",
+        .data = "line1\nline2\nline3\nline4\nline5\n",
+    });
+
+    var file = try tmp.dir.openFile(tail_io, "tail.log", .{});
+    defer file.close(tail_io);
+
+    const stat = try file.stat(tail_io);
+    var read_buf: [READ_BUF_SIZE]u8 = undefined;
+    var of = OpenFile{ .path = "tail.log", .fd = file, .position = 0 };
+
+    try testing.expectEqual(@as(u64, 12), try findLastNLinesStart(&of, stat.size, 3, &read_buf));
+    try testing.expectEqual(@as(u64, 24), try findLastNLinesStart(&of, stat.size, 1, &read_buf));
+}
+
+test "findLastNLinesStart handles file without trailing newline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tail_io, .{
+        .sub_path = "tail-no-newline.log",
+        .data = "line1\nline2\nline3\nline4\nline5",
+    });
+
+    var file = try tmp.dir.openFile(tail_io, "tail-no-newline.log", .{});
+    defer file.close(tail_io);
+
+    const stat = try file.stat(tail_io);
+    var read_buf: [READ_BUF_SIZE]u8 = undefined;
+    var of = OpenFile{ .path = "tail-no-newline.log", .fd = file, .position = 0 };
+
+    try testing.expectEqual(@as(u64, 12), try findLastNLinesStart(&of, stat.size, 3, &read_buf));
+    try testing.expectEqual(@as(u64, 24), try findLastNLinesStart(&of, stat.size, 1, &read_buf));
 }
 
 test "position tracking correctly advances after reading" {

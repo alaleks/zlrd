@@ -380,6 +380,11 @@ const OutputBuffer = struct {
 
     /// Appends a raw byte slice to the internal buffer, flushing if full.
     fn write(self: *OutputBuffer, s: []const u8) !void {
+        if (s.len >= self.max_size) {
+            try self.flush();
+            try self.file.writeStreamingAll(debug_io, s);
+            return;
+        }
         try self.buffer.appendSlice(self.allocator, s);
         if (self.buffer.items.len >= self.max_size) try self.flush();
     }
@@ -569,7 +574,7 @@ pub fn readStreaming(
     if (gzip.isGzip(path)) {
         var filter_state = FilterState.init(args);
         defer filter_state.deinit();
-        try gzip.readGzip(allocator, path, args, &filter_state, null);
+        try gzip.readGzip(allocator, path, args, &filter_state, buildAggregateKeyForLine);
         return;
     }
 
@@ -1291,61 +1296,57 @@ fn printJsonOutputLine(line: []const u8, info: LineInfo) void {
     const date = if (info.date) |d| d else "";
     const time = if (info.time) |t| t else "";
 
-    // Single 4KB stack buffer for the full JSON line.
-    var buf: [4096]u8 = undefined;
-    var wi: usize = 0;
+    var prefix_buf: [256]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
+    writeOut(prefix);
 
-    // Write prefix: {"level":"...","date":"...","time":"...","raw":"
-    const prefix = std.fmt.bufPrint(buf[wi..], "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
-    wi += prefix.len;
+    var out_buf: [4096]u8 = undefined;
+    var out_len: usize = 0;
 
-    // Copy raw line with JSON escaping inline.
-    var i: usize = 0;
-    while (i < line.len and wi + 2 < buf.len) {
-        const c = line[i];
-        switch (c) {
-            '"' => {
-                buf[wi] = '\\';
-                wi += 1;
-                buf[wi] = '"';
-            },
-            '\\' => {
-                buf[wi] = '\\';
-                wi += 1;
-                buf[wi] = '\\';
-            },
-            '\n' => {
-                buf[wi] = '\\';
-                wi += 1;
-                buf[wi] = 'n';
-            },
-            '\r' => {
-                buf[wi] = '\\';
-                wi += 1;
-                buf[wi] = 'r';
-            },
-            '\t' => {
-                buf[wi] = '\\';
-                wi += 1;
-                buf[wi] = 't';
-            },
-            0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {},
-            else => buf[wi] = c,
+    const Writer = struct {
+        fn flush(buf: []const u8) void {
+            if (buf.len > 0) writeOut(buf);
         }
-        wi += 1;
-        i += 1;
-    }
-    if (i < line.len) return;
 
-    // Closing: "}\n
-    if (wi + 3 > buf.len) return;
-    buf[wi] = '"';
-    wi += 1;
-    buf[wi] = '}';
-    wi += 1;
-    buf[wi] = '\n';
-    wi += 1;
-    writeOut(buf[0..wi]);
+        fn append(buf: []u8, len: *usize, bytes: []const u8) void {
+            if (bytes.len > buf.len) {
+                flush(buf[0..len.*]);
+                len.* = 0;
+                flush(bytes);
+                return;
+            }
+
+            if (len.* + bytes.len > buf.len) {
+                flush(buf[0..len.*]);
+                len.* = 0;
+            }
+
+            @memcpy(buf[len.* .. len.* + bytes.len], bytes);
+            len.* += bytes.len;
+        }
+    };
+
+    for (line) |c| {
+        switch (c) {
+            '"' => Writer.append(&out_buf, &out_len, "\\\""),
+            '\\' => Writer.append(&out_buf, &out_len, "\\\\"),
+            '\n' => Writer.append(&out_buf, &out_len, "\\n"),
+            '\r' => Writer.append(&out_buf, &out_len, "\\r"),
+            '\t' => Writer.append(&out_buf, &out_len, "\\t"),
+            0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {
+                var esc: [6]u8 = undefined;
+                const s = std.fmt.bufPrint(&esc, "\\u{X:0>4}", .{c}) catch continue;
+                Writer.append(&out_buf, &out_len, s);
+            },
+            else => {
+                var one = [_]u8{c};
+                Writer.append(&out_buf, &out_len, &one);
+            },
+        }
+    }
+
+    Writer.append(&out_buf, &out_len, "\"}\n");
+    Writer.flush(out_buf[0..out_len]);
 }
 
 /// Writes a plain-text line, coloring the level token at `info.level_pos`
