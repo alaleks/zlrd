@@ -600,7 +600,6 @@ test "extractJsonField: non-string value is ignored" {
     try testing.expect(extractJsonField("{\"level\":123}", "level", 10) == null);
 }
 
-
 // ── chunkMask ────────────────────────────────────────────────────────────────
 
 test "chunkMask: single bit" {

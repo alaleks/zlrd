@@ -142,6 +142,7 @@ pub const FilterState = struct {
     has_regex: bool,
     regex_list: regex.RegexList,
     search_expr: ?[]const u8,
+    output_json: bool,
 
     /// Builds a `FilterState` from parsed CLI arguments.
     /// Tries to compile regex; falls back to literal matching on failure.
@@ -152,7 +153,7 @@ pub const FilterState = struct {
         const has_search = args.search != null;
         var rx_list: regex.RegexList = undefined;
         var has_rx = false;
-        if (has_search) {
+        if (has_search and shouldUseRegexSearch(args.search.?)) {
             if (regex.RegexList.compile(args.search.?)) |rl| {
                 rx_list = rl;
                 has_rx = true;
@@ -170,6 +171,7 @@ pub const FilterState = struct {
             .has_regex = has_rx,
             .regex_list = rx_list,
             .search_expr = args.search,
+            .output_json = args.output_json,
         };
     }
 
@@ -180,7 +182,7 @@ pub const FilterState = struct {
 
     /// Returns the cached `LineInfo` if `line` passes all active filters, null otherwise.
     /// Filter order: search → level → date (cheapest to most expensive).
-    pub fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
+    pub fn checkLine(self: *const FilterState, line: []const u8) ?LineInfo {
         if (line.len == 0) return null;
 
         if (self.has_regex) {
@@ -209,8 +211,12 @@ pub const FilterState = struct {
 
     /// Convenience wrapper: filter and print in one call.
     /// Intended for tail.zig so it does not need to import `LineInfo` or `printStyledLine`.
-    pub fn printIfMatch(self: FilterState, line: []const u8) void {
+    pub fn printIfMatch(self: *const FilterState, line: []const u8) void {
         if (self.checkLine(line)) |info| {
+            if (self.output_json) {
+                printJsonOutputLine(line, info);
+                return;
+            }
             var match_buf: [max_search_matches]MatchRange = undefined;
             const matches: []const MatchRange = if (self.has_search_filter)
                 findSearchMatches(line, self.search_expr.?, &match_buf)
@@ -310,7 +316,7 @@ const Aggregator = struct {
 
     /// Print all aggregated entries in first-seen order.
     /// If `page_size > 0`, paginate the aggregated output.
-    fn printAll(self: *Aggregator, output: *OutputBuffer, page_size: usize) !void {
+    fn printAll(self: *Aggregator, output: *OutputBuffer, page_size: usize, output_json: bool) !void {
         var batch: usize = 0;
         var page: usize = 1;
 
@@ -318,8 +324,12 @@ const Aggregator = struct {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
             const info = self.sample_infos.get(key).?;
-            try printAggregatePrefix(output, count);
-            try printStyledLineBuffered(output, line, info, &.{});
+            if (output_json) {
+                printJsonOutputLine(line, info);
+            } else {
+                try printAggregatePrefix(output, count);
+                try printStyledLineBuffered(output, line, info, &.{});
+            }
 
             if (page_size > 0) {
                 batch += 1;
@@ -559,7 +569,7 @@ pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args) !void {
     for (args.files) |path| {
         try readStreaming(allocator, path, args, &counter);
     }
-    counter.print();
+    if (!args.output_json) counter.print();
 }
 
 /// Read a log file with filtering and colored output.
@@ -668,7 +678,7 @@ fn readAggregated(
         }
     }
 
-    try aggregator.printAll(&output, args.num_lines);
+    try aggregator.printAll(&output, args.num_lines, args.output_json);
 }
 
 /// Streams a log file continuously, printing each matching line as it is read.
@@ -1689,6 +1699,16 @@ fn matchSearch(line: []const u8, expr: []const u8) bool {
     return containsIgnoreCase(line, expr);
 }
 
+fn shouldUseRegexSearch(expr: []const u8) bool {
+    for (expr) |c| {
+        switch (c) {
+            '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '\\' => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Returns true if `needle` appears in `hay` (case-insensitive).
 /// Returns false if either slice is empty or `needle` is longer than `hay`.
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
@@ -1927,7 +1947,7 @@ test "FilterState.init should initialize from args" {
     defer state.deinit();
     try std.testing.expect(state.has_date_filter);
     try std.testing.expect(state.has_level_filter);
-    try std.testing.expect(state.has_regex);
+    try std.testing.expect(!state.has_regex);
     try std.testing.expectEqualStrings("error", state.search_expr.?);
 }
 
@@ -2491,6 +2511,15 @@ test "FilterState: regex matches simple pattern" {
     try std.testing.expect(state.has_regex);
     try std.testing.expect(state.checkLine("some error occurred") != null);
     try std.testing.expect(state.checkLine("no issue here") == null);
+}
+
+test "FilterState: plain search stays on literal fast path" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{ .files = &file, .search = "error" };
+    var state = FilterState.init(args);
+    defer state.deinit();
+    try std.testing.expect(!state.has_regex);
+    try std.testing.expect(state.checkLine("some error occurred") != null);
 }
 
 test "FilterState: regex OR via pipe" {

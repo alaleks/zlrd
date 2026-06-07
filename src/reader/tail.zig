@@ -103,29 +103,18 @@ const BatchAggregator = struct {
         try self.order.append(self.allocator, owned_key);
     }
 
-    fn printAll(self: *BatchAggregator) void {
+    fn printAll(self: *BatchAggregator, filter_state: *const formats.FilterState) void {
         for (self.order.items) |key| {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
 
-            if (count > 1) {
+            if (count > 1 and !filter_state.output_json) {
                 var buf: [128]u8 = undefined;
                 const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{count}) catch "[x?] ";
                 std.Io.File.stdout().writeStreamingAll(tail_io, prefix) catch {};
             }
 
-            formats.handleLine(line, .{
-                .files = &.{},
-                .search = null,
-                .levels = null,
-                .date = null,
-                .tail_mode = false,
-                .help = false,
-                .version = false,
-                .num_lines = 0,
-                .aggregate = false,
-                .aggregate_mode = .exact,
-            });
+            filter_state.printIfMatch(line);
         }
     }
 };
@@ -148,7 +137,8 @@ pub fn follow(
         }
     }
 
-    const filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args);
+    defer filter_state.deinit();
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -175,7 +165,7 @@ pub fn follow(
                 &files_buf[files_len - 1],
                 args,
                 stat.size,
-                filter_state,
+                &filter_state,
                 read_buf,
             );
             files_buf[files_len - 1].position = final_pos;
@@ -204,7 +194,7 @@ pub fn follow(
                 continue;
             }
 
-            const bytes_read = readAvailable(allocator, f, args, filter_state, carry, read_buf) catch continue;
+            const bytes_read = readAvailable(allocator, f, args, &filter_state, carry, read_buf) catch continue;
             if (bytes_read > 0) any_read = true;
         }
 
@@ -222,7 +212,7 @@ pub fn readLastNLines(
     f: *OpenFile,
     args: flags.Args,
     file_size: u64,
-    filter_state: formats.FilterState,
+    filter_state: *const formats.FilterState,
     read_buf: []u8,
 ) !u64 {
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
@@ -244,7 +234,7 @@ fn readAvailable(
     allocator: std.mem.Allocator,
     f: *OpenFile,
     args: flags.Args,
-    filter_state: formats.FilterState,
+    filter_state: *const formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
 ) !usize {
@@ -262,7 +252,7 @@ pub fn readToEOF(
     allocator: std.mem.Allocator,
     f: *OpenFile,
     args: flags.Args,
-    filter_state: formats.FilterState,
+    filter_state: *const formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
 ) !void {
@@ -303,14 +293,14 @@ pub fn readToEOF(
     }
 
     if (aggregator) |*agg| {
-        agg.printAll();
+        agg.printAll(filter_state);
     }
 }
 
 fn processLine(
     allocator: std.mem.Allocator,
     args: flags.Args,
-    filter_state: formats.FilterState,
+    filter_state: *const formats.FilterState,
     aggregator: ?*BatchAggregator,
     line: []const u8,
 ) !void {
@@ -394,7 +384,7 @@ test "readLastNLines handles files with fewer lines than requested" {
     defer allocator.free(read_buf);
 
     var of = OpenFile{ .path = "small.log", .fd = file, .position = 0 };
-    const pos = try readLastNLines(allocator, &of, args, stat.size, filter_state, read_buf);
+    const pos = try readLastNLines(allocator, &of, args, stat.size, &filter_state, read_buf);
     try testing.expectEqual(@as(u64, 13), pos);
 }
 
@@ -476,7 +466,7 @@ test "position tracking correctly advances after reading" {
     defer allocator.free(read_buf);
 
     var of = OpenFile{ .path = "pos.log", .fd = file, .position = 0 };
-    const position = try readLastNLines(allocator, &of, args, stat.size, filter_state, read_buf);
+    const position = try readLastNLines(allocator, &of, args, stat.size, &filter_state, read_buf);
     try testing.expectEqual(@as(u64, 30), position);
 }
 
@@ -529,7 +519,7 @@ test "appended data read correctly in sequential operations" {
     defer allocator.free(read_buf);
 
     var of = OpenFile{ .path = "append.log", .fd = file, .position = 0 };
-    const position = try readLastNLines(allocator, &of, args, stat1.size, filter_state, read_buf);
+    const position = try readLastNLines(allocator, &of, args, stat1.size, &filter_state, read_buf);
     try testing.expectEqual(@as(u64, 18), position);
 
     // Append more data using positional write (pwrite)
@@ -549,7 +539,7 @@ test "appended data read correctly in sequential operations" {
     const args2 = makeSilentTailArgs(files_array[0..], 0, false, .exact);
     const filter_state2 = formats.FilterState.init(args2);
 
-    try readToEOF(allocator, &of, args2, filter_state2, &carry, read_buf);
+    try readToEOF(allocator, &of, args2, &filter_state2, &carry, read_buf);
     try testing.expectEqual(@as(u64, 36), of.position);
 }
 
@@ -594,7 +584,7 @@ test "readToEOF with aggregate exact advances position and preserves carry" {
     defer allocator.free(read_buf);
 
     var of = OpenFile{ .path = "agg.log", .fd = file, .position = 0 };
-    try readToEOF(allocator, &of, args, filter_state, &carry, read_buf);
+    try readToEOF(allocator, &of, args, &filter_state, &carry, read_buf);
 
     try testing.expectEqualStrings("partial", carry.items);
     try testing.expect(of.position > 0);
@@ -627,7 +617,7 @@ test "readToEOF with aggregate normalized consumes complete data" {
     defer allocator.free(read_buf);
 
     var of = OpenFile{ .path = "norm.log", .fd = file, .position = 0 };
-    try readToEOF(allocator, &of, args, filter_state, &carry, read_buf);
+    try readToEOF(allocator, &of, args, &filter_state, &carry, read_buf);
 
     try testing.expectEqual(@as(usize, 0), carry.items.len);
     try testing.expect(of.position > 0);

@@ -7,6 +7,7 @@ const flags = @import("flags");
 const simd = @import("simd.zig");
 const tail_reader = @import("tail.zig");
 const gzip = @import("gzip.zig");
+const regex = @import("regex.zig");
 
 const debug_io = std.Options.debug_io;
 
@@ -124,32 +125,60 @@ const DateRange = struct {
 pub const FilterState = struct {
     has_date_filter: bool,
     date_range: DateRange,
+    has_time_filter: bool,
+    from_time: ?[]const u8,
+    to_time: ?[]const u8,
     has_level_filter: bool,
     enabled_levels: ?flags.LevelMask,
     has_search_filter: bool,
+    has_regex: bool,
+    regex_list: regex.RegexList,
     search_expr: ?[]const u8,
+    output_json: bool,
 
     /// Builds a `FilterState` from parsed CLI arguments.
     /// Date filtering is disabled in tail mode because tail follows live output
     /// where date-based skipping would drop all newly written lines.
     pub fn init(args: flags.Args) FilterState {
         const has_date = !args.tail_mode and args.date != null;
+        const has_time = !args.tail_mode and (args.from_time != null or args.to_time != null);
+        const has_search = args.search != null;
+        var rx_list: regex.RegexList = undefined;
+        var has_rx = false;
+        if (has_search and shouldUseRegexSearch(args.search.?)) {
+            if (regex.RegexList.compile(args.search.?)) |rl| {
+                rx_list = rl;
+                has_rx = true;
+            }
+        }
         return .{
             .has_date_filter = has_date,
             .date_range = if (has_date) parseDateRange(args.date.?) else .{ .from = null, .to = null },
+            .has_time_filter = has_time,
+            .from_time = args.from_time,
+            .to_time = args.to_time,
             .has_level_filter = args.levels != null,
             .enabled_levels = args.levels,
-            .has_search_filter = args.search != null,
+            .has_search_filter = has_search and !has_rx,
+            .has_regex = has_rx,
+            .regex_list = rx_list,
             .search_expr = args.search,
+            .output_json = args.output_json,
         };
+    }
+
+    pub fn deinit(self: *FilterState) void {
+        if (self.has_regex) self.regex_list.deinit();
     }
 
     /// Returns the cached `LineInfo` if `line` passes all active filters, null otherwise.
     /// Filter order: search → level → date (cheapest to most expensive).
-    pub fn checkLine(self: FilterState, line: []const u8) ?LineInfo {
+    pub fn checkLine(self: *const FilterState, line: []const u8) ?LineInfo {
         if (line.len == 0) return null;
 
-        if (self.has_search_filter) {
+        if (self.has_regex) {
+            if (!self.regex_list.allMatch(line)) return null;
+        } else if (self.has_search_filter) {
             if (!matchSearch(line, self.search_expr.?)) return null;
         }
 
@@ -164,13 +193,23 @@ pub const FilterState = struct {
             if (!matchDateRangeWithDate(info.date, self.date_range)) return null;
         }
 
+        if (self.has_time_filter) {
+            if (!matchTimeRange(info.time, self.from_time, self.to_time)) return null;
+        }
+
         return info;
     }
 
     /// Convenience wrapper: filter and print in one call.
     /// Intended for tail.zig so it does not need to import `LineInfo` or `printStyledLine`.
-    pub fn printIfMatch(self: FilterState, line: []const u8) void {
-        if (self.checkLine(line)) |info| printStyledLine(line, info);
+    pub fn printIfMatch(self: *const FilterState, line: []const u8) void {
+        if (self.checkLine(line)) |info| {
+            if (self.output_json) {
+                printJsonOutputLine(line, info);
+            } else {
+                printStyledLine(line, info);
+            }
+        }
     }
 };
 
@@ -233,7 +272,7 @@ const Aggregator = struct {
 
     /// Print all aggregated entries in first-seen order.
     /// If `page_size > 0`, paginate the aggregated output.
-    fn printAll(self: *Aggregator, output: *OutputBuffer, page_size: usize) !void {
+    fn printAll(self: *Aggregator, output: *OutputBuffer, page_size: usize, output_json: bool) !void {
         var batch: usize = 0;
         var page: usize = 1;
 
@@ -241,8 +280,12 @@ const Aggregator = struct {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
             const info = self.sample_infos.get(key).?;
-            try printAggregatePrefix(output, count);
-            try printStyledLineBuffered(output, line, info);
+            if (output_json) {
+                printJsonOutputLine(line, info);
+            } else {
+                try printAggregatePrefix(output, count);
+                try printStyledLineBuffered(output, line, info);
+            }
 
             if (page_size > 0) {
                 batch += 1;
@@ -490,6 +533,7 @@ pub fn readStreaming(
 ) !void {
     if (gzip.isGzip(path)) {
         var filter_state = FilterState.init(args);
+        defer filter_state.deinit();
         try gzip.readGzip(allocator, path, args, &filter_state, buildAggregateKeyForLine);
         return;
     }
@@ -524,7 +568,8 @@ fn readAggregated(
     var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
     defer carry.deinit(allocator);
 
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
 
     var aggregator = try Aggregator.init(allocator);
     defer aggregator.deinit();
@@ -574,7 +619,7 @@ fn readAggregated(
         }
     }
 
-    try aggregator.printAll(&output, args.num_lines);
+    try aggregator.printAll(&output, args.num_lines, args.output_json);
 }
 
 /// Streams a log file continuously, printing each matching line as it is read.
@@ -593,7 +638,8 @@ fn readContinuous(
     var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
     defer carry.deinit(allocator);
 
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
 
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
@@ -654,7 +700,8 @@ fn readWithPagination(
     var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
     defer carry.deinit(allocator);
 
-    const filter_state = FilterState.init(args);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
 
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
@@ -1379,6 +1426,16 @@ fn matchSearch(line: []const u8, expr: []const u8) bool {
     return containsIgnoreCase(line, expr);
 }
 
+fn shouldUseRegexSearch(expr: []const u8) bool {
+    for (expr) |c| {
+        switch (c) {
+            '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '\\' => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Returns true if `needle` appears in `hay` (case-insensitive).
 /// Returns false if either slice is empty or `needle` is longer than `hay`.
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
@@ -1399,11 +1456,70 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn printJsonOutputLine(line: []const u8, info: LineInfo) void {
+    const lvl = if (info.level) |l| @tagName(l) else "";
+    const date = if (info.date) |d| d else "";
+    const time = if (info.time) |t| t else "";
+
+    var prefix_buf: [256]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
+    writeOut(prefix);
+
+    var out_buf: [4096]u8 = undefined;
+    var out_len: usize = 0;
+
+    const Writer = struct {
+        fn flush(buf: []const u8) void {
+            if (buf.len > 0) writeOut(buf);
+        }
+
+        fn append(buf: []u8, len: *usize, bytes: []const u8) void {
+            if (bytes.len > buf.len) {
+                flush(buf[0..len.*]);
+                len.* = 0;
+                flush(bytes);
+                return;
+            }
+
+            if (len.* + bytes.len > buf.len) {
+                flush(buf[0..len.*]);
+                len.* = 0;
+            }
+
+            @memcpy(buf[len.* .. len.* + bytes.len], bytes);
+            len.* += bytes.len;
+        }
+    };
+
+    for (line) |c| {
+        switch (c) {
+            '"' => Writer.append(&out_buf, &out_len, "\\\""),
+            '\\' => Writer.append(&out_buf, &out_len, "\\\\"),
+            '\n' => Writer.append(&out_buf, &out_len, "\\n"),
+            '\r' => Writer.append(&out_buf, &out_len, "\\r"),
+            '\t' => Writer.append(&out_buf, &out_len, "\\t"),
+            0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {
+                var esc: [6]u8 = undefined;
+                const s = std.fmt.bufPrint(&esc, "\\u{X:0>4}", .{c}) catch continue;
+                Writer.append(&out_buf, &out_len, s);
+            },
+            else => {
+                var one = [_]u8{c};
+                Writer.append(&out_buf, &out_len, &one);
+            },
+        }
+    }
+
+    Writer.append(&out_buf, &out_len, "\"}\n");
+    Writer.flush(out_buf[0..out_len]);
+}
+
 /// Backward-compatible wrapper for tail.zig.
 /// Constructs a `FilterState` on every call — do not use in tight loops.
 pub fn handleLine(line: []const u8, args: flags.Args) void {
-    const filter_state = FilterState.init(args);
-    if (filter_state.checkLine(line)) |info| printStyledLine(line, info);
+    var filter_state = FilterState.init(args);
+    defer filter_state.deinit();
+    filter_state.printIfMatch(line);
 }
 
 // ============================================================================

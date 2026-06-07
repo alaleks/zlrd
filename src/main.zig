@@ -208,6 +208,8 @@ fn printError(io: std.Io, err: anyerror) void {
         error.MissingDate => "missing date value",
         error.MissingNumLines => "missing number of lines",
         error.MissingAggregateMode => "missing aggregate mode",
+        error.MissingFromTime => "missing from time value",
+        error.MissingToTime => "missing to time value",
         else => @errorName(err),
     };
 

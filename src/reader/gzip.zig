@@ -73,7 +73,7 @@ const BatchAggregator = struct {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
 
-            if (count > 1) {
+            if (count > 1 and !outputJsonEnabled(filter_state)) {
                 var buf: [128]u8 = undefined;
                 const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{count}) catch "[x?] ";
                 std.Io.File.stdout().writeStreamingAll(debug_io, prefix) catch {};
@@ -83,6 +83,17 @@ const BatchAggregator = struct {
         }
     }
 };
+
+fn outputJsonEnabled(filter_state: anytype) bool {
+    const T = @TypeOf(filter_state);
+    if (@typeInfo(T) == .pointer) {
+        const Child = @typeInfo(T).pointer.child;
+        if (@hasField(Child, "output_json")) return filter_state.output_json;
+    } else if (@hasField(T, "output_json")) {
+        return filter_state.output_json;
+    }
+    return false;
+}
 
 /// Returns true if `path` has a `.gz` extension.
 pub fn isGzip(path: []const u8) bool {

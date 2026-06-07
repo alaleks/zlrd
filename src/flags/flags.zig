@@ -83,6 +83,10 @@ pub const Args = struct {
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
         allocator.free(self.files);
+        if (self.search) |s| allocator.free(s);
+        if (self.date) |d| allocator.free(d);
+        if (self.from_time) |t| allocator.free(t);
+        if (self.to_time) |t| allocator.free(t);
     }
 
     pub fn isLevelEnabled(self: Args, lvl: Level) bool {
@@ -180,6 +184,7 @@ fn parseArgsFromIter(
     var parsed = Args{
         .files = &.{},
     };
+    errdefer parsed.deinit(allocator);
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -226,6 +231,16 @@ fn appendFile(
     try files.append(allocator, owned);
 }
 
+fn replaceOwnedString(
+    allocator: std.mem.Allocator,
+    slot: *?[]const u8,
+    value: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, value);
+    if (slot.*) |old| allocator.free(old);
+    slot.* = owned;
+}
+
 fn parseLongFlag(
     parsed: *Args,
     files: *std.ArrayList([]const u8),
@@ -241,7 +256,7 @@ fn parseLongFlag(
             return;
         }
         if (std.mem.eql(u8, f, "search")) {
-            parsed.search = val;
+            try replaceOwnedString(allocator, &parsed.search, val);
             return;
         }
         if (std.mem.eql(u8, f, "level")) {
@@ -249,7 +264,7 @@ fn parseLongFlag(
             return;
         }
         if (std.mem.eql(u8, f, "date")) {
-            parsed.date = val;
+            try replaceOwnedString(allocator, &parsed.date, val);
             return;
         }
         if (std.mem.eql(u8, f, "num-lines")) {
@@ -261,11 +276,11 @@ fn parseLongFlag(
             return;
         }
         if (std.mem.eql(u8, f, "from")) {
-            parsed.from_time = val;
+            try replaceOwnedString(allocator, &parsed.from_time, val);
             return;
         }
         if (std.mem.eql(u8, f, "to")) {
-            parsed.to_time = val;
+            try replaceOwnedString(allocator, &parsed.to_time, val);
             return;
         }
         if (std.mem.eql(u8, f, "output")) {
@@ -309,19 +324,19 @@ fn parseLongFlag(
         if (std.mem.eql(u8, flag, "file")) {
             try appendFile(allocator, files, val);
         } else if (std.mem.eql(u8, flag, "search")) {
-            parsed.search = val;
+            try replaceOwnedString(allocator, &parsed.search, val);
         } else if (std.mem.eql(u8, flag, "level")) {
             try addLevels(parsed, val);
         } else if (std.mem.eql(u8, flag, "date")) {
-            parsed.date = val;
+            try replaceOwnedString(allocator, &parsed.date, val);
         } else if (std.mem.eql(u8, flag, "num-lines")) {
             parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
         } else if (std.mem.eql(u8, flag, "aggregate-mode")) {
             parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
         } else if (std.mem.eql(u8, flag, "from")) {
-            parsed.from_time = val;
+            try replaceOwnedString(allocator, &parsed.from_time, val);
         } else if (std.mem.eql(u8, flag, "to")) {
-            parsed.to_time = val;
+            try replaceOwnedString(allocator, &parsed.to_time, val);
         }
         return;
     }
@@ -352,10 +367,11 @@ fn parseShortFlags(
             's' => {
                 const rest = flags_str[i + 1 ..];
                 if (rest.len > 0) {
-                    parsed.search = rest;
+                    try replaceOwnedString(allocator, &parsed.search, rest);
                     return;
                 }
-                parsed.search = valueOrNext(it, "search") orelse return error.MissingSearch;
+                const val = valueOrNext(it, "search") orelse return error.MissingSearch;
+                try replaceOwnedString(allocator, &parsed.search, val);
                 return;
             },
             'l' => {
@@ -371,10 +387,11 @@ fn parseShortFlags(
             'd' => {
                 const rest = flags_str[i + 1 ..];
                 if (rest.len > 0) {
-                    parsed.date = rest;
+                    try replaceOwnedString(allocator, &parsed.date, rest);
                     return;
                 }
-                parsed.date = valueOrNext(it, "date") orelse return error.MissingDate;
+                const val = valueOrNext(it, "date") orelse return error.MissingDate;
+                try replaceOwnedString(allocator, &parsed.date, val);
                 return;
             },
             't' => parsed.tail_mode = true,
