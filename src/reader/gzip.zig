@@ -52,19 +52,20 @@ const BatchAggregator = struct {
     }
 
     fn add(self: *BatchAggregator, key: []const u8, sample_line: []const u8) !void {
-        const gop = try self.counts.getOrPut(self.allocator, key);
-        if (gop.found_existing) {
-            gop.value_ptr.* += 1;
+        if (self.counts.getPtr(key)) |count| {
+            count.* += 1;
             return;
         }
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
 
-        gop.key_ptr.* = owned_key;
-        gop.value_ptr.* = 1;
+        try self.counts.putNoClobber(self.allocator, owned_key, 1);
+        errdefer _ = self.counts.remove(owned_key);
 
-        try self.sample_lines.put(self.allocator, owned_key, owned_line);
+        try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
+        errdefer _ = self.sample_lines.remove(owned_key);
+
         try self.order.append(self.allocator, owned_key);
     }
 

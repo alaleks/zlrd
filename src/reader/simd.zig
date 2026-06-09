@@ -182,25 +182,15 @@ pub fn extractJsonField(
         // Skip whitespace before value.
         while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
 
-        // We only support quoted string values.
-        if (i >= line.len or line[i] != '"') {
-            return null;
-        }
-        i += 1;
+        const is_target_key = std.mem.eql(u8, found_key, key);
 
-        if (!std.mem.eql(u8, found_key, key)) {
-            // Skip this string value safely.
-            while (i < line.len) {
-                if (line[i] == '\\') {
-                    i += 2;
-                    continue;
-                }
-                if (line[i] == '"') break;
-                i += 1;
-            }
-            if (i < line.len) i += 1;
+        if (!is_target_key) {
+            i = skipJsonValue(line, i);
             continue;
         }
+
+        if (i >= line.len or line[i] != '"') return null;
+        i += 1;
 
         const value_start = i;
 
@@ -222,6 +212,49 @@ pub fn extractJsonField(
     }
 
     return null;
+}
+
+fn skipJsonValue(line: []const u8, start: usize) usize {
+    var i = start;
+    if (i >= line.len) return i;
+
+    if (line[i] == '"') {
+        i += 1;
+        while (i < line.len) {
+            if (line[i] == '\\') {
+                i += 2;
+                continue;
+            }
+            if (line[i] == '"') return i + 1;
+            i += 1;
+        }
+        return i;
+    }
+
+    if (line[i] == '{' or line[i] == '[') {
+        var depth: usize = 0;
+        while (i < line.len) {
+            switch (line[i]) {
+                '"' => {
+                    i = skipJsonValue(line, i);
+                    continue;
+                },
+                '{', '[' => depth += 1,
+                '}', ']' => {
+                    depth -= 1;
+                    i += 1;
+                    if (depth == 0) return i;
+                    continue;
+                },
+                else => {},
+            }
+            i += 1;
+        }
+        return i;
+    }
+
+    while (i < line.len and line[i] != ',' and line[i] != '}' and line[i] != ']') : (i += 1) {}
+    return i;
 }
 
 /// Returns true if `s` starts with an ISO-8601 date (`YYYY-MM-DD`).
@@ -598,6 +631,18 @@ test "extractJsonField: whitespace around colon" {
 
 test "extractJsonField: non-string value is ignored" {
     try testing.expect(extractJsonField("{\"level\":123}", "level", 10) == null);
+}
+
+test "extractJsonField: skips unrelated non-string values before target" {
+    const line = "{\"pid\":123,\"ok\":true,\"level\":\"error\"}";
+    const r = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", r.?);
+}
+
+test "extractJsonField: skips nested unrelated objects before target" {
+    const line = "{\"ctx\":{\"level\":\"debug\"},\"level\":\"error\"}";
+    const r = extractJsonField(line, "level", 10);
+    try testing.expectEqualStrings("error", r.?);
 }
 
 // ── chunkMask ────────────────────────────────────────────────────────────────

@@ -297,20 +297,23 @@ const Aggregator = struct {
     /// The first line seen for a key is kept as the sample line for display
     /// together with its precomputed `LineInfo` to avoid re-analysis during output.
     fn add(self: *Aggregator, key: []const u8, sample_line: []const u8, info: LineInfo) !void {
-        const gop = try self.counts.getOrPut(self.allocator, key);
-        if (gop.found_existing) {
-            gop.value_ptr.* += 1;
+        if (self.counts.getPtr(key)) |count| {
+            count.* += 1;
             return;
         }
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
 
-        gop.key_ptr.* = owned_key;
-        gop.value_ptr.* = 1;
+        try self.counts.putNoClobber(self.allocator, owned_key, 1);
+        errdefer _ = self.counts.remove(owned_key);
 
-        try self.sample_lines.put(self.allocator, owned_key, owned_line);
-        try self.sample_infos.put(self.allocator, owned_key, info);
+        try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
+        errdefer _ = self.sample_lines.remove(owned_key);
+
+        try self.sample_infos.putNoClobber(self.allocator, owned_key, info);
+        errdefer _ = self.sample_infos.remove(owned_key);
+
         try self.order.append(self.allocator, owned_key);
     }
 
@@ -464,7 +467,7 @@ fn extractDate(line: []const u8) ?[]const u8 {
     if (line[0] == '{') {
         inline for (.{ "time", "timestamp", "date" }) |field| {
             if (simd.extractJsonField(line, field, 32)) |v| {
-                if (v.len >= 10) return v[0..10];
+                if (v.len >= 10 and isValidDateString(v[0..10])) return v[0..10];
             }
         }
         return null;
@@ -483,9 +486,9 @@ fn extractDate(line: []const u8) ?[]const u8 {
 /// Looks for a time pattern preceded by T, space, or bracket.
 /// Returns a slice into `line`, or null if no time is found.
 fn extractTime(line: []const u8) ?[]const u8 {
-    var i: usize = 1;
+    var i: usize = 0;
     while (i + 5 <= line.len) : (i += 1) {
-        if (line[i - 1] == 'T' or line[i - 1] == ' ' or line[i - 1] == '[') {
+        if (i == 0 or line[i - 1] == 'T' or line[i - 1] == ' ' or line[i - 1] == '[') {
             if (isDigit(line[i]) and isDigit(line[i + 1]) and line[i + 2] == ':' and
                 isDigit(line[i + 3]) and isDigit(line[i + 4]))
             {
@@ -600,6 +603,30 @@ pub fn readStreaming(
     }
 }
 
+fn keepUnprocessedTail(
+    allocator: std.mem.Allocator,
+    carry: *std.ArrayList(u8),
+    slice: []const u8,
+    start: usize,
+    used_carry: bool,
+) !void {
+    if (used_carry) {
+        if (start < carry.items.len) {
+            const rest = carry.items[start..];
+            std.mem.copyForwards(u8, carry.items[0..rest.len], rest);
+            carry.items.len = rest.len;
+        } else {
+            carry.clearRetainingCapacity();
+        }
+        return;
+    }
+
+    carry.clearRetainingCapacity();
+    if (start < slice.len) {
+        try carry.appendSlice(allocator, slice[start..]);
+    }
+}
+
 /// Read the whole file, aggregate identical matched lines, and print them once.
 ///
 /// Aggregation is applied after all active filters.
@@ -638,7 +665,8 @@ fn readAggregated(
 
         var slice = buffer[0..n];
 
-        if (carry.items.len > 0) {
+        const used_carry = carry.items.len > 0;
+        if (used_carry) {
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -661,10 +689,7 @@ fn readAggregated(
             start = nl + 1;
         }
 
-        carry.clearRetainingCapacity();
-        if (start < slice.len) {
-            try carry.appendSlice(allocator, slice[start..]);
-        }
+        try keepUnprocessedTail(allocator, &carry, slice, start, used_carry);
     }
 
     // Process final line if present (no trailing newline).
@@ -714,7 +739,8 @@ fn readContinuous(
 
         var slice = buffer[0..n];
 
-        if (carry.items.len > 0) {
+        const used_carry = carry.items.len > 0;
+        if (used_carry) {
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -742,10 +768,7 @@ fn readContinuous(
             start = nl + 1;
         }
 
-        carry.clearRetainingCapacity();
-        if (start < slice.len) {
-            try carry.appendSlice(allocator, slice[start..]);
-        }
+        try keepUnprocessedTail(allocator, &carry, slice, start, used_carry);
     }
 
     if (carry.items.len > 0) {
@@ -800,7 +823,8 @@ fn readWithPagination(
         if (n == 0) break;
 
         var slice = buffer[0..n];
-        if (carry.items.len > 0) {
+        const used_carry = carry.items.len > 0;
+        if (used_carry) {
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -838,10 +862,7 @@ fn readWithPagination(
             start = nl + 1;
         }
 
-        carry.clearRetainingCapacity();
-        if (start < slice.len) {
-            try carry.appendSlice(allocator, slice[start..]);
-        }
+        try keepUnprocessedTail(allocator, &carry, slice, start, used_carry);
     }
 
     // Flush any final line that had no trailing newline.
@@ -1107,26 +1128,100 @@ fn matchWord(line: []const u8, pos: usize, comptime word: []const u8) bool {
 /// Used by the printer to colorize only the level token, not the surrounding JSON.
 /// Continues searching after `"level"` tokens that are not followed by `: "`.
 fn extractJsonLevelPos(line: []const u8) ?LevelPos {
-    var search_pos: usize = 0;
+    var i: usize = 0;
 
-    while (true) {
-        const q = simd.findByte(line, search_pos, '"') orelse return null;
+    while (i < line.len) {
+        const q = simd.findByte(line, i, '"') orelse return null;
+        i = q + 1;
 
-        if (q + 7 <= line.len and
-            std.mem.eql(u8, line[q + 1 .. q + 6], "level") and
-            line[q + 6] == '"')
-        {
-            var i = q + 7;
-            while (i < line.len and (line[i] == ' ' or line[i] == ':')) : (i += 1) {}
-            if (i < line.len and line[i] == '"') {
-                const start = i + 1;
-                const end = simd.findByte(line, start, '"') orelse return null;
-                return LevelPos{ .start = start, .end = end };
+        const key_start = i;
+        while (i < line.len) {
+            if (line[i] == '\\') {
+                i += 2;
+                continue;
             }
+            if (line[i] == '"') break;
+            i += 1;
+        }
+        if (i >= line.len) return null;
+
+        const key = line[key_start..i];
+        i += 1;
+
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
+        if (i >= line.len or line[i] != ':') continue;
+        i += 1;
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
+
+        const is_level_key = std.mem.eql(u8, key, "level");
+        if (!is_level_key) {
+            i = skipJsonValue(line, i);
+            continue;
         }
 
-        search_pos = q + 1;
+        if (i >= line.len or line[i] != '"') return null;
+
+        i += 1;
+        const value_start = i;
+        while (i < line.len) {
+            if (line[i] == '\\') {
+                i += 2;
+                continue;
+            }
+            if (line[i] == '"') break;
+            i += 1;
+        }
+        if (i >= line.len) return null;
+
+        const value_end = i;
+        i += 1;
+        if (is_level_key) return .{ .start = value_start, .end = value_end };
     }
+
+    return null;
+}
+
+fn skipJsonValue(line: []const u8, start: usize) usize {
+    var i = start;
+    if (i >= line.len) return i;
+
+    if (line[i] == '"') {
+        i += 1;
+        while (i < line.len) {
+            if (line[i] == '\\') {
+                i += 2;
+                continue;
+            }
+            if (line[i] == '"') return i + 1;
+            i += 1;
+        }
+        return i;
+    }
+
+    if (line[i] == '{' or line[i] == '[') {
+        var depth: usize = 0;
+        while (i < line.len) {
+            switch (line[i]) {
+                '"' => {
+                    i = skipJsonValue(line, i);
+                    continue;
+                },
+                '{', '[' => depth += 1,
+                '}', ']' => {
+                    depth -= 1;
+                    i += 1;
+                    if (depth == 0) return i;
+                    continue;
+                },
+                else => {},
+            }
+            i += 1;
+        }
+        return i;
+    }
+
+    while (i < line.len and line[i] != ',' and line[i] != '}' and line[i] != ']') : (i += 1) {}
+    return i;
 }
 
 /// Writes bytes to stdout in uppercase.
@@ -1967,6 +2062,19 @@ test "FilterState.checkLine should filter by level" {
     try std.testing.expect(state.checkLine("[INFO] Everything is fine") == null);
 }
 
+test "FilterState.checkLine handles JSON non-string fields before level" {
+    var file = [_][]const u8{"test.log"};
+    const args = flags.Args{
+        .files = &file,
+        .levels = flags.levelBit(.Error),
+    };
+    var state = FilterState.init(args);
+    defer state.deinit();
+
+    const info = state.checkLine("{\"pid\":123,\"ok\":true,\"level\":\"error\",\"msg\":\"failed\"}").?;
+    try std.testing.expectEqual(flags.Level.Error, info.level.?);
+}
+
 test "FilterState.checkLine should filter by search" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{
@@ -2273,6 +2381,18 @@ test "extractJsonLevelPos: skips level-as-value before real key" {
     try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
 }
 
+test "extractJsonLevelPos: ignores escaped key-like text inside values" {
+    const line = "{\"msg\":\"text with \\\"level\\\":\\\"warn\\\" inside\",\"level\":\"error\"}";
+    const pos = extractJsonLevelPos(line).?;
+    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
+}
+
+test "extractJsonLevelPos: skips nested level before sibling level" {
+    const line = "{\"ctx\":{\"level\":\"debug\"},\"level\":\"error\"}";
+    const pos = extractJsonLevelPos(line).?;
+    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
+}
+
 test "findSearchMatches: single term" {
     var buf: [max_search_matches]MatchRange = undefined;
     const m = findSearchMatches("hello world hello", "hello", &buf);
@@ -2416,6 +2536,10 @@ test "extractTime: HH:MM only" {
     try std.testing.expectEqualStrings("14:30", extractTime("[14:30] message").?);
 }
 
+test "extractTime: time at start of line" {
+    try std.testing.expectEqualStrings("14:30:05", extractTime("14:30:05 service started").?);
+}
+
 test "extractTime: returns null without time" {
     try std.testing.expect(extractTime("no time here") == null);
     try std.testing.expect(extractTime("") == null);
@@ -2501,6 +2625,19 @@ test "FilterState: date + time combined filter" {
     try std.testing.expect(state.checkLine("2023-10-15T14:30:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-16T14:30:00Z [INFO] msg") == null);
     try std.testing.expect(state.checkLine("2023-10-15T13:00:00Z [INFO] msg") == null);
+}
+
+test "extractDate rejects invalid JSON date fields" {
+    try std.testing.expect(extractDate("{\"time\":\"not-a-date\",\"level\":\"info\"}") == null);
+}
+
+test "keepUnprocessedTail compacts carry without self-copy append" {
+    var carry = try std.ArrayList(u8).initCapacity(std.testing.allocator, 16);
+    defer carry.deinit(std.testing.allocator);
+    try carry.appendSlice(std.testing.allocator, "hello partial");
+
+    try keepUnprocessedTail(std.testing.allocator, &carry, carry.items, 6, true);
+    try std.testing.expectEqualStrings("partial", carry.items);
 }
 
 test "FilterState: regex matches simple pattern" {

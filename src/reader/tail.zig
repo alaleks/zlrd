@@ -27,7 +27,7 @@ fn findLastNLinesStart(f: *OpenFile, file_size: u64, n: usize, scan_buf: []u8) !
     var target_newlines = n;
     var last_byte: [1]u8 = undefined;
     if (try readAt(f.fd, file_size - 1, &last_byte) == 1 and last_byte[0] == '\n') {
-        target_newlines += 1;
+        target_newlines = std.math.add(usize, target_newlines, 1) catch return 0;
     }
 
     var newlines_found: usize = 0;
@@ -87,19 +87,20 @@ const BatchAggregator = struct {
     }
 
     fn add(self: *BatchAggregator, key: []const u8, sample_line: []const u8) !void {
-        const gop = try self.counts.getOrPut(self.allocator, key);
-        if (gop.found_existing) {
-            gop.value_ptr.* += 1;
+        if (self.counts.getPtr(key)) |count| {
+            count.* += 1;
             return;
         }
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
 
-        gop.key_ptr.* = owned_key;
-        gop.value_ptr.* = 1;
+        try self.counts.putNoClobber(self.allocator, owned_key, 1);
+        errdefer _ = self.counts.remove(owned_key);
 
-        try self.sample_lines.put(self.allocator, owned_key, owned_line);
+        try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
+        errdefer _ = self.sample_lines.remove(owned_key);
+
         try self.order.append(self.allocator, owned_key);
     }
 
@@ -224,7 +225,7 @@ pub fn readLastNLines(
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
-    try readToEOF(allocator, f, args, filter_state, &carry, read_buf);
+    try readToEOFInternal(allocator, f, args, filter_state, &carry, read_buf, true);
     return f.position;
 }
 
@@ -256,6 +257,18 @@ pub fn readToEOF(
     carry: *std.ArrayList(u8),
     buf: []u8,
 ) !void {
+    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, false);
+}
+
+fn readToEOFInternal(
+    allocator: std.mem.Allocator,
+    f: *OpenFile,
+    args: flags.Args,
+    filter_state: *const formats.FilterState,
+    carry: *std.ArrayList(u8),
+    buf: []u8,
+    flush_final_line: bool,
+) !void {
     var aggregator: ?BatchAggregator = null;
     defer if (aggregator) |*agg| agg.deinit();
 
@@ -266,13 +279,14 @@ pub fn readToEOF(
     const agg_ptr: ?*BatchAggregator = if (aggregator) |*agg| agg else null;
 
     while (true) {
-        const n = readAt(f.fd, f.position, buf) catch break;
+        const n = try readAt(f.fd, f.position, buf);
         if (n == 0) break;
 
         f.position += n;
         var slice = buf[0..n];
 
-        if (carry.items.len > 0) {
+        const used_carry = carry.items.len > 0;
+        if (used_carry) {
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -286,14 +300,40 @@ pub fn readToEOF(
             start = nl + 1;
         }
 
+        try keepUnprocessedTail(allocator, carry, slice, start, used_carry);
+    }
+
+    if (flush_final_line and carry.items.len > 0) {
+        try processLine(allocator, args, filter_state, agg_ptr, carry.items);
         carry.clearRetainingCapacity();
-        if (start < slice.len) {
-            try carry.appendSlice(allocator, slice[start..]);
-        }
     }
 
     if (aggregator) |*agg| {
         agg.printAll(filter_state);
+    }
+}
+
+fn keepUnprocessedTail(
+    allocator: std.mem.Allocator,
+    carry: *std.ArrayList(u8),
+    slice: []const u8,
+    start: usize,
+    used_carry: bool,
+) !void {
+    if (used_carry) {
+        if (start < carry.items.len) {
+            const rest = carry.items[start..];
+            std.mem.copyForwards(u8, carry.items[0..rest.len], rest);
+            carry.items.len = rest.len;
+        } else {
+            carry.clearRetainingCapacity();
+        }
+        return;
+    }
+
+    carry.clearRetainingCapacity();
+    if (start < slice.len) {
+        try carry.appendSlice(allocator, slice[start..]);
     }
 }
 
@@ -621,4 +661,37 @@ test "readToEOF with aggregate normalized consumes complete data" {
 
     try testing.expectEqual(@as(usize, 0), carry.items.len);
     try testing.expect(of.position > 0);
+}
+
+test "readToEOFInternal can flush final line without trailing newline" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tail_io, .{
+        .sub_path = "unterminated.log",
+        .data = "line1\npartial",
+    });
+
+    var file = try tmp.dir.openFile(tail_io, "unterminated.log", .{});
+    defer file.close(tail_io);
+
+    const stat = try file.stat(tail_io);
+    var files_array = [_][]const u8{"unterminated.log"};
+    const args = makeSilentTailArgs(files_array[0..], 0, false, .exact);
+    var filter_state = formats.FilterState.init(args);
+    defer filter_state.deinit();
+
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(allocator);
+
+    var read_buf: [4]u8 = undefined;
+    var of = OpenFile{ .path = "unterminated.log", .fd = file, .position = 0 };
+    try readToEOFInternal(allocator, &of, args, &filter_state, &carry, &read_buf, true);
+
+    try testing.expectEqual(@as(usize, 0), carry.items.len);
+    try testing.expectEqual(stat.size, of.position);
 }

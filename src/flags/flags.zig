@@ -20,7 +20,11 @@ pub const AggregateMode = enum {
 pub const LevelMask = u8;
 
 pub fn allLevelsMask() LevelMask {
-    return 0xFF;
+    var mask: LevelMask = 0;
+    inline for (@typeInfo(Level).@"enum".fields) |f| {
+        mask |= levelBit(@enumFromInt(f.value));
+    }
+    return mask;
 }
 
 pub inline fn levelBit(lvl: Level) LevelMask {
@@ -100,6 +104,7 @@ pub const ParseError = error{
     MissingFile,
     InvalidLevel,
     InvalidAggregateMode,
+    InvalidOutputMode,
     MissingSearch,
     MissingLevel,
     MissingDate,
@@ -107,6 +112,7 @@ pub const ParseError = error{
     MissingAggregateMode,
     MissingFromTime,
     MissingToTime,
+    MissingOutput,
     UnknownArgument,
     OutOfMemory,
 };
@@ -206,6 +212,10 @@ fn parseArgsFromIter(
 
         if (arg.len > 1 and arg[0] == '-') {
             try parseShortFlags(&parsed, &files, arg[1..], it, allocator);
+            if (parsed.help or parsed.version) {
+                parsed.files = try files.toOwnedSlice(allocator);
+                return parsed;
+            }
             continue;
         }
 
@@ -284,7 +294,7 @@ fn parseLongFlag(
             return;
         }
         if (std.mem.eql(u8, f, "output")) {
-            if (std.mem.eql(u8, val, "json")) parsed.output_json = true;
+            try parseOutputMode(parsed, val);
             return;
         }
         break :blk f;
@@ -299,8 +309,8 @@ fn parseLongFlag(
         return;
     }
     if (std.mem.eql(u8, flag, "output")) {
-        const val = valueOrNext(it, flag) orelse return;
-        if (std.mem.eql(u8, val, "json")) parsed.output_json = true;
+        const val = valueOrNext(it, flag) orelse return error.MissingOutput;
+        try parseOutputMode(parsed, val);
         return;
     }
     if (std.mem.eql(u8, flag, "file") or
@@ -312,15 +322,7 @@ fn parseLongFlag(
         std.mem.eql(u8, flag, "from") or
         std.mem.eql(u8, flag, "to"))
     {
-        const val = valueOrNext(it, flag) orelse return switch (flag[0]) {
-            'f' => error.MissingFile,
-            's' => error.MissingSearch,
-            'l' => error.MissingLevel,
-            'd' => error.MissingDate,
-            'n' => error.MissingNumLines,
-            'm' => error.MissingAggregateMode,
-            else => if (std.mem.eql(u8, flag, "from")) error.MissingFromTime else error.MissingToTime,
-        };
+        const val = valueOrNext(it, flag) orelse return missingValueError(flag);
         if (std.mem.eql(u8, flag, "file")) {
             try appendFile(allocator, files, val);
         } else if (std.mem.eql(u8, flag, "search")) {
@@ -342,6 +344,24 @@ fn parseLongFlag(
     }
 
     return error.UnknownArgument;
+}
+
+fn missingValueError(flag: []const u8) ParseError {
+    if (std.mem.eql(u8, flag, "file")) return error.MissingFile;
+    if (std.mem.eql(u8, flag, "search")) return error.MissingSearch;
+    if (std.mem.eql(u8, flag, "level")) return error.MissingLevel;
+    if (std.mem.eql(u8, flag, "date")) return error.MissingDate;
+    if (std.mem.eql(u8, flag, "num-lines")) return error.MissingNumLines;
+    if (std.mem.eql(u8, flag, "aggregate-mode")) return error.MissingAggregateMode;
+    if (std.mem.eql(u8, flag, "from")) return error.MissingFromTime;
+    if (std.mem.eql(u8, flag, "to")) return error.MissingToTime;
+    if (std.mem.eql(u8, flag, "output")) return error.MissingOutput;
+    return error.InvalidArgument;
+}
+
+fn parseOutputMode(parsed: *Args, value: []const u8) ParseError!void {
+    if (!std.mem.eql(u8, value, "json")) return error.InvalidOutputMode;
+    parsed.output_json = true;
 }
 
 fn parseShortFlags(
@@ -416,6 +436,14 @@ fn parseShortFlags(
                 parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
                 return;
             },
+            'h' => {
+                parsed.help = true;
+                return;
+            },
+            'v' => {
+                parsed.version = true;
+                return;
+            },
             else => return error.UnknownArgument,
         }
     }
@@ -433,13 +461,16 @@ fn parseNumLines(s: []const u8) !usize {
 
 fn addLevels(parsed: *Args, s: []const u8) !void {
     var it = std.mem.splitScalar(u8, s, ',');
+    var saw_level = false;
     while (it.next()) |token| {
         const trimmed = std.mem.trim(u8, token, &std.ascii.whitespace);
         if (trimmed.len == 0) continue;
         const lvl = parseLevelInsensitive(trimmed) orelse return error.InvalidLevel;
+        saw_level = true;
         if (parsed.levels == null) parsed.levels = 0;
         parsed.levels.? |= levelBit(lvl);
     }
+    if (!saw_level) return error.InvalidLevel;
 }
 
 const testing = std.testing;
@@ -757,6 +788,17 @@ test "version flag via -v" {
     try testing.expect(parsed.version);
 }
 
+test "version flag in grouped short flags stops parsing" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "-tv", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.tail_mode);
+    try testing.expect(parsed.version);
+    try testing.expectEqual(@as(usize, 0), parsed.files.len);
+}
+
 test "date filter via -d" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-d", "2023-10-01..2023-10-31", "app.log" } };
@@ -953,4 +995,55 @@ test "missing level value returns error" {
     const fake = FakeIter{ .argv = &.{ "zlrd", "-l" } };
     var it = fake;
     try testing.expectError(error.MissingLevel, parseArgsFromIter(allocator, &it));
+}
+
+test "missing aggregate mode via long flag returns specific error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--aggregate-mode" } };
+    var it = fake;
+    try testing.expectError(error.MissingAggregateMode, parseArgsFromIter(allocator, &it));
+}
+
+test "output json via long flag and equals" {
+    const allocator = testing.allocator;
+
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--output", "json" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.output_json);
+
+    const fake2 = FakeIter{ .argv = &.{ "zlrd", "--output=json" } };
+    var it2 = fake2;
+    const parsed2 = try parseArgsFromIter(allocator, &it2);
+    defer parsed2.deinit(allocator);
+    try testing.expect(parsed2.output_json);
+}
+
+test "output rejects missing and unknown modes" {
+    const allocator = testing.allocator;
+
+    const missing = FakeIter{ .argv = &.{ "zlrd", "--output" } };
+    var it_missing = missing;
+    try testing.expectError(error.MissingOutput, parseArgsFromIter(allocator, &it_missing));
+
+    const invalid = FakeIter{ .argv = &.{ "zlrd", "--output", "yaml" } };
+    var it_invalid = invalid;
+    try testing.expectError(error.InvalidOutputMode, parseArgsFromIter(allocator, &it_invalid));
+
+    const invalid_equals = FakeIter{ .argv = &.{ "zlrd", "--output=yaml" } };
+    var it_invalid_equals = invalid_equals;
+    try testing.expectError(error.InvalidOutputMode, parseArgsFromIter(allocator, &it_invalid_equals));
+}
+
+test "empty level list is invalid" {
+    const allocator = testing.allocator;
+
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--level=, , " } };
+    var it = fake;
+    try testing.expectError(error.InvalidLevel, parseArgsFromIter(allocator, &it));
+}
+
+test "allLevelsMask has no unused bits" {
+    try testing.expectEqual(@as(LevelMask, 0x7F), allLevelsMask());
 }

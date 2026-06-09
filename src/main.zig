@@ -202,6 +202,7 @@ fn printError(io: std.Io, err: anyerror) void {
         error.MissingFile => "no input files specified",
         error.InvalidLevel => "invalid log level",
         error.InvalidAggregateMode => "invalid aggregate mode",
+        error.InvalidOutputMode => "invalid output mode",
         error.UnknownArgument => "unknown argument",
         error.MissingSearch => "missing search value",
         error.MissingLevel => "missing level value",
@@ -210,6 +211,7 @@ fn printError(io: std.Io, err: anyerror) void {
         error.MissingAggregateMode => "missing aggregate mode",
         error.MissingFromTime => "missing from time value",
         error.MissingToTime => "missing to time value",
+        error.MissingOutput => "missing output mode",
         else => @errorName(err),
     };
 
