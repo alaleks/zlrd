@@ -79,9 +79,32 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Build .deb package
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VER="${VERSION#v}"
+
+          tar xzf dist/zlrd-x86_64-linux.tar.gz -C dist
+
+          mkdir -p pkg/DEBIAN pkg/usr/local/bin
+          cp dist/zlrd pkg/usr/local/bin/zlrd
+          chmod 755 pkg/usr/local/bin/zlrd
+
+          echo "Package: zlrd"                                      > pkg/DEBIAN/control
+          echo "Version: ${VER}"                                   >> pkg/DEBIAN/control
+          echo "Architecture: amd64"                               >> pkg/DEBIAN/control
+          echo "Maintainer: alaleks <alaleksandrov30@gmail.com>"   >> pkg/DEBIAN/control
+          echo "Section: utils"                                    >> pkg/DEBIAN/control
+          echo "Priority: optional"                                >> pkg/DEBIAN/control
+          echo "Homepage: https://github.com/alaleks/zlrd"        >> pkg/DEBIAN/control
+          echo "Description: Fast log viewer CLI"                  >> pkg/DEBIAN/control
+          echo " High-performance log reader and analyzer."        >> pkg/DEBIAN/control
+
+          dpkg-deb --build pkg dist/zlrd_${VER}_amd64.deb
+
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum * > checksums.txt
+        run: sha256sum *.tar.gz *.zip *.deb > checksums.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -158,3 +181,47 @@ jobs:
           git add Formula/zlrd.rb
           git diff --staged --quiet || git commit -m "chore: bump zlrd to ${VERSION}"
           git push
+
+  publish-apt:
+    name: Publish apt package (Buildkite Package Registries)
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    continue-on-error: true
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zlrd-x86_64-linux.tar.gz
+          path: incoming
+
+      - name: Build .deb
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VER="${VERSION#v}"
+
+          tar xzf incoming/zlrd-x86_64-linux.tar.gz -C incoming
+
+          mkdir -p pkg/DEBIAN pkg/usr/local/bin
+          cp incoming/zlrd pkg/usr/local/bin/zlrd
+          chmod 755 pkg/usr/local/bin/zlrd
+
+          echo "Package: zlrd"                                      > pkg/DEBIAN/control
+          echo "Version: ${VER}"                                   >> pkg/DEBIAN/control
+          echo "Architecture: amd64"                               >> pkg/DEBIAN/control
+          echo "Maintainer: alaleks <alaleksandrov30@gmail.com>"   >> pkg/DEBIAN/control
+          echo "Section: utils"                                    >> pkg/DEBIAN/control
+          echo "Priority: optional"                                >> pkg/DEBIAN/control
+          echo "Homepage: https://github.com/alaleks/zlrd"        >> pkg/DEBIAN/control
+          echo "Description: Fast log viewer CLI"                  >> pkg/DEBIAN/control
+          echo " High-performance log reader and analyzer."        >> pkg/DEBIAN/control
+
+          dpkg-deb --build pkg zlrd_${VER}_amd64.deb
+          echo "DEB=zlrd_${VER}_amd64.deb" >> "$GITHUB_ENV"
+
+      - name: Push to Buildkite Package Registries
+        env:
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+        run: |
+          gem install package_cloud --no-document
+          package_cloud push alaleks/zlrd/any/any "${DEB}"
