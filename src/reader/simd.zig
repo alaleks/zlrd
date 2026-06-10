@@ -12,15 +12,12 @@ pub const VecSize = 16;
 
 /// Converts a boolean SIMD mask to a packed u16 bitmask for use with @ctz.
 /// Bit N is set iff lane N of `mask` is true.
+///
+/// Compiles to a single `vpmovmskb`-equivalent instruction on x86_64 (SSE2) and
+/// `umaxv`/`shrn` sequences on aarch64 — far cheaper than a 16-step inline OR.
 inline fn chunkMask(mask: @Vector(VecSize, bool)) u16 {
-    var result: u16 = 0;
-    // Pack 16 single-bit values into a u16.
-    // @intFromBool guarantees 0/1 without an intermediate vector.
-    // Zig has no _mm_movemask_epi8 intrinsic yet, so we do it manually.
-    inline for (0..VecSize) |j| {
-        result |= @as(u16, @intFromBool(mask[j])) << @intCast(j);
-    }
-    return result;
+    const bits: @Vector(VecSize, u1) = @intFromBool(mask);
+    return @bitCast(bits);
 }
 
 // ============================================================================
@@ -137,6 +134,23 @@ pub inline fn findAny3(
     return null;
 }
 
+/// Walks a JSON string body starting at `body_start` (the byte right after the
+/// opening `"`) and returns the index of the closing quote, or null if the
+/// string is unterminated.
+///
+/// Uses SIMD to jump over runs of plain characters between escape sequences,
+/// which is the dominant case for log messages.
+pub fn scanJsonStringEnd(line: []const u8, body_start: usize) ?usize {
+    var i = body_start;
+    while (i < line.len) {
+        const pos = findEither(line, i, '\\', '"') orelse return null;
+        if (line[pos] == '"') return pos;
+        // Backslash: skip it and the escaped byte (handles \", \\ and others).
+        i = pos + 2;
+    }
+    return null;
+}
+
 /// Extracts the string value of a JSON field matching `"key": "value"`.
 /// Returns a slice within `line` (no allocation), or null if the key is absent,
 /// the value is not a quoted JSON string, or the value exceeds `max_len` bytes.
@@ -155,21 +169,10 @@ pub fn extractJsonField(
         i = q + 1;
 
         const key_start = i;
+        const key_end = scanJsonStringEnd(line, i) orelse return null;
 
-        // Scan JSON string key with escape handling.
-        while (i < line.len) {
-            if (line[i] == '\\') {
-                i += 2;
-                continue;
-            }
-            if (line[i] == '"') break;
-            i += 1;
-        }
-        if (i >= line.len) return null;
-
-        const key_end = i;
         const found_key = line[key_start..key_end];
-        i += 1;
+        i = key_end + 1;
 
         // Skip whitespace after key.
         while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
@@ -193,18 +196,7 @@ pub fn extractJsonField(
         i += 1;
 
         const value_start = i;
-
-        while (i < line.len) {
-            if (line[i] == '\\') {
-                i += 2;
-                continue;
-            }
-            if (line[i] == '"') break;
-            i += 1;
-        }
-        if (i >= line.len) return null;
-
-        const value_end = i;
+        const value_end = scanJsonStringEnd(line, i) orelse return null;
         const value = line[value_start..value_end];
         if (value.len > max_len) return null;
 
@@ -219,16 +211,8 @@ fn skipJsonValue(line: []const u8, start: usize) usize {
     if (i >= line.len) return i;
 
     if (line[i] == '"') {
-        i += 1;
-        while (i < line.len) {
-            if (line[i] == '\\') {
-                i += 2;
-                continue;
-            }
-            if (line[i] == '"') return i + 1;
-            i += 1;
-        }
-        return i;
+        const end = scanJsonStringEnd(line, i + 1) orelse return line.len;
+        return end + 1;
     }
 
     if (line[i] == '{' or line[i] == '[') {

@@ -1125,48 +1125,26 @@ fn extractJsonLevelPos(line: []const u8) ?LevelPos {
 
     while (i < line.len) {
         const q = simd.findByte(line, i, '"') orelse return null;
-        i = q + 1;
-
-        const key_start = i;
-        while (i < line.len) {
-            if (line[i] == '\\') {
-                i += 2;
-                continue;
-            }
-            if (line[i] == '"') break;
-            i += 1;
-        }
-        if (i >= line.len) return null;
-
-        const key = line[key_start..i];
-        i += 1;
+        const key_start = q + 1;
+        const key_end = simd.scanJsonStringEnd(line, key_start) orelse return null;
+        const key = line[key_start..key_end];
+        i = key_end + 1;
 
         while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
         if (i >= line.len or line[i] != ':') continue;
         i += 1;
         while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
 
-        const is_level_key = std.mem.eql(u8, key, "level");
-        if (!is_level_key) {
+        if (!std.mem.eql(u8, key, "level")) {
             i = skipJsonValue(line, i);
             continue;
         }
 
         if (i >= line.len or line[i] != '"') return null;
 
-        i += 1;
-        const value_start = i;
-        while (i < line.len) {
-            if (line[i] == '\\') {
-                i += 2;
-                continue;
-            }
-            if (line[i] == '"') break;
-            i += 1;
-        }
-        if (i >= line.len) return null;
-
-        return .{ .start = value_start, .end = i };
+        const value_start = i + 1;
+        const value_end = simd.scanJsonStringEnd(line, value_start) orelse return null;
+        return .{ .start = value_start, .end = value_end };
     }
 
     return null;
@@ -1177,16 +1155,8 @@ fn skipJsonValue(line: []const u8, start: usize) usize {
     if (i >= line.len) return i;
 
     if (line[i] == '"') {
-        i += 1;
-        while (i < line.len) {
-            if (line[i] == '\\') {
-                i += 2;
-                continue;
-            }
-            if (line[i] == '"') return i + 1;
-            i += 1;
-        }
-        return i;
+        const end = simd.scanJsonStringEnd(line, i + 1) orelse return line.len;
+        return end + 1;
     }
 
     if (line[i] == '{' or line[i] == '[') {
@@ -1797,9 +1767,45 @@ fn shouldUseRegexSearch(expr: []const u8) bool {
 
 /// Returns true if `needle` appears in `hay` (case-insensitive).
 /// Returns false if either slice is empty or `needle` is longer than `hay`.
+///
+/// Hot path: pre-lowers the needle once into a stack buffer, then uses SIMD
+/// `findEither` to jump to candidate positions matching the (lower, upper)
+/// variant of the first byte before verifying the rest. Long needles
+/// (> 256 bytes — extremely rare in log search) fall back to the simple
+/// scalar scan.
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or needle.len > hay.len) return false;
 
+    var lower_buf: [256]u8 = undefined;
+    if (needle.len > lower_buf.len) return containsIgnoreCaseScalar(hay, needle);
+
+    for (needle, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
+    const lneedle = lower_buf[0..needle.len];
+
+    const first_lo = lneedle[0];
+    const first_hi: u8 = if (first_lo >= 'a' and first_lo <= 'z') first_lo - 32 else first_lo;
+
+    const max = hay.len - needle.len;
+    var i: usize = 0;
+    while (i <= max) {
+        const pos = simd.findEither(hay, i, first_lo, first_hi) orelse return false;
+        if (pos > max) return false;
+
+        var ok = true;
+        var j: usize = 1;
+        while (j < lneedle.len) : (j += 1) {
+            if (std.ascii.toLower(hay[pos + j]) != lneedle[j]) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+        i = pos + 1;
+    }
+    return false;
+}
+
+fn containsIgnoreCaseScalar(hay: []const u8, needle: []const u8) bool {
     const max = hay.len - needle.len;
     var i: usize = 0;
     while (i <= max) : (i += 1) {
