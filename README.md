@@ -1,30 +1,42 @@
 <p align="center">
-  <img src=".github/logo.svg" alt="ZLRD Logo" width="200"/>
+  <img src=".github/logo.svg" alt="zlrd" width="180"/>
 </p>
 
-# zlrd — high-performance log viewer CLI (tail/grep alternative)
+<h1 align="center">zlrd</h1>
 
-Fast and memory-efficient **log reader and analyzer** written in Zig.
-Designed for working with large log files with support for filtering, search, and real-time streaming.
+<p align="center">
+  A fast log viewer for the terminal — a focused alternative to <code>tail</code>, <code>grep</code>, and ad-hoc log pipelines.
+</p>
 
-**zlrd is a modern CLI alternative to `tail`, `grep`, and basic log viewers.**
-
----
-
-## ✨ Features
-
-* ⚡ Stream large files line-by-line with minimal memory usage
-* 🔍 Full-text search (case-insensitive)
-* 📊 Filter by log levels (trace, debug, info, warn, error, fatal, panic)
-* 📅 Filter logs by date or date range
-* 🔄 Real-time mode (`tail -f` equivalent)
-* 📦 Supports JSON and plain text logs
-* 🧩 Works with multiple files
-* 🗜️ Supports compressed logs (gzip)
+<p align="center">
+  <a href="https://github.com/alaleks/zlrd/releases"><img src="https://img.shields.io/github/v/release/alaleks/zlrd?color=blue&label=release" alt="Release"></a>
+  <a href="https://github.com/alaleks/zlrd/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alaleks/zlrd/release.yml?label=build" alt="Build"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/alaleks/zlrd?color=lightgrey" alt="License"></a>
+</p>
 
 ---
 
-## 🚀 Install
+## Overview
+
+`zlrd` is a single-binary CLI for reading, filtering, and analyzing log files.
+It streams files line-by-line with minimal memory use, recognizes common log
+formats (JSON, bracketed plain text, logfmt), and offers filtering by level,
+date, time range, and regex search. Built in Zig with SIMD-accelerated parsing.
+
+## Features
+
+- **Streaming reader** — line-by-line, constant memory, scales to multi-GB files
+- **Format detection** — JSON, `[LEVEL]` bracketed, and `level=` logfmt
+- **Level filtering** — `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`
+- **Date and time filtering** — single date, date range, time-of-day window
+- **Regex and literal search** — case-insensitive, with `|` (OR) and `&` (AND)
+- **Tail mode** — follow live writes (`tail -f` equivalent)
+- **Aggregation** — group identical or normalized lines with occurrence counts
+- **JSONL output** — pipe to `jq` and other tools
+- **Compressed input** — read `.log.gz` directly
+- **Multi-file** — process several files in a single invocation
+
+## Installation
 
 ### macOS — Homebrew
 
@@ -32,184 +44,168 @@ Designed for working with large log files with support for filtering, search, an
 brew install alaleks/tap/zlrd
 ```
 
-> First time only: run `brew tap alaleks/tap` if the formula isn't found automatically.
-
-### Linux — apt (Debian / Ubuntu)
+### Linux — apt (Debian, Ubuntu)
 
 ```bash
-curl -s https://packagecloud.io/install/repositories/alaleks/zlrd/script.deb.sh | sudo bash
+curl -fsSL https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/setup.deb.sh | sudo bash
 sudo apt install zlrd
 ```
 
-### macOS / Linux — Pre-built binary
+### Pre-built binaries
 
-**macOS Apple Silicon (M1/M2/M3)**
+Download the archive for your platform from
+[Releases](https://github.com/alaleks/zlrd/releases/latest), then extract
+and place `zlrd` on your `PATH`.
+
+| Platform              | Archive                          |
+| --------------------- | -------------------------------- |
+| macOS Apple Silicon   | `zlrd-aarch64-macos.tar.gz`      |
+| macOS Intel           | `zlrd-x86_64-macos.tar.gz`       |
+| Linux x86_64          | `zlrd-x86_64-linux.tar.gz`       |
+| Windows x86_64        | `zlrd-x86_64-windows.zip`        |
+
+Each release also ships a `checksums.txt` with SHA-256 hashes for verification.
+
+One-line install for Unix-like systems:
+
 ```bash
+# macOS Apple Silicon
 curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-aarch64-macos.tar.gz \
   | tar xz && sudo mv zlrd /usr/local/bin/
-```
 
-**macOS Intel**
-```bash
-curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-x86_64-macos.tar.gz \
-  | tar xz && sudo mv zlrd /usr/local/bin/
-```
-
-**Linux x86_64**
-```bash
+# Linux x86_64
 curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-x86_64-linux.tar.gz \
   | tar xz && sudo mv zlrd /usr/local/bin/
 ```
 
-> All release assets include a `checksums.txt` with SHA-256 hashes for verification.
+### From source
 
-### Windows
-
-Download [`zlrd-x86_64-windows.zip`](https://github.com/alaleks/zlrd/releases/latest) from the latest release, extract, and add `zlrd.exe` to your `PATH`.
-
-### Build from source
-
-Requires **Zig 0.16.0 or later**
+Requires Zig 0.16.0 or later.
 
 ```bash
 git clone https://github.com/alaleks/zlrd.git
 cd zlrd
 zig build -Doptimize=ReleaseFast
-sudo cp zig-out/bin/zlrd /usr/local/bin/
+sudo install zig-out/bin/zlrd /usr/local/bin/
 ```
 
----
+## Usage
 
-## 🧪 Usage
-
-```bash
+```
 zlrd [options] <file...>
 
-Options:
-  -f, --file <path>        Log file (repeatable)
-  -s, --search <text>      Search string (case-insensitive)
-  -l, --level <levels>     Filter by level (case-insensitive)
-                           Values: trace,debug,info,warn,error,fatal,panic
-                           Comma-separated: -l error,warn
-                           Repeatable:     -l error -l fatal
-  -d, --date <date>        Date filter: YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD
-      --from <time>        Time range start (HH:MM or HH:MM:SS)
-      --to <time>          Time range end (HH:MM or HH:MM:SS)
-      --output json        Output as JSONL for pipeline processing
-  -t, --tail               Follow file in real time
-  -n, --num-lines <num>    Show last N lines
-  -v, --version            Print version and exit
-  -h, --help               Show this help
+  -f, --file <path>          Log file (repeatable)
+  -s, --search <text>        Search string (literal or regex)
+                             Operators: `|` = OR, `&` = AND
+  -l, --level <levels>       Level filter (comma-separated, repeatable)
+                             Values: trace, debug, info, warn, error, fatal, panic
+  -d, --date <date>          Date filter: YYYY-MM-DD  or  YYYY-MM-DD..YYYY-MM-DD
+      --from <time>          Time range start (HH:MM or HH:MM:SS)
+      --to   <time>          Time range end   (HH:MM or HH:MM:SS)
+      --output <mode>        Output mode: json (JSONL for pipelines)
+  -t, --tail                 Follow file in real time
+  -n, --num-lines <num>      Paginate: show N lines per page
+  -a, --aggregate            Group identical matched lines
+  -m, --aggregate-mode <mode> exact | level-message | json-message | normalized
+  -v, --version              Print version and exit
+  -h, --help                 Show help
 ```
 
----
+If no file is given, `zlrd` reads every `*.log` and `*.log.gz` in the current
+directory.
 
-## 📌 Examples
+## Examples
 
 ```bash
-# Basic viewing
+# Stream a file with default formatting
 zlrd app.log
-zlrd app.log error.log
 
 # Filter by level
-zlrd -l error app.log
 zlrd -l error,warn app.log
-zlrd -l error -l fatal app.log
 
-# Search (like grep)
+# Search with OR / AND operators
 zlrd -s "connection|timeout" app.log
-zlrd -s "goroutine" app.log
-zlrd -s "error&connection" app.log
+zlrd -s "error&database" app.log
 
-# Date filter
-zlrd -d 2024-01-20 app.log
+# Date range
 zlrd -d 2024-01-01..2024-01-31 app.log
 
-# Time range filter (incident drill-down)
-zlrd --from 14:00 --to 15:30 app.log
-zlrd -d 2024-01-20 --from 09:00 --to 09:15 app.log
+# Time window inside one day (incident drill-down)
+zlrd -d 2024-01-20 --from 09:00 --to 09:30 app.log
 
-# Tail mode (real-time)
-zlrd -t app.log
-zlrd -t -l error -s "timeout" app.log
+# Real-time follow
+zlrd -t -l error app.log
 
-# Combine filters
-zlrd -l error -d 2024-01-20 -s timeout app.log
+# Aggregate normalized log lines (strips IDs, timestamps, digits)
+zlrd -a -m normalized app.log
 
-# Last N lines
-zlrd -n 100 app.log
+# Pipe to jq
+zlrd --output json app.log | jq 'select(.level == "error")'
 
-# Short flags (GNU-style)
+# Multiple files with combined filters
+zlrd -l error -d 2024-01-20 -s "timeout" app.log gateway.log
+
+# Grouped short flags (GNU-style)
 zlrd -tl error app.log
 ```
 
----
+## Supported log formats
 
-## 🧾 Supported Log Formats
+`zlrd` auto-detects the format from the line shape.
 
-zlrd automatically detects log format:
+**JSON**
 
-* **JSON logs**
-
-  ```json
-  {"level":"error","message":"..."}
-  ```
-
-* **Plain text logs**
-
-  ```
-  [ERROR] something failed
-  level=error msg="..."
-  severity=error ...
-  ```
-
----
-
-## 🤖 Agent Mode (planned)
-
-Run zlrd as a background monitoring agent:
-
-```bash
-zlrd --agent --agent-port 9090 /var/log/app/*.log
+```
+{"time":"2024-01-20T12:00:00Z","level":"error","message":"connection refused"}
 ```
 
-- **Stateless watcher** — periodic scan, JSON metrics, threshold alerts
-- **Sidecar** — gRPC streaming to central collector for multi-node clusters
-- **eBPF probes** — kernel-level OOM/segfault/panic detection with near-zero overhead
-- HTTP endpoints: `/metrics` (Prometheus), `/health`, `/events`
-- Webhook alerts: Slack, Discord, Telegram
+**Bracketed plain text**
 
----
+```
+2024-01-20 12:00:00 [ERROR] connection refused
+```
 
-## 🗺️ Roadmap
+**logfmt**
 
-* [x] Compressed logs (gzip)
-* [x] Aggregates log rows
-* [x] Regex-based filtering — `-s` with pattern matching for grep parity
-* [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
-* [x] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
-* [x] Pre-built binaries for macOS, Linux, Windows — download from [Releases](https://github.com/alaleks/zlrd/releases)
-* [x] Homebrew tap — `brew install alaleks/tap/zlrd`
-* [ ] Agent mode (`--agent`) — background monitoring, alerting, HTTP metrics
-* [ ] Sidecar agent — gRPC streaming to central collector, multi-node
-* [ ] eBPF agent — kernel-level probes (OOM, segfault, panic) with zero overhead
+```
+time=2024-01-20T12:00:00Z level=error msg="connection refused"
+```
 
----
+Recognized level keys: `level`, `severity`, `lvl`.
+Recognized timestamp keys: `time`, `timestamp`, `date`.
 
-## 🤝 Contributing
+## Aggregation modes
 
-* Follow Zig style guidelines
-* Add tests for new features
-* Keep the code simple and efficient
+| Mode             | Groups by                                     | Use case                          |
+| ---------------- | --------------------------------------------- | --------------------------------- |
+| `exact`          | full line                                     | Count identical lines             |
+| `level-message`  | level + extracted message                     | Same message, any timestamp       |
+| `json-message`   | JSON `message`/`msg` field only               | Compare message text across runs  |
+| `normalized`     | lowercased, digits → `#`, dates → `<date>`    | Find recurring error patterns     |
 
----
+## Roadmap
 
-## 🏷️ Keywords
+- [x] Streaming reader with JSON, bracketed, and logfmt detection
+- [x] Level, date, and time-range filtering
+- [x] Regex search with `|` and `&` operators
+- [x] Aggregation modes
+- [x] gzip input
+- [x] JSONL output for pipelines
+- [x] Pre-built binaries for macOS, Linux, Windows
+- [x] Homebrew tap and apt repository
+- [ ] Agent mode: background watcher, HTTP metrics endpoint, alerting
+- [ ] Sidecar mode: gRPC streaming to a central collector
+- [ ] eBPF probes for kernel-level OOM, segfault, and panic detection
 
-log viewer, log analyzer, cli tool, tail alternative, grep alternative, zig cli, log parser, log monitoring, developer tools
+## Contributing
 
----
+Bug reports and pull requests are welcome.
 
-## 📄 License
+- Run `zig build test` before submitting; all tests must pass.
+- Run `zig fmt src/` to keep formatting consistent.
+- Follow the existing style: no hidden allocations, explicit error handling,
+  small focused functions.
 
-MIT — see [LICENSE](LICENSE) for details.
+## License
+
+[MIT](LICENSE)
