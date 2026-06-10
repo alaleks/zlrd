@@ -34,6 +34,13 @@ brew install alaleks/tap/zlrd
 
 > First time only: run `brew tap alaleks/tap` if the formula isn't found automatically.
 
+### Linux — apt (Debian / Ubuntu)
+
+```bash
+curl -s https://packagecloud.io/install/repositories/alaleks/zlrd/script.deb.sh | sudo bash
+sudo apt install zlrd
+```
+
 ### macOS / Linux — Pre-built binary
 
 **macOS Apple Silicon (M1/M2/M3)**
