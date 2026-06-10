@@ -47,8 +47,19 @@ brew install alaleks/tap/zlrd
 ### Linux — apt (Debian, Ubuntu)
 
 ```bash
-curl -fsSL https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/setup.deb.sh | sudo bash
-sudo apt install zlrd
+# 1. Install prerequisites (skip if you already have curl and gpg)
+sudo apt update && sudo apt install -y curl gpg
+
+# 2. Import the registry signing key
+curl -fsSL "https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/gpgkey" \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/aleksandr-aleksandrov_zlrd-archive-keyring.gpg
+
+# 3. Add the apt source
+echo "deb [signed-by=/etc/apt/keyrings/aleksandr-aleksandrov_zlrd-archive-keyring.gpg] https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/any/ any main" \
+  | sudo tee /etc/apt/sources.list.d/buildkite-aleksandr-aleksandrov-zlrd.list > /dev/null
+
+# 4. Install
+sudo apt update && sudo apt install zlrd
 ```
 
 ### Pre-built binaries
