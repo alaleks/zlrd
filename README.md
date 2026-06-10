@@ -26,6 +26,42 @@ Designed for working with large log files with support for filtering, search, an
 
 ## 🚀 Install
 
+### macOS — Homebrew
+
+```bash
+brew install alaleks/tap/zlrd
+```
+
+> First time only: run `brew tap alaleks/tap` if the formula isn't found automatically.
+
+### macOS / Linux — Pre-built binary
+
+**macOS Apple Silicon (M1/M2/M3)**
+```bash
+curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-aarch64-macos.tar.gz \
+  | tar xz && sudo mv zlrd /usr/local/bin/
+```
+
+**macOS Intel**
+```bash
+curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-x86_64-macos.tar.gz \
+  | tar xz && sudo mv zlrd /usr/local/bin/
+```
+
+**Linux x86_64**
+```bash
+curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-x86_64-linux.tar.gz \
+  | tar xz && sudo mv zlrd /usr/local/bin/
+```
+
+> All release assets include a `checksums.txt` with SHA-256 hashes for verification.
+
+### Windows
+
+Download [`zlrd-x86_64-windows.zip`](https://github.com/alaleks/zlrd/releases/latest) from the latest release, extract, and add `zlrd.exe` to your `PATH`.
+
+### Build from source
+
 Requires **Zig 0.16.0 or later**
 
 ```bash
@@ -145,7 +181,8 @@ zlrd --agent --agent-port 9090 /var/log/app/*.log
 * [x] Regex-based filtering — `-s` with pattern matching for grep parity
 * [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
 * [x] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
-* [ ] Homebrew tap + apt/yum packages — `brew install zlrd`
+* [x] Pre-built binaries for macOS, Linux, Windows — download from [Releases](https://github.com/alaleks/zlrd/releases)
+* [ ] Homebrew tap — `brew install alaleks/tap/zlrd`
 * [ ] Agent mode (`--agent`) — background monitoring, alerting, HTTP metrics
 * [ ] Sidecar agent — gRPC streaming to central collector, multi-node
 * [ ] eBPF agent — kernel-level probes (OOM, segfault, panic) with zero overhead
