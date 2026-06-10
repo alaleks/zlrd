@@ -182,7 +182,7 @@ zlrd --agent --agent-port 9090 /var/log/app/*.log
 * [x] Time-range filtering — `--from 14:00 --to 15:30` for incident drill-down
 * [x] `--output json` — pipeline-friendly output (`zlrd ... | jq`)
 * [x] Pre-built binaries for macOS, Linux, Windows — download from [Releases](https://github.com/alaleks/zlrd/releases)
-* [ ] Homebrew tap — `brew install alaleks/tap/zlrd`
+* [x] Homebrew tap — `brew install alaleks/tap/zlrd`
 * [ ] Agent mode (`--agent`) — background monitoring, alerting, HTTP metrics
 * [ ] Sidecar agent — gRPC streaming to central collector, multi-node
 * [ ] eBPF agent — kernel-level probes (OOM, segfault, panic) with zero overhead

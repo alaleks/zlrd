@@ -125,38 +125,78 @@ pub fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) P
 }
 
 pub fn printHelp() void {
-    std.debug.print(
-        \\Usage:
-        \\  zlrd [options] <file...>
-        \\
-        \\Options:
-        \\  -{c}, --{s:<16} <path>   Add log file (can be repeated)
-        \\  -{c}, --{s:<16} <text>   Search string
-        \\  -{c}, --{s:<16} <levels> Levels: trace,debug,info,warn,error,fatal,panic
-        \\                           Case-insensitive. Multiple: -l error,warn -l fatal
-        \\  -{c}, --{s:<16} <date>   Date filter (YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD)
-        \\  -{c}, --{s:<16}          Tail mode
-        \\  -{c}, --{s:<16} <num>    Number of lines to display
-        \\  -{c}, --{s:<16}          Print version and exit
-        \\  -{c}, --{s:<16}          Show help
-        \\  -{c}, --{s:<16}          Aggregate matched log rows
-        \\  -{c}, --{s:<16} <mode>   Aggregate mode: exact | level-message | json-message | normalized
-        \\      --from <time>        Time range start (HH:MM or HH:MM:SS)
-        \\      --to <time>          Time range end (HH:MM or HH:MM:SS)
-        \\      --output json        Output as JSONL (pipe to jq)
-        \\
-    , .{
-        OptionFile.short,          OptionFile.long,
-        OptionSearch.short,        OptionSearch.long,
-        OptionLevel.short,         OptionLevel.long,
-        OptionDate.short,          OptionDate.long,
-        OptionTail.short,          OptionTail.long,
-        OptionNumLines.short,      OptionNumLines.long,
-        OptionVersion.short,       OptionVersion.long,
-        OptionHelp.short,          OptionHelp.long,
-        OptionAggregate.short,     OptionAggregate.long,
-        OptionAggregateMode.short, OptionAggregateMode.long,
-    });
+    // ANSI — consistent with the rest of the codebase (GitHub Dark palette)
+    const b  = "\x1b[1m";                   // bold  (section headers)
+    const sh = "\x1b[38;2;227;179;65m";     // amber (short flags   -x)
+    const lo = "\x1b[38;2;88;166;255m";     // blue  (long flags --flag)
+    const ar = "\x1b[38;2;139;148;158m";    // muted (<args>, hints)
+    const gr = "\x1b[38;2;63;185;80m";      // green (examples)
+    const r  = "\x1b[0m";
+
+    // Description column starts at display position 35.
+    // Layout per row:  2 + 4 + <long flag padded to 19> + <arg padded to 10> = 35
+    const text =
+        "\n" ++
+        b ++ "Usage" ++ r ++ "\n" ++
+        "  zlrd " ++ ar ++ "[options]" ++ r ++ " " ++ ar ++ "<file...>" ++ r ++ "\n\n" ++
+        b ++ "Options" ++ r ++ "\n" ++
+
+        "  " ++ sh ++ "-f" ++ r ++ ", " ++ lo ++ "--file" ++ r ++
+            "             " ++ ar ++ "<path>   " ++ r ++ "  Add log file (repeatable)\n" ++
+
+        "  " ++ sh ++ "-s" ++ r ++ ", " ++ lo ++ "--search" ++ r ++
+            "           " ++ ar ++ "<text>   " ++ r ++ "  Search string  " ++
+            ar ++ "·  | = OR   & = AND" ++ r ++ "\n" ++
+
+        "  " ++ sh ++ "-l" ++ r ++ ", " ++ lo ++ "--level" ++ r ++
+            "            " ++ ar ++ "<levels> " ++ r ++ "  Filter by level (comma-separated, repeatable)\n" ++
+        "                                     " ++
+            ar ++ "trace · debug · info · warn · error · fatal · panic" ++ r ++ "\n" ++
+
+        "  " ++ sh ++ "-d" ++ r ++ ", " ++ lo ++ "--date" ++ r ++
+            "             " ++ ar ++ "<date>   " ++ r ++ "  Date: YYYY-MM-DD  or  YYYY-MM-DD..YYYY-MM-DD\n" ++
+
+        "      " ++ lo ++ "--from" ++ r ++
+            "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
+
+        "      " ++ lo ++ "--to" ++ r ++
+            "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
+
+        "      " ++ lo ++ "--output" ++ r ++
+            "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
+            ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
+
+        "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
+            "                          Follow file in real time\n" ++
+
+        "  " ++ sh ++ "-n" ++ r ++ ", " ++ lo ++ "--num-lines" ++ r ++
+            "        " ++ ar ++ "<num>    " ++ r ++ "  Paginate: show N lines per page\n" ++
+
+        "  " ++ sh ++ "-a" ++ r ++ ", " ++ lo ++ "--aggregate" ++ r ++
+            "                     Group identical matched lines\n" ++
+
+        "  " ++ sh ++ "-m" ++ r ++ ", " ++ lo ++ "--aggregate-mode" ++ r ++
+            "   " ++ ar ++ "<mode>   " ++ r ++ "  " ++
+            ar ++ "exact · level-message · json-message · normalized" ++ r ++ "\n" ++
+
+        "  " ++ sh ++ "-v" ++ r ++ ", " ++ lo ++ "--version" ++ r ++
+            "                     Print version and exit\n" ++
+
+        "  " ++ sh ++ "-h" ++ r ++ ", " ++ lo ++ "--help" ++ r ++
+            "                          Show this help\n" ++
+
+        "\n" ++
+        b ++ "Examples" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd -l error,warn app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd -s \"connection|timeout\" app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd -d 2024-01-20 --from 09:00 --to 09:30 app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd -t -l error app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd -a -m normalized app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd --output json app.log | jq ." ++ r ++ "\n" ++
+        "\n";
+
+    std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, text) catch {};
 }
 
 pub const Options = struct {

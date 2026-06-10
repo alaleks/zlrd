@@ -22,8 +22,7 @@ pub fn main(opts: struct {
     const io = opts.io;
 
     var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
-        printError(io, err);
-        flags.printHelp();
+        fatal(io, parseErrorMessage(err), "run zlrd --help for usage");
         std.process.exit(1);
     };
     defer parsed_args.deinit(allocator);
@@ -52,11 +51,11 @@ pub fn main(opts: struct {
 
     if (parsed_args.files.len == 0) {
         discovered_files = findLogFiles(allocator, io) catch {
-            writeStderr(io, "zlrd: could not read current directory\n");
+            fatal(io, "could not read current directory", "check read permissions: ls -la .");
             std.process.exit(1);
         };
         if (discovered_files.len == 0) {
-            writeStderr(io, "zlrd: no *.log or *.log.gz files found in current directory\n");
+            fatal(io, "no *.log or *.log.gz files found in current directory", "specify a file: zlrd app.log");
             std.process.exit(1);
         }
         parsed_args.files = discovered_files;
@@ -65,9 +64,9 @@ pub fn main(opts: struct {
         for (parsed_args.files) |path| {
             if (parsed_args.tail_mode and gzip.isGzip(path)) {
                 var buf: [512]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "zlrd: {s}: tail mode is not supported for .gz files\n", .{path}) catch
-                    "zlrd: tail mode is not supported for .gz files\n";
-                writeStderr(io, msg);
+                const msg = std.fmt.bufPrint(&buf, "{s}: tail mode is not supported for .gz files", .{path}) catch
+                    "tail mode is not supported for .gz files";
+                fatal(io, msg, "decompress first: gunzip file.log.gz");
                 all_ok = false;
                 continue;
             }
@@ -75,11 +74,15 @@ pub fn main(opts: struct {
             std.Io.Dir.cwd().access(io, path, .{}) catch |err| {
                 var buf: [512]u8 = undefined;
                 const msg = switch (err) {
-                    error.FileNotFound => std.fmt.bufPrint(&buf, "zlrd: {s}: no such file\n", .{path}) catch "zlrd: no such file\n",
-                    error.AccessDenied => std.fmt.bufPrint(&buf, "zlrd: {s}: permission denied\n", .{path}) catch "zlrd: permission denied\n",
-                    else => std.fmt.bufPrint(&buf, "zlrd: {s}: {s}\n", .{ path, @errorName(err) }) catch "zlrd: error\n",
+                    error.FileNotFound => std.fmt.bufPrint(&buf, "{s}: no such file", .{path}) catch "no such file",
+                    error.AccessDenied => std.fmt.bufPrint(&buf, "{s}: permission denied", .{path}) catch "permission denied",
+                    else => std.fmt.bufPrint(&buf, "{s}: {s}", .{ path, @errorName(err) }) catch "unexpected error",
                 };
-                writeStderr(io, msg);
+                const hint: ?[]const u8 = switch (err) {
+                    error.AccessDenied => "check permissions or try with sudo",
+                    else => null,
+                };
+                fatal(io, msg, hint);
                 all_ok = false;
             };
         }
@@ -90,13 +93,27 @@ pub fn main(opts: struct {
         if (std.Io.File.stdout().isTty(io) catch false) printBanner(io);
     }
     processFiles(allocator, parsed_args) catch |err| {
-        printError(io, err);
+        fatal(io, runtimeErrorMessage(err), null);
         std.process.exit(1);
     };
 }
 
 fn writeStderr(io: std.Io, msg: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+}
+
+/// Styled fatal error. `hint` is optional follow-up line shown in muted colour.
+fn fatal(io: std.Io, msg: []const u8, hint: ?[]const u8) void {
+    const e = std.Io.File.stderr();
+    e.writeStreamingAll(io, "\n\x1b[1;38;2;248;81;73m✗\x1b[0m  ") catch {};
+    e.writeStreamingAll(io, msg) catch {};
+    e.writeStreamingAll(io, "\n") catch {};
+    if (hint) |h| {
+        e.writeStreamingAll(io, "\x1b[38;2;139;148;158m   → ") catch {};
+        e.writeStreamingAll(io, h) catch {};
+        e.writeStreamingAll(io, "\x1b[0m\n") catch {};
+    }
+    e.writeStreamingAll(io, "\n") catch {};
 }
 
 fn printBanner(io: std.Io) void {
@@ -190,32 +207,34 @@ fn processFileWithArena(
     try reader.readLogs(arena.allocator(), single_file_args);
 }
 
-fn printError(io: std.Io, err: anyerror) void {
-    const msg = switch (err) {
-        error.FileNotFound => "file not found",
-        error.AccessDenied => "access denied",
-        error.IsDir => "is a directory",
-        error.NotOpenForReading => "not open for reading",
-        error.OutOfMemory => "out of memory",
-        error.InvalidArgument => "invalid argument",
-        error.InvalidNumLines => "invalid number of lines",
-        error.MissingFile => "no input files specified",
-        error.InvalidLevel => "invalid log level",
-        error.InvalidAggregateMode => "invalid aggregate mode",
-        error.InvalidOutputMode => "invalid output mode",
+fn parseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
         error.UnknownArgument => "unknown argument",
-        error.MissingSearch => "missing search value",
-        error.MissingLevel => "missing level value",
-        error.MissingDate => "missing date value",
-        error.MissingNumLines => "missing number of lines",
-        error.MissingAggregateMode => "missing aggregate mode",
-        error.MissingFromTime => "missing from time value",
-        error.MissingToTime => "missing to time value",
-        error.MissingOutput => "missing output mode",
+        error.InvalidArgument => "invalid argument",
+        error.InvalidNumLines => "invalid value for --num-lines (must be a positive integer)",
+        error.InvalidLevel => "invalid log level (valid: trace debug info warn error fatal panic)",
+        error.InvalidAggregateMode => "invalid aggregate mode (valid: exact level-message json-message normalized)",
+        error.InvalidOutputMode => "invalid output mode (valid: json)",
+        error.MissingFile => "missing value for --file",
+        error.MissingSearch => "missing value for --search",
+        error.MissingLevel => "missing value for --level",
+        error.MissingDate => "missing value for --date",
+        error.MissingNumLines => "missing value for --num-lines",
+        error.MissingAggregateMode => "missing value for --aggregate-mode",
+        error.MissingFromTime => "missing value for --from",
+        error.MissingToTime => "missing value for --to",
+        error.MissingOutput => "missing value for --output",
         else => @errorName(err),
     };
+}
 
-    std.Io.File.stderr().writeStreamingAll(io, "zlrd: ") catch {};
-    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
-    std.Io.File.stderr().writeStreamingAll(io, "\n") catch {};
+fn runtimeErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "file not found",
+        error.AccessDenied => "permission denied",
+        error.IsDir => "path is a directory, not a file",
+        error.NotOpenForReading => "file is not open for reading",
+        error.OutOfMemory => "out of memory",
+        else => @errorName(err),
+    };
 }
