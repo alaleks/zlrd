@@ -27,7 +27,8 @@ fn findLastNLinesStart(f: *OpenFile, file_size: u64, n: usize, scan_buf: []u8) !
     var target_newlines = n;
     var last_byte: [1]u8 = undefined;
     if (try readAt(f.fd, file_size - 1, &last_byte) == 1 and last_byte[0] == '\n') {
-        target_newlines = std.math.add(usize, target_newlines, 1) catch return 0;
+        // n comes from args.num_lines (default 10, CLI-bounded), so n+1 cannot overflow.
+        target_newlines += 1;
     }
 
     var newlines_found: usize = 0;
@@ -349,8 +350,10 @@ fn processLine(
         return;
     }
 
-    if (filter_state.checkLine(line) != null) {
-        const key = try formats.buildAggregateKeyForLine(allocator, args.aggregate_mode, line);
+    // Reuse LineInfo produced by checkLine — buildAggregateKey accepts it
+    // directly, avoiding a second parse of the line for key construction.
+    if (filter_state.checkLine(line)) |info| {
+        const key = try formats.buildAggregateKey(allocator, args.aggregate_mode, line, info);
         defer allocator.free(key);
 
         try aggregator.?.add(key, line);

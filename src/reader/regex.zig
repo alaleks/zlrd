@@ -126,11 +126,6 @@ fn matchRepeat(
     start: usize,
     min: usize,
 ) ?usize {
-    // For '?', we special-case: max = 1
-    const is_optional = min == 0 and rest.len > 0 or min == 0;
-    _ = is_optional;
-
-    // Greedily count matches
     var count: usize = 0;
     var tp = start;
     while (tp < text.len) {
@@ -258,7 +253,10 @@ fn topAlt(pattern: []const u8) ?usize {
     var i: usize = 0;
     while (i < pattern.len) : (i += 1) {
         if (in_class) {
-            if (pattern[i] == '\\') { i += 1; continue; }
+            if (pattern[i] == '\\') {
+                i += 1;
+                continue;
+            }
             if (pattern[i] == ']') in_class = false;
             continue;
         }
@@ -266,7 +264,9 @@ fn topAlt(pattern: []const u8) ?usize {
             '\\' => i += 1,
             '[' => in_class = true,
             '(' => depth += 1,
-            ')' => { if (depth > 0) depth -= 1; },
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
             '|' => if (depth == 0) return i,
             else => {},
         }
@@ -293,8 +293,14 @@ fn validate(pattern: []const u8) bool {
                 if (i < pattern.len and pattern[i] == ']') i += 1;
                 var closed = false;
                 while (i < pattern.len) : (i += 1) {
-                    if (pattern[i] == '\\') { i += 1; continue; }
-                    if (pattern[i] == ']') { closed = true; break; }
+                    if (pattern[i] == '\\') {
+                        i += 1;
+                        continue;
+                    }
+                    if (pattern[i] == ']') {
+                        closed = true;
+                        break;
+                    }
                 }
                 if (!closed) return false;
                 last_was_atom = true;

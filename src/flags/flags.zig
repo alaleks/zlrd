@@ -126,12 +126,12 @@ pub fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) P
 
 pub fn printHelp() void {
     // ANSI — consistent with the rest of the codebase (GitHub Dark palette)
-    const b  = "\x1b[1m";                   // bold  (section headers)
-    const sh = "\x1b[38;2;227;179;65m";     // amber (short flags   -x)
-    const lo = "\x1b[38;2;88;166;255m";     // blue  (long flags --flag)
-    const ar = "\x1b[38;2;139;148;158m";    // muted (<args>, hints)
-    const gr = "\x1b[38;2;63;185;80m";      // green (examples)
-    const r  = "\x1b[0m";
+    const b = "\x1b[1m"; // bold  (section headers)
+    const sh = "\x1b[38;2;227;179;65m"; // amber (short flags   -x)
+    const lo = "\x1b[38;2;88;166;255m"; // blue  (long flags --flag)
+    const ar = "\x1b[38;2;139;148;158m"; // muted (<args>, hints)
+    const gr = "\x1b[38;2;63;185;80m"; // green (examples)
+    const r = "\x1b[0m";
 
     // Description column starts at display position 35.
     // Layout per row:  2 + 4 + <long flag padded to 19> + <arg padded to 10> = 35
@@ -140,51 +140,37 @@ pub fn printHelp() void {
         b ++ "Usage" ++ r ++ "\n" ++
         "  zlrd " ++ ar ++ "[options]" ++ r ++ " " ++ ar ++ "<file...>" ++ r ++ "\n\n" ++
         b ++ "Options" ++ r ++ "\n" ++
-
         "  " ++ sh ++ "-f" ++ r ++ ", " ++ lo ++ "--file" ++ r ++
-            "             " ++ ar ++ "<path>   " ++ r ++ "  Add log file (repeatable)\n" ++
-
+        "             " ++ ar ++ "<path>   " ++ r ++ "  Add log file (repeatable)\n" ++
         "  " ++ sh ++ "-s" ++ r ++ ", " ++ lo ++ "--search" ++ r ++
-            "           " ++ ar ++ "<text>   " ++ r ++ "  Search string  " ++
-            ar ++ "·  | = OR   & = AND" ++ r ++ "\n" ++
-
+        "           " ++ ar ++ "<text>   " ++ r ++ "  Search string  " ++
+        ar ++ "·  | = OR   & = AND" ++ r ++ "\n" ++
         "  " ++ sh ++ "-l" ++ r ++ ", " ++ lo ++ "--level" ++ r ++
-            "            " ++ ar ++ "<levels> " ++ r ++ "  Filter by level (comma-separated, repeatable)\n" ++
+        "            " ++ ar ++ "<levels> " ++ r ++ "  Filter by level (comma-separated, repeatable)\n" ++
         "                                     " ++
-            ar ++ "trace · debug · info · warn · error · fatal · panic" ++ r ++ "\n" ++
-
+        ar ++ "trace · debug · info · warn · error · fatal · panic" ++ r ++ "\n" ++
         "  " ++ sh ++ "-d" ++ r ++ ", " ++ lo ++ "--date" ++ r ++
-            "             " ++ ar ++ "<date>   " ++ r ++ "  Date: YYYY-MM-DD  or  YYYY-MM-DD..YYYY-MM-DD\n" ++
-
+        "             " ++ ar ++ "<date>   " ++ r ++ "  Date: YYYY-MM-DD  or  YYYY-MM-DD..YYYY-MM-DD\n" ++
         "      " ++ lo ++ "--from" ++ r ++
-            "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
-
+        "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
         "      " ++ lo ++ "--to" ++ r ++
-            "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
-
+        "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
         "      " ++ lo ++ "--output" ++ r ++
-            "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
-            ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
-
+        "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
+        ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
         "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
-            "                          Follow file in real time\n" ++
-
+        "                          Follow file in real time\n" ++
         "  " ++ sh ++ "-n" ++ r ++ ", " ++ lo ++ "--num-lines" ++ r ++
-            "        " ++ ar ++ "<num>    " ++ r ++ "  Paginate: show N lines per page\n" ++
-
+        "        " ++ ar ++ "<num>    " ++ r ++ "  Paginate: show N lines per page\n" ++
         "  " ++ sh ++ "-a" ++ r ++ ", " ++ lo ++ "--aggregate" ++ r ++
-            "                     Group identical matched lines\n" ++
-
+        "                     Group identical matched lines\n" ++
         "  " ++ sh ++ "-m" ++ r ++ ", " ++ lo ++ "--aggregate-mode" ++ r ++
-            "   " ++ ar ++ "<mode>   " ++ r ++ "  " ++
-            ar ++ "exact · level-message · json-message · normalized" ++ r ++ "\n" ++
-
+        "   " ++ ar ++ "<mode>   " ++ r ++ "  " ++
+        ar ++ "exact · level-message · json-message · normalized" ++ r ++ "\n" ++
         "  " ++ sh ++ "-v" ++ r ++ ", " ++ lo ++ "--version" ++ r ++
-            "                     Print version and exit\n" ++
-
+        "                     Print version and exit\n" ++
         "  " ++ sh ++ "-h" ++ r ++ ", " ++ lo ++ "--help" ++ r ++
-            "                          Show this help\n" ++
-
+        "                          Show this help\n" ++
         "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
