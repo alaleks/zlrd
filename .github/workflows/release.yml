@@ -221,21 +221,22 @@ jobs:
 
       - name: Push to Buildkite Package Registries
         env:
-          BUILDKITE_REGISTRY_TOKEN: ${{ secrets.BUILDKITE_REGISTRY_TOKEN }}
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
         run: |
-          if [ -z "${BUILDKITE_REGISTRY_TOKEN}" ]; then
-            echo "BUILDKITE_REGISTRY_TOKEN not configured — skipping apt publish"
+          if [ -z "${PACKAGECLOUD_TOKEN}" ]; then
+            echo "PACKAGECLOUD_TOKEN not configured — skipping apt publish"
             exit 0
           fi
 
           # Buildkite Package Registries API:
-          #   POST https://packages.buildkite.com/<org>/<registry>/packages/upload
-          # Bearer token must be a Registry Token with upload permission.
+          #   POST https://api.buildkite.com/v2/packages/organizations/<org>/registries/<registry>/packages
+          # Bearer token must be a Buildkite API Access Token with the
+          # "write_packages" REST API scope.
           HTTP_CODE=$(curl -sS -o response.txt -w "%{http_code}" \
             -X POST \
-            -H "Authorization: Bearer ${BUILDKITE_REGISTRY_TOKEN}" \
+            -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" \
             -F "file=@${DEB}" \
-            "https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/packages/upload")
+            "https://api.buildkite.com/v2/packages/organizations/aleksandr-aleksandrov/registries/zlrd/packages")
 
           echo "HTTP ${HTTP_CODE}"
           cat response.txt
