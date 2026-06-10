@@ -248,9 +248,8 @@ pub const LevelCounter = struct {
             writeOut(style.bg);
             writeOut(style.fg);
             writeOut("\u{2009}");
-            var buf: [64]u8 = undefined;
-            const label = std.fmt.bufPrint(&buf, "{s}", .{@tagName(lvl)}) catch continue;
-            writeLevelLabel(label);
+            writeLevelLabel(@tagName(lvl));
+            var buf: [32]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, " {d}", .{n}) catch continue;
             writeOut(s);
             writeOut("\u{2009}");
@@ -440,19 +439,11 @@ fn matchDateRangeWithDate(date: ?[]const u8, range: DateRange) bool {
 
     if (range.from) |from| {
         const f10 = if (from.len >= 10) from[0..10] else return false;
-        switch (std.mem.order(u8, d10, f10)) {
-            .lt => return false,
-            .eq => if (d.len > from.len and from.len < 10) return false,
-            else => {},
-        }
+        if (std.mem.order(u8, d10, f10) == .lt) return false;
     }
     if (range.to) |to| {
         const t10 = if (to.len >= 10) to[0..10] else return false;
-        switch (std.mem.order(u8, d10, t10)) {
-            .gt => return false,
-            .eq => if (d.len > to.len and to.len < 10) return false,
-            else => {},
-        }
+        if (std.mem.order(u8, d10, t10) == .gt) return false;
     }
     return true;
 }
@@ -982,7 +973,7 @@ fn buildNormalizedKey(
     _ = info;
 
     var buf = try std.ArrayList(u8).initCapacity(allocator, line.len);
-    defer buf.deinit(allocator);
+    errdefer buf.deinit(allocator);
 
     var i: usize = 0;
     var prev_space = false;
@@ -1018,7 +1009,9 @@ fn buildNormalizedKey(
     }
 
     const trimmed = std.mem.trim(u8, buf.items, " ");
-    return allocator.dupe(u8, trimmed);
+    std.mem.copyForwards(u8, buf.items[0..trimmed.len], trimmed);
+    buf.items.len = trimmed.len;
+    return buf.toOwnedSlice(allocator);
 }
 
 /// Extract a human-meaningful message slice from a line.
@@ -1173,9 +1166,7 @@ fn extractJsonLevelPos(line: []const u8) ?LevelPos {
         }
         if (i >= line.len) return null;
 
-        const value_end = i;
-        i += 1;
-        if (is_level_key) return .{ .start = value_start, .end = value_end };
+        return .{ .start = value_start, .end = i };
     }
 
     return null;
