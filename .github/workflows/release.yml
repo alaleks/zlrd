@@ -221,7 +221,26 @@ jobs:
 
       - name: Push to Buildkite Package Registries
         env:
-          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+          BUILDKITE_REGISTRY_TOKEN: ${{ secrets.BUILDKITE_REGISTRY_TOKEN }}
         run: |
-          gem install package_cloud --no-document
-          package_cloud push alaleks/zlrd/any/any "${DEB}"
+          if [ -z "${BUILDKITE_REGISTRY_TOKEN}" ]; then
+            echo "BUILDKITE_REGISTRY_TOKEN not configured — skipping apt publish"
+            exit 0
+          fi
+
+          # Buildkite Package Registries API:
+          #   POST https://packages.buildkite.com/<org>/<registry>/packages/upload
+          # Bearer token must be a Registry Token with upload permission.
+          HTTP_CODE=$(curl -sS -o response.txt -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${BUILDKITE_REGISTRY_TOKEN}" \
+            -F "file=@${DEB}" \
+            "https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/packages/upload")
+
+          echo "HTTP ${HTTP_CODE}"
+          cat response.txt
+          echo
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            exit 1
+          fi
