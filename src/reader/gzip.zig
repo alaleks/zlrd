@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const flags = @import("flags");
-const simd = @import("simd.zig");
+const simd = @import("simd");
 
 const debug_io = std.Options.debug_io;
 

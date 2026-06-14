@@ -1,5 +1,6 @@
 const std = @import("std");
 const flags = @import("flags");
+const agent = @import("agent");
 const reader = @import("reader/reader.zig");
 const gzip = @import("reader/gzip.zig");
 const build_options = @import("build_options");
@@ -87,6 +88,15 @@ pub fn main(opts: struct {
             };
         }
         if (!all_ok) std.process.exit(1);
+    }
+
+    if (parsed_args.agent_mode) {
+        const exit_code = agent.run(allocator, io, parsed_args) catch |err| {
+            fatal(io, agentErrorMessage(err), agentErrorHint(err));
+            std.process.exit(1);
+        };
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
     }
 
     if (!parsed_args.output_json and !parsed_args.tail_mode) {
@@ -224,7 +234,39 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.MissingFromTime => "missing value for --from",
         error.MissingToTime => "missing value for --to",
         error.MissingOutput => "missing value for --output",
+        error.MissingListen => "missing value for --listen",
+        error.MissingMetricsToken => "missing value for --metrics-token",
+        error.MissingAlertErrorRate => "missing value for --alert-error-rate",
+        error.MissingAlertRegex => "missing value for --alert-regex",
+        error.MissingAlertSilence => "missing value for --alert-silence",
+        error.MissingAlertFile => "missing value for --alert-file",
+        error.MissingAlertWebhook => "missing value for --alert-webhook",
+        error.MissingWebhookHeader => "missing value for --webhook-header",
         else => @errorName(err),
+    };
+}
+
+fn agentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NoFiles => "agent mode requires at least one file",
+        error.MissingMetricsToken => "agent mode requires --metrics-token <secret>",
+        error.InvalidListenAddress, error.InvalidAddress, error.InvalidPort => "invalid --listen address",
+        error.InvalidThresholdSpec => "invalid threshold spec (expected N/Ws, e.g. 10/60s)",
+        error.InvalidDuration => "invalid duration (expected Nms, Ns, Nm, or Nh)",
+        error.InvalidRegexSpec => "invalid --alert-regex spec (expected <pattern>:N/Ws)",
+        error.InvalidRegexPattern => "invalid regex pattern in --alert-regex",
+        error.InvalidHeaderSpec => "invalid --webhook-header spec (expected 'Name: Value')",
+        else => runtimeErrorMessage(err),
+    };
+}
+
+fn agentErrorHint(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.NoFiles => "pass at least one file: zlrd --agent --metrics-token secret app.log",
+        error.MissingMetricsToken => "generate one and export it: --metrics-token=$(openssl rand -hex 16)",
+        error.InvalidThresholdSpec => "example: --alert-error-rate 10/60s",
+        error.InvalidRegexSpec => "example: --alert-regex 'panic:5/30s'",
+        else => null,
     };
 }
 

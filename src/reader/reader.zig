@@ -4,11 +4,11 @@
 
 const std = @import("std");
 const flags = @import("flags");
-const simd = @import("simd.zig");
+const simd = @import("simd");
 const tail_reader = @import("tail.zig");
 const formats = @import("formats.zig");
 const gzip = @import("gzip.zig");
-const regex = @import("regex.zig");
+const regex = @import("regex");
 const debug_io = std.Options.debug_io;
 
 /// Write bytes to stdout. Swallows errors — log output is best-effort.

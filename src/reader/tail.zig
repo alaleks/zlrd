@@ -1,7 +1,7 @@
 const std = @import("std");
 const flags = @import("flags");
 const formats = @import("formats.zig");
-const simd = @import("simd.zig");
+const simd = @import("simd");
 
 // Track open files with manual position tracking.
 const OpenFile = struct {

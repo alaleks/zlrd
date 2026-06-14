@@ -84,6 +84,20 @@ pub const Args = struct {
     aggregate_mode: AggregateMode = .exact,
     output_json: bool = false,
 
+    // Agent mode flags. See src/agent/ for the implementation.
+    agent_mode: bool = false,
+    listen: ?[]const u8 = null,
+    metrics_token: ?[]const u8 = null,
+    alert_error_rate: ?[]const u8 = null,
+    alert_regexes: []const []const u8 = &.{},
+    alert_first_seen: bool = false,
+    alert_silence: ?[]const u8 = null,
+    alert_stderr: bool = false,
+    alert_file: ?[]const u8 = null,
+    alert_webhooks: []const []const u8 = &.{},
+    webhook_headers: []const []const u8 = &.{},
+    alert_exit_on_alert: bool = false,
+
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
         allocator.free(self.files);
@@ -91,6 +105,18 @@ pub const Args = struct {
         if (self.date) |d| allocator.free(d);
         if (self.from_time) |t| allocator.free(t);
         if (self.to_time) |t| allocator.free(t);
+
+        if (self.listen) |s| allocator.free(s);
+        if (self.metrics_token) |s| allocator.free(s);
+        if (self.alert_error_rate) |s| allocator.free(s);
+        if (self.alert_silence) |s| allocator.free(s);
+        if (self.alert_file) |s| allocator.free(s);
+        for (self.alert_regexes) |s| allocator.free(s);
+        allocator.free(self.alert_regexes);
+        for (self.alert_webhooks) |s| allocator.free(s);
+        allocator.free(self.alert_webhooks);
+        for (self.webhook_headers) |s| allocator.free(s);
+        allocator.free(self.webhook_headers);
     }
 
     pub fn isLevelEnabled(self: Args, lvl: Level) bool {
@@ -113,6 +139,14 @@ pub const ParseError = error{
     MissingFromTime,
     MissingToTime,
     MissingOutput,
+    MissingListen,
+    MissingMetricsToken,
+    MissingAlertErrorRate,
+    MissingAlertRegex,
+    MissingAlertSilence,
+    MissingAlertFile,
+    MissingAlertWebhook,
+    MissingWebhookHeader,
     UnknownArgument,
     OutOfMemory,
 };
@@ -172,6 +206,32 @@ pub fn printHelp() void {
         "  " ++ sh ++ "-h" ++ r ++ ", " ++ lo ++ "--help" ++ r ++
         "                          Show this help\n" ++
         "\n" ++
+        b ++ "Agent mode" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--agent" ++ r ++
+        "                         Run as a background watcher with /metrics + alerting\n" ++
+        "      " ++ lo ++ "--listen" ++ r ++
+        "           " ++ ar ++ "<addr>   " ++ r ++ "  HTTP bind address  " ++ ar ++ "(default 127.0.0.1:9100)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--metrics-token" ++ r ++
+        "    " ++ ar ++ "<token>  " ++ r ++ "  Bearer token required on /metrics  " ++ ar ++ "(mandatory)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-error-rate" ++ r ++
+        " " ++ ar ++ "<N/Ws>   " ++ r ++ "  Alert if >N error/fatal/panic lines in window  " ++ ar ++ "e.g. 10/60s" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-regex" ++ r ++
+        "      " ++ ar ++ "<spec>   " ++ r ++ "  Alert if regex matches N times in W seconds  " ++ ar ++ "P:N/Ws  (repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-first-seen" ++ r ++
+        "                Alert on first-seen normalized error signature\n" ++
+        "      " ++ lo ++ "--alert-silence" ++ r ++
+        "    " ++ ar ++ "<Ws>     " ++ r ++ "  Alert if no lines arrived in window  " ++ ar ++ "e.g. 60s" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-stderr" ++ r ++
+        "                    Sink: structured JSON alerts to stderr\n" ++
+        "      " ++ lo ++ "--alert-file" ++ r ++
+        "       " ++ ar ++ "<path>   " ++ r ++ "  Sink: append JSONL alerts to file\n" ++
+        "      " ++ lo ++ "--alert-webhook" ++ r ++
+        "    " ++ ar ++ "<url>    " ++ r ++ "  Sink: POST JSON alert to URL  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--webhook-header" ++ r ++
+        "   " ++ ar ++ "<K: V>   " ++ r ++ "  Extra header for webhooks  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-exit" ++ r ++
+        "                      Exit non-zero on first alert\n" ++
+        "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd -l error,warn app.log" ++ r ++ "\n" ++
@@ -204,14 +264,46 @@ pub const OptionFromTime = Options{ .short = 0, .long = "from" };
 pub const OptionToTime = Options{ .short = 0, .long = "to" };
 pub const OptionOutput = Options{ .short = 0, .long = "output" };
 
+/// Mutable buffers for repeatable string-list flags (--file, agent-mode repeatables).
+/// Held outside Args during parsing; converted to owned slices on success.
+const ParseBuffers = struct {
+    files: std.ArrayList([]const u8),
+    alert_regexes: std.ArrayList([]const u8),
+    alert_webhooks: std.ArrayList([]const u8),
+    webhook_headers: std.ArrayList([]const u8),
+
+    fn init(allocator: std.mem.Allocator) !ParseBuffers {
+        return .{
+            .files = try std.ArrayList([]const u8).initCapacity(allocator, 4),
+            .alert_regexes = .empty,
+            .alert_webhooks = .empty,
+            .webhook_headers = .empty,
+        };
+    }
+
+    fn deinit(self: *ParseBuffers, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, &self.files);
+        freeStringList(allocator, &self.alert_regexes);
+        freeStringList(allocator, &self.alert_webhooks);
+        freeStringList(allocator, &self.webhook_headers);
+    }
+
+    fn transferInto(self: *ParseBuffers, allocator: std.mem.Allocator, parsed: *Args) !void {
+        parsed.files = try self.files.toOwnedSlice(allocator);
+        parsed.alert_regexes = try self.alert_regexes.toOwnedSlice(allocator);
+        parsed.alert_webhooks = try self.alert_webhooks.toOwnedSlice(allocator);
+        parsed.webhook_headers = try self.webhook_headers.toOwnedSlice(allocator);
+    }
+};
+
 fn parseArgsFromIter(
     allocator: std.mem.Allocator,
     it: anytype,
 ) ParseError!Args {
     _ = it.next();
 
-    var files = try std.ArrayList([]const u8).initCapacity(allocator, 4);
-    errdefer freeFileList(allocator, &files);
+    var bufs = try ParseBuffers.init(allocator);
+    errdefer bufs.deinit(allocator);
 
     var parsed = Args{
         .files = &.{},
@@ -221,40 +313,40 @@ fn parseArgsFromIter(
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             parsed.help = true;
-            parsed.files = try files.toOwnedSlice(allocator);
+            try bufs.transferInto(allocator, &parsed);
             return parsed;
         }
 
         if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
             parsed.version = true;
-            parsed.files = try files.toOwnedSlice(allocator);
+            try bufs.transferInto(allocator, &parsed);
             return parsed;
         }
 
         if (std.mem.startsWith(u8, arg, "--")) {
-            try parseLongFlag(&parsed, &files, arg, it, allocator);
+            try parseLongFlag(&parsed, &bufs, arg, it, allocator);
             continue;
         }
 
         if (arg.len > 1 and arg[0] == '-') {
-            try parseShortFlags(&parsed, &files, arg[1..], it, allocator);
+            try parseShortFlags(&parsed, &bufs.files, arg[1..], it, allocator);
             if (parsed.help or parsed.version) {
-                parsed.files = try files.toOwnedSlice(allocator);
+                try bufs.transferInto(allocator, &parsed);
                 return parsed;
             }
             continue;
         }
 
-        try appendFile(allocator, &files, arg);
+        try appendFile(allocator, &bufs.files, arg);
     }
 
-    parsed.files = try files.toOwnedSlice(allocator);
+    try bufs.transferInto(allocator, &parsed);
     return parsed;
 }
 
-fn freeFileList(allocator: std.mem.Allocator, files: *std.ArrayList([]const u8)) void {
-    for (files.items) |f| allocator.free(f);
-    files.deinit(allocator);
+fn freeStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |f| allocator.free(f);
+    list.deinit(allocator);
 }
 
 fn appendFile(
@@ -265,6 +357,16 @@ fn appendFile(
     const owned = try allocator.dupe(u8, path);
     errdefer allocator.free(owned);
     try files.append(allocator, owned);
+}
+
+fn appendString(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    value: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
 }
 
 fn replaceOwnedString(
@@ -279,7 +381,7 @@ fn replaceOwnedString(
 
 fn parseLongFlag(
     parsed: *Args,
-    files: *std.ArrayList([]const u8),
+    bufs: *ParseBuffers,
     arg: []const u8,
     it: anytype,
     allocator: std.mem.Allocator,
@@ -287,42 +389,9 @@ fn parseLongFlag(
     const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| blk: {
         const val = arg[eq_pos + 1 ..];
         const f = arg[2..eq_pos];
-        if (std.mem.eql(u8, f, "file")) {
-            try appendFile(allocator, files, val);
-            return;
-        }
-        if (std.mem.eql(u8, f, "search")) {
-            try replaceOwnedString(allocator, &parsed.search, val);
-            return;
-        }
-        if (std.mem.eql(u8, f, "level")) {
-            try addLevels(parsed, val);
-            return;
-        }
-        if (std.mem.eql(u8, f, "date")) {
-            try replaceOwnedString(allocator, &parsed.date, val);
-            return;
-        }
-        if (std.mem.eql(u8, f, "num-lines")) {
-            parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
-            return;
-        }
-        if (std.mem.eql(u8, f, "aggregate-mode")) {
-            parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
-            return;
-        }
-        if (std.mem.eql(u8, f, "from")) {
-            try replaceOwnedString(allocator, &parsed.from_time, val);
-            return;
-        }
-        if (std.mem.eql(u8, f, "to")) {
-            try replaceOwnedString(allocator, &parsed.to_time, val);
-            return;
-        }
-        if (std.mem.eql(u8, f, "output")) {
-            try parseOutputMode(parsed, val);
-            return;
-        }
+        if (applyValuedLongFlag(parsed, bufs, f, val, allocator)) |applied| {
+            if (applied) return;
+        } else |err| return err;
         break :blk f;
     } else arg[2..];
 
@@ -334,42 +403,130 @@ fn parseLongFlag(
         parsed.aggregate = true;
         return;
     }
+    if (std.mem.eql(u8, flag, "agent")) {
+        parsed.agent_mode = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "alert-first-seen")) {
+        parsed.alert_first_seen = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "alert-stderr")) {
+        parsed.alert_stderr = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "alert-exit")) {
+        parsed.alert_exit_on_alert = true;
+        return;
+    }
     if (std.mem.eql(u8, flag, "output")) {
         const val = valueOrNext(it, flag) orelse return error.MissingOutput;
         try parseOutputMode(parsed, val);
         return;
     }
-    if (std.mem.eql(u8, flag, "file") or
-        std.mem.eql(u8, flag, "search") or
-        std.mem.eql(u8, flag, "level") or
-        std.mem.eql(u8, flag, "date") or
-        std.mem.eql(u8, flag, "num-lines") or
-        std.mem.eql(u8, flag, "aggregate-mode") or
-        std.mem.eql(u8, flag, "from") or
-        std.mem.eql(u8, flag, "to"))
-    {
+    if (isValuedLongFlag(flag)) {
         const val = valueOrNext(it, flag) orelse return missingValueError(flag);
-        if (std.mem.eql(u8, flag, "file")) {
-            try appendFile(allocator, files, val);
-        } else if (std.mem.eql(u8, flag, "search")) {
-            try replaceOwnedString(allocator, &parsed.search, val);
-        } else if (std.mem.eql(u8, flag, "level")) {
-            try addLevels(parsed, val);
-        } else if (std.mem.eql(u8, flag, "date")) {
-            try replaceOwnedString(allocator, &parsed.date, val);
-        } else if (std.mem.eql(u8, flag, "num-lines")) {
-            parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
-        } else if (std.mem.eql(u8, flag, "aggregate-mode")) {
-            parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
-        } else if (std.mem.eql(u8, flag, "from")) {
-            try replaceOwnedString(allocator, &parsed.from_time, val);
-        } else if (std.mem.eql(u8, flag, "to")) {
-            try replaceOwnedString(allocator, &parsed.to_time, val);
-        }
+        const applied = try applyValuedLongFlag(parsed, bufs, flag, val, allocator);
+        if (!applied) return error.UnknownArgument;
         return;
     }
 
     return error.UnknownArgument;
+}
+
+fn isValuedLongFlag(flag: []const u8) bool {
+    const names = [_][]const u8{
+        "file",          "search",         "level",            "date",
+        "num-lines",     "aggregate-mode", "from",             "to",
+        "listen",        "metrics-token",  "alert-error-rate", "alert-regex",
+        "alert-silence", "alert-file",     "alert-webhook",    "webhook-header",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, flag, n)) return true;
+    }
+    return false;
+}
+
+/// Applies a `<flag>=<val>` style assignment, or the second-arg form once the
+/// caller has resolved the value via `valueOrNext`. Returns true if the flag
+/// was a known valued flag and was applied; false if the name is unknown
+/// (caller may surface as `error.UnknownArgument`).
+fn applyValuedLongFlag(
+    parsed: *Args,
+    bufs: *ParseBuffers,
+    flag: []const u8,
+    val: []const u8,
+    allocator: std.mem.Allocator,
+) ParseError!bool {
+    if (std.mem.eql(u8, flag, "file")) {
+        try appendFile(allocator, &bufs.files, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "search")) {
+        try replaceOwnedString(allocator, &parsed.search, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "level")) {
+        try addLevels(parsed, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "date")) {
+        try replaceOwnedString(allocator, &parsed.date, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "num-lines")) {
+        parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "aggregate-mode")) {
+        parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "from")) {
+        try replaceOwnedString(allocator, &parsed.from_time, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "to")) {
+        try replaceOwnedString(allocator, &parsed.to_time, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "output")) {
+        try parseOutputMode(parsed, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "listen")) {
+        try replaceOwnedString(allocator, &parsed.listen, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "metrics-token")) {
+        try replaceOwnedString(allocator, &parsed.metrics_token, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "alert-error-rate")) {
+        try replaceOwnedString(allocator, &parsed.alert_error_rate, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "alert-silence")) {
+        try replaceOwnedString(allocator, &parsed.alert_silence, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "alert-file")) {
+        try replaceOwnedString(allocator, &parsed.alert_file, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "alert-regex")) {
+        try appendString(allocator, &bufs.alert_regexes, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "alert-webhook")) {
+        try appendString(allocator, &bufs.alert_webhooks, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "webhook-header")) {
+        try appendString(allocator, &bufs.webhook_headers, val);
+        return true;
+    }
+    return false;
 }
 
 fn missingValueError(flag: []const u8) ParseError {
@@ -382,6 +539,14 @@ fn missingValueError(flag: []const u8) ParseError {
     if (std.mem.eql(u8, flag, "from")) return error.MissingFromTime;
     if (std.mem.eql(u8, flag, "to")) return error.MissingToTime;
     if (std.mem.eql(u8, flag, "output")) return error.MissingOutput;
+    if (std.mem.eql(u8, flag, "listen")) return error.MissingListen;
+    if (std.mem.eql(u8, flag, "metrics-token")) return error.MissingMetricsToken;
+    if (std.mem.eql(u8, flag, "alert-error-rate")) return error.MissingAlertErrorRate;
+    if (std.mem.eql(u8, flag, "alert-regex")) return error.MissingAlertRegex;
+    if (std.mem.eql(u8, flag, "alert-silence")) return error.MissingAlertSilence;
+    if (std.mem.eql(u8, flag, "alert-file")) return error.MissingAlertFile;
+    if (std.mem.eql(u8, flag, "alert-webhook")) return error.MissingAlertWebhook;
+    if (std.mem.eql(u8, flag, "webhook-header")) return error.MissingWebhookHeader;
     return error.InvalidArgument;
 }
 
@@ -1072,4 +1237,91 @@ test "empty level list is invalid" {
 
 test "allLevelsMask has no unused bits" {
     try testing.expectEqual(@as(LevelMask, 0x7F), allLevelsMask());
+}
+
+test "agent: flag toggles agent_mode" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--agent", "app.log" } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.agent_mode);
+    try testing.expectEqual(@as(usize, 1), parsed.files.len);
+}
+
+test "agent: listen + metrics-token parsed and owned" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--agent",
+        "--listen",
+        "0.0.0.0:9100",
+        "--metrics-token=secret123",
+        "app.log",
+    } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqualStrings("0.0.0.0:9100", parsed.listen.?);
+    try testing.expectEqualStrings("secret123", parsed.metrics_token.?);
+}
+
+test "agent: missing metrics-token value surfaces specific error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--metrics-token" } };
+    var it = fake;
+    try testing.expectError(error.MissingMetricsToken, parseArgsFromIter(allocator, &it));
+}
+
+test "agent: repeatable alert-regex collects all values" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--alert-regex=panic:5/30s",
+        "--alert-regex",
+        "OOMKilled:1/60s",
+        "app.log",
+    } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), parsed.alert_regexes.len);
+    try testing.expectEqualStrings("panic:5/30s", parsed.alert_regexes[0]);
+    try testing.expectEqualStrings("OOMKilled:1/60s", parsed.alert_regexes[1]);
+}
+
+test "agent: webhook + headers collected" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--alert-webhook",
+        "https://example.com/hook",
+        "--webhook-header",
+        "Authorization: Bearer xyz",
+        "--webhook-header=X-Source: zlrd",
+        "app.log",
+    } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), parsed.alert_webhooks.len);
+    try testing.expectEqual(@as(usize, 2), parsed.webhook_headers.len);
+    try testing.expectEqualStrings("Authorization: Bearer xyz", parsed.webhook_headers[0]);
+}
+
+test "agent: bool flags parse" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--alert-first-seen",
+        "--alert-stderr",
+        "--alert-exit",
+        "app.log",
+    } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.alert_first_seen);
+    try testing.expect(parsed.alert_stderr);
+    try testing.expect(parsed.alert_exit_on_alert);
 }
