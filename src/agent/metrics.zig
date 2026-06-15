@@ -15,6 +15,9 @@ pub const RuleKind = enum {
     kernel_oom,
     kernel_segfault,
     kernel_panic,
+    service_crash,
+    service_stop,
+    service_restart,
 
     pub fn label(self: RuleKind) []const u8 {
         return switch (self) {
@@ -25,6 +28,9 @@ pub const RuleKind = enum {
             .kernel_oom => "kernel_oom",
             .kernel_segfault => "kernel_segfault",
             .kernel_panic => "kernel_panic",
+            .service_crash => "service_crash",
+            .service_stop => "service_stop",
+            .service_restart => "service_restart",
         };
     }
 };

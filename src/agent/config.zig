@@ -29,7 +29,13 @@ pub const ParseError = error{
     InvalidDuration,
     InvalidRegexSpec,
     InvalidHeaderSpec,
+    InvalidServiceSpec,
     MissingMetricsToken,
+};
+
+pub const ServiceSpec = struct {
+    name: []const u8,
+    path: []const u8,
 };
 
 pub const SinkConfig = struct {
@@ -52,11 +58,22 @@ pub const AgentConfig = struct {
     silence_window_ms: ?u64,
     sinks: SinkConfig,
     alert_exit: bool,
+    services: []ServiceSpec,
+    crash_markers: []const []const u8,
 
     pub fn deinit(self: *AgentConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.regex_rules);
         allocator.free(self.sinks.webhook_headers);
+        allocator.free(self.services);
         self.* = undefined;
+    }
+
+    /// Returns the service name bound to `path`, or null if no binding.
+    pub fn serviceForPath(self: *const AgentConfig, path: []const u8) ?[]const u8 {
+        for (self.services) |svc| {
+            if (std.mem.eql(u8, svc.path, path)) return svc.name;
+        }
+        return null;
     }
 
     /// Build an AgentConfig from CLI flags. Allocates only the parsed
@@ -88,6 +105,12 @@ pub const AgentConfig = struct {
             headers[i] = try parseHeaderSpec(spec);
         }
 
+        const services = try allocator.alloc(ServiceSpec, args.services.len);
+        errdefer allocator.free(services);
+        for (args.services, 0..) |spec, i| {
+            services[i] = try parseServiceSpec(spec);
+        }
+
         // Default sink: if the user enabled agent mode but specified no sink at all,
         // emit alerts to stderr so the process is never silently producing them.
         const any_sink = args.alert_stderr or args.alert_file != null or args.alert_webhooks.len > 0;
@@ -107,9 +130,18 @@ pub const AgentConfig = struct {
                 .webhook_headers = headers,
             },
             .alert_exit = args.alert_exit_on_alert,
+            .services = services,
+            .crash_markers = args.crash_markers,
         };
     }
 };
+
+/// Parses `NAME=PATH`. Both halves must be non-empty. NAME may not contain `=`.
+pub fn parseServiceSpec(s: []const u8) ParseError!ServiceSpec {
+    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidServiceSpec;
+    if (eq == 0 or eq == s.len - 1) return error.InvalidServiceSpec;
+    return .{ .name = s[0..eq], .path = s[eq + 1 ..] };
+}
 
 /// Parses an `N/Ws` threshold spec into its components. `W` accepts the same
 /// duration suffixes as `parseDuration` (`ms`, `s`, `m`, `h`).
@@ -254,6 +286,36 @@ test "AgentConfig.fromArgs: defaults listen, defaults stderr sink when no sink g
     try testing.expect(cfg.sinks.file_path == null);
     try testing.expectEqual(@as(usize, 0), cfg.sinks.webhooks.len);
     try testing.expectEqual(@as(usize, 0), cfg.regex_rules.len);
+}
+
+test "parseServiceSpec: splits on first =" {
+    const s = try parseServiceSpec("api=/var/log/api.log");
+    try testing.expectEqualStrings("api", s.name);
+    try testing.expectEqualStrings("/var/log/api.log", s.path);
+}
+
+test "parseServiceSpec: rejects malformed input" {
+    try testing.expectError(error.InvalidServiceSpec, parseServiceSpec("noequals"));
+    try testing.expectError(error.InvalidServiceSpec, parseServiceSpec("=onlypath"));
+    try testing.expectError(error.InvalidServiceSpec, parseServiceSpec("onlyname="));
+}
+
+test "AgentConfig: services parsed and serviceForPath lookup works" {
+    const allocator = testing.allocator;
+    const services = [_][]const u8{
+        "api=/var/log/api.log",
+        "gw=/var/log/gw.log",
+    };
+    var args = flags.Args{};
+    args.metrics_token = "t";
+    args.services = &services;
+    var cfg = try AgentConfig.fromArgs(allocator, args);
+    defer cfg.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 2), cfg.services.len);
+    try testing.expectEqualStrings("api", cfg.serviceForPath("/var/log/api.log").?);
+    try testing.expectEqualStrings("gw", cfg.serviceForPath("/var/log/gw.log").?);
+    try testing.expectEqual(@as(?[]const u8, null), cfg.serviceForPath("/other.log"));
 }
 
 test "AgentConfig.fromArgs: explicit sink suppresses default stderr" {

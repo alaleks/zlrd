@@ -98,6 +98,8 @@ pub const Args = struct {
     webhook_headers: []const []const u8 = &.{},
     alert_exit_on_alert: bool = false,
     kernel_probes: bool = false,
+    services: []const []const u8 = &.{},
+    crash_markers: []const []const u8 = &.{},
 
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
@@ -118,6 +120,10 @@ pub const Args = struct {
         allocator.free(self.alert_webhooks);
         for (self.webhook_headers) |s| allocator.free(s);
         allocator.free(self.webhook_headers);
+        for (self.services) |s| allocator.free(s);
+        allocator.free(self.services);
+        for (self.crash_markers) |s| allocator.free(s);
+        allocator.free(self.crash_markers);
     }
 
     pub fn isLevelEnabled(self: Args, lvl: Level) bool {
@@ -148,6 +154,8 @@ pub const ParseError = error{
     MissingAlertFile,
     MissingAlertWebhook,
     MissingWebhookHeader,
+    MissingService,
+    MissingCrashMarker,
     UnknownArgument,
     OutOfMemory,
 };
@@ -234,6 +242,10 @@ pub fn printHelp() void {
         "                      Exit non-zero on first alert\n" ++
         "      " ++ lo ++ "--kernel-probes" ++ r ++
         "                   Watch kernel for OOM / segfault / panic (Linux)\n" ++
+        "      " ++ lo ++ "--service" ++ r ++
+        "          " ++ ar ++ "<N=PATH> " ++ r ++ "  Bind service name to a log file  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--crash-marker" ++ r ++
+        "     " ++ ar ++ "<regex>  " ++ r ++ "  Extra crash pattern  " ++ ar ++ "(repeatable, ext: built-in set)" ++ r ++ "\n" ++
         "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
@@ -274,6 +286,8 @@ const ParseBuffers = struct {
     alert_regexes: std.ArrayList([]const u8),
     alert_webhooks: std.ArrayList([]const u8),
     webhook_headers: std.ArrayList([]const u8),
+    services: std.ArrayList([]const u8),
+    crash_markers: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) !ParseBuffers {
         return .{
@@ -281,6 +295,8 @@ const ParseBuffers = struct {
             .alert_regexes = .empty,
             .alert_webhooks = .empty,
             .webhook_headers = .empty,
+            .services = .empty,
+            .crash_markers = .empty,
         };
     }
 
@@ -289,6 +305,8 @@ const ParseBuffers = struct {
         freeStringList(allocator, &self.alert_regexes);
         freeStringList(allocator, &self.alert_webhooks);
         freeStringList(allocator, &self.webhook_headers);
+        freeStringList(allocator, &self.services);
+        freeStringList(allocator, &self.crash_markers);
     }
 
     fn transferInto(self: *ParseBuffers, allocator: std.mem.Allocator, parsed: *Args) !void {
@@ -296,6 +314,8 @@ const ParseBuffers = struct {
         parsed.alert_regexes = try self.alert_regexes.toOwnedSlice(allocator);
         parsed.alert_webhooks = try self.alert_webhooks.toOwnedSlice(allocator);
         parsed.webhook_headers = try self.webhook_headers.toOwnedSlice(allocator);
+        parsed.services = try self.services.toOwnedSlice(allocator);
+        parsed.crash_markers = try self.crash_markers.toOwnedSlice(allocator);
     }
 };
 
@@ -447,6 +467,7 @@ fn isValuedLongFlag(flag: []const u8) bool {
         "num-lines",     "aggregate-mode", "from",             "to",
         "listen",        "metrics-token",  "alert-error-rate", "alert-regex",
         "alert-silence", "alert-file",     "alert-webhook",    "webhook-header",
+        "service",       "crash-marker",
     };
     for (names) |n| {
         if (std.mem.eql(u8, flag, n)) return true;
@@ -533,6 +554,14 @@ fn applyValuedLongFlag(
         try appendString(allocator, &bufs.webhook_headers, val);
         return true;
     }
+    if (std.mem.eql(u8, flag, "service")) {
+        try appendString(allocator, &bufs.services, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "crash-marker")) {
+        try appendString(allocator, &bufs.crash_markers, val);
+        return true;
+    }
     return false;
 }
 
@@ -554,6 +583,8 @@ fn missingValueError(flag: []const u8) ParseError {
     if (std.mem.eql(u8, flag, "alert-file")) return error.MissingAlertFile;
     if (std.mem.eql(u8, flag, "alert-webhook")) return error.MissingAlertWebhook;
     if (std.mem.eql(u8, flag, "webhook-header")) return error.MissingWebhookHeader;
+    if (std.mem.eql(u8, flag, "service")) return error.MissingService;
+    if (std.mem.eql(u8, flag, "crash-marker")) return error.MissingCrashMarker;
     return error.InvalidArgument;
 }
 
@@ -1314,6 +1345,35 @@ test "agent: webhook + headers collected" {
     try testing.expectEqual(@as(usize, 1), parsed.alert_webhooks.len);
     try testing.expectEqual(@as(usize, 2), parsed.webhook_headers.len);
     try testing.expectEqualStrings("Authorization: Bearer xyz", parsed.webhook_headers[0]);
+}
+
+test "agent: service binding and crash markers collect" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--service=api=/var/log/api.log",
+        "--service",
+        "gateway=/var/log/gw.log",
+        "--crash-marker",
+        "FATAL\\b",
+        "--crash-marker=runtime error",
+        "app.log",
+    } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), parsed.services.len);
+    try testing.expectEqualStrings("api=/var/log/api.log", parsed.services[0]);
+    try testing.expectEqualStrings("gateway=/var/log/gw.log", parsed.services[1]);
+    try testing.expectEqual(@as(usize, 2), parsed.crash_markers.len);
+    try testing.expectEqualStrings("runtime error", parsed.crash_markers[1]);
+}
+
+test "agent: missing --service value surfaces specific error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--service" } };
+    var it = fake;
+    try testing.expectError(error.MissingService, parseArgsFromIter(allocator, &it));
 }
 
 test "agent: bool flags parse" {

@@ -70,7 +70,7 @@ pub fn run(
         if (args.alert_silence) |s| s else "off",
     });
 
-    var w = try watcher.Watcher.init(allocator, io, &m, &rs, &dispatcher, args.files);
+    var w = try watcher.Watcher.init(allocator, io, &m, &rs, &dispatcher, &cfg, args.files);
     defer w.deinit();
 
     const server_thread = try std.Thread.spawn(.{}, runServer, .{&srv});

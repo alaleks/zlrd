@@ -7,10 +7,13 @@
 
 const std = @import("std");
 const flags = @import("flags");
+const regex = @import("regex");
 
 const alert = @import("alert.zig");
+const config = @import("config.zig");
 const metrics = @import("metrics.zig");
 const rules = @import("rules.zig");
+const service = @import("service.zig");
 const signature = @import("signature.zig");
 
 const log = std.log.scoped(.zlrd_watcher);
@@ -29,6 +32,12 @@ const FileState = struct {
     position: u64,
     carry: std.ArrayList(u8),
     last_line_ms: i64,
+    /// Inode of the file currently open under this path. Compared against a
+    /// path-level stat each iteration to detect rotation / restart.
+    inode: u64,
+    /// Per-file lifecycle tracker. Non-null only when the file's path is
+    /// bound to a `--service NAME=PATH` mapping.
+    tracker: ?service.Tracker,
 };
 
 pub const Watcher = struct {
@@ -40,6 +49,8 @@ pub const Watcher = struct {
     dispatcher: *alert.Dispatcher,
     read_buf: []u8,
     stop_flag: std.atomic.Value(bool),
+    crash_regexes: []regex.Regex,
+    detector: service.Detector,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -47,6 +58,7 @@ pub const Watcher = struct {
         m: *metrics.Metrics,
         rs: *rules.RuleSet,
         dispatcher: *alert.Dispatcher,
+        cfg: *const config.AgentConfig,
         paths: []const []const u8,
     ) !Watcher {
         const files = try allocator.alloc(FileState, paths.len);
@@ -65,18 +77,32 @@ pub const Watcher = struct {
             const fd = try std.Io.Dir.cwd().openFile(io, path, .{});
             errdefer fd.close(io);
             const stat = try fd.stat(io);
+            const tracker_opt: ?service.Tracker = if (cfg.serviceForPath(path)) |svc_name|
+                service.Tracker.init(svc_name, path, now)
+            else
+                null;
             files[i] = .{
                 .path = path,
                 .fd = fd,
                 .position = stat.size,
                 .carry = .empty,
                 .last_line_ms = now,
+                .inode = stat.inode,
+                .tracker = tracker_opt,
             };
             opened += 1;
         }
 
         const buf = try allocator.alloc(u8, read_buf_size);
         errdefer allocator.free(buf);
+
+        // Compile user-supplied crash markers once. Pure-Zig regex engine
+        // borrows the pattern slice; cfg outlives the watcher.
+        const regexes = try allocator.alloc(regex.Regex, cfg.crash_markers.len);
+        errdefer allocator.free(regexes);
+        for (cfg.crash_markers, 0..) |pattern, i| {
+            regexes[i] = regex.Regex.compile(pattern) orelse return error.InvalidCrashMarker;
+        }
 
         m.setFilesWatched(files.len);
 
@@ -89,6 +115,8 @@ pub const Watcher = struct {
             .dispatcher = dispatcher,
             .read_buf = buf,
             .stop_flag = .init(false),
+            .crash_regexes = regexes,
+            .detector = .{ .customs = regexes },
         };
     }
 
@@ -99,6 +127,7 @@ pub const Watcher = struct {
         }
         self.allocator.free(self.files);
         self.allocator.free(self.read_buf);
+        self.allocator.free(self.crash_regexes);
         self.* = undefined;
     }
 
@@ -128,16 +157,44 @@ pub const Watcher = struct {
                 last_silence_check_ms = now_ms;
             }
 
+            // Tick service trackers every loop iteration — the cost is just a
+            // pair of timestamp comparisons; flushing pending crashes within
+            // ~250 ms of the marker is what makes the alert latency feel
+            // tight to operators.
+            self.runServiceTicks(now_ms);
+
             if (!any_read) {
                 std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(poll_interval_ms), .awake) catch break;
             }
         }
     }
 
+    fn runServiceTicks(self: *Watcher, now_ms: i64) void {
+        for (self.files) |*f| {
+            if (f.tracker) |*t| {
+                if (t.tick(now_ms, service.default_trace_flush_ms, service.default_stop_window_ms)) |ev| {
+                    self.dispatcher.dispatchService(ev, now_ms);
+                }
+            }
+        }
+    }
+
     fn drainFile(self: *Watcher, f: *FileState) !usize {
+        // Path-level stat catches the "logrotate / restart created a new
+        // file at this path" case — the open fd still points at the old
+        // (possibly unlinked) inode, so its fstat() would never notice.
+        if (std.Io.Dir.cwd().statFile(self.io, f.path, .{})) |path_stat| {
+            if (path_stat.inode != f.inode) {
+                try self.handleRotation(f, path_stat.inode);
+            }
+        } else |_| {
+            // Path temporarily missing during a swap — keep using the
+            // existing fd until the path resolves again.
+        }
+
         const stat = try f.fd.stat(self.io);
 
-        // Truncation / rotation: file shrank under us.
+        // Truncation: file shrank under us (in-place truncate, not rotation).
         if (stat.size < f.position) {
             self.metrics.observeRotation();
             f.position = 0;
@@ -155,6 +212,21 @@ pub const Watcher = struct {
             if (n < self.read_buf.len) break;
         }
         return consumed;
+    }
+
+    fn handleRotation(self: *Watcher, f: *FileState, new_inode: u64) !void {
+        f.fd.close(self.io);
+        f.fd = try std.Io.Dir.cwd().openFile(self.io, f.path, .{});
+        f.inode = new_inode;
+        f.position = 0;
+        f.carry.clearRetainingCapacity();
+        self.metrics.observeRotation();
+
+        if (f.tracker) |*t| {
+            const now_ms = nowMs(self.io);
+            const ev = t.observeInodeChange(now_ms);
+            self.dispatcher.dispatchService(ev, now_ms);
+        }
     }
 
     fn processChunk(self: *Watcher, f: *FileState, chunk: []const u8) !void {
@@ -188,6 +260,12 @@ pub const Watcher = struct {
         var fired: [8]rules.Fired = undefined;
         const n = try self.rules.observe(self.io, line, level, f.path, now_ms, &fired);
         for (fired[0..n]) |entry| self.dispatcher.dispatch(entry, now_ms);
+
+        if (f.tracker) |*t| {
+            if (t.observe(line, level, &self.detector, now_ms)) |ev| {
+                self.dispatcher.dispatchService(ev, now_ms);
+            }
+        }
     }
 
     fn runSilenceChecks(self: *Watcher, now_ms: i64) void {

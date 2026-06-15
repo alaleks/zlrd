@@ -12,6 +12,7 @@ const config = @import("config.zig");
 const metrics = @import("metrics.zig");
 const rules = @import("rules.zig");
 const kernel = @import("kernel");
+const service = @import("service.zig");
 
 /// Hooks set by the watcher / main loop so this file does not have to depend
 /// on `webhook.zig` (which pulls in std.http). Set after construction.
@@ -76,6 +77,29 @@ pub const Dispatcher = struct {
 
     pub fn shouldExit(self: *const Dispatcher) bool {
         return self.exit_flag.load(.monotonic);
+    }
+
+    /// Fan out a service-lifecycle event to the same sinks. Uses the
+    /// service payload schema (`formatServiceEventJson`), which is distinct
+    /// from rule alerts (no threshold/window, has stack_trace).
+    pub fn dispatchService(self: *Dispatcher, event: service.ServiceEvent, now_ms: i64) void {
+        const rule_kind: metrics.RuleKind = switch (event.kind) {
+            .crash => .service_crash,
+            .stop => .service_stop,
+            .restart => .service_restart,
+        };
+        self.metrics.observeAlert(rule_kind);
+
+        // Stack traces can run up to ~4 KiB; budget the payload accordingly.
+        var buf: [8192]u8 = undefined;
+        const payload = formatServiceEventJson(&buf, event, now_ms) catch return;
+
+        if (self.sinks.stderr) self.writeStderr(payload);
+        if (self.file != null) self.writeFile(payload);
+        if (self.webhook_sender) |send| {
+            for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
+        }
+        if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
 
     /// Fan out a kernel-level event to the same sinks. Distinct from
@@ -164,6 +188,35 @@ pub fn formatAlert(buf: []u8, fired: rules.Fired, now_ms: i64) ![]const u8 {
     return w.buffered();
 }
 
+/// Renders a `ServiceEvent` as a single-line JSON document.
+pub fn formatServiceEventJson(buf: []u8, event: service.ServiceEvent, now_ms: i64) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeByte('{');
+    try w.print("\"ts_ms\":{d}", .{now_ms});
+    try w.print(",\"kind\":\"{s}\"", .{event.kind.label()});
+    try w.writeAll(",\"service\":");
+    try writeJsonString(&w, event.service_name);
+    try w.writeAll(",\"file\":");
+    try writeJsonString(&w, event.file_path);
+    if (event.marker.len > 0) {
+        try w.writeAll(",\"marker\":");
+        try writeJsonString(&w, event.marker);
+    }
+    if (event.pid) |p| try w.print(",\"pid\":{d}", .{p});
+    try w.print(",\"crash_count\":{d}", .{event.crash_count});
+    try w.print(",\"restart_count\":{d}", .{event.restart_count});
+    if (event.detail.len > 0) {
+        try w.writeAll(",\"detail\":");
+        try writeJsonString(&w, event.detail);
+    }
+    if (event.stack_trace.len > 0) {
+        try w.writeAll(",\"stack_trace\":");
+        try writeJsonString(&w, event.stack_trace);
+    }
+    try w.writeByte('}');
+    return w.buffered();
+}
+
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     try w.writeByte('"');
     for (s) |c| {
@@ -228,6 +281,57 @@ test "formatAlert: silence alert omits empty line field" {
     defer parsed.deinit();
 
     try testing.expect(!parsed.value.object.contains("line"));
+}
+
+test "formatServiceEventJson: crash with marker, pid, detail, stack_trace" {
+    var buf: [2048]u8 = undefined;
+    const ev: service.ServiceEvent = .{
+        .kind = .crash,
+        .service_name = "api",
+        .file_path = "/var/log/api.log",
+        .marker = "go_panic",
+        .pid = 1234,
+        .detail = "panic: nil pointer",
+        .stack_trace = "\tmain.go:1\n\tmain.go:2\n",
+        .crash_count = 1,
+        .restart_count = 0,
+    };
+    const out = try formatServiceEventJson(&buf, ev, 1_700_000_000_000);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("service_crash", obj.get("kind").?.string);
+    try testing.expectEqualStrings("api", obj.get("service").?.string);
+    try testing.expectEqualStrings("go_panic", obj.get("marker").?.string);
+    try testing.expectEqual(@as(i64, 1234), obj.get("pid").?.integer);
+    try testing.expectEqualStrings("panic: nil pointer", obj.get("detail").?.string);
+    try testing.expect(std.mem.indexOf(u8, obj.get("stack_trace").?.string, "main.go:1") != null);
+}
+
+test "formatServiceEventJson: stop event omits empty fields" {
+    var buf: [512]u8 = undefined;
+    const ev: service.ServiceEvent = .{
+        .kind = .stop,
+        .service_name = "x",
+        .file_path = "/x.log",
+        .marker = "",
+        .pid = null,
+        .detail = "",
+        .stack_trace = "",
+        .crash_count = 1,
+        .restart_count = 0,
+    };
+    const out = try formatServiceEventJson(&buf, ev, 0);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("service_stop", obj.get("kind").?.string);
+    try testing.expect(!obj.contains("marker"));
+    try testing.expect(!obj.contains("pid"));
+    try testing.expect(!obj.contains("detail"));
+    try testing.expect(!obj.contains("stack_trace"));
 }
 
 test "formatAlert: escapes quotes, backslashes, and control bytes in line" {
