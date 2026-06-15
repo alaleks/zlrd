@@ -97,6 +97,7 @@ pub const Args = struct {
     alert_webhooks: []const []const u8 = &.{},
     webhook_headers: []const []const u8 = &.{},
     alert_exit_on_alert: bool = false,
+    kernel_probes: bool = false,
 
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
@@ -231,6 +232,8 @@ pub fn printHelp() void {
         "   " ++ ar ++ "<K: V>   " ++ r ++ "  Extra header for webhooks  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--alert-exit" ++ r ++
         "                      Exit non-zero on first alert\n" ++
+        "      " ++ lo ++ "--kernel-probes" ++ r ++
+        "                   Watch kernel for OOM / segfault / panic (Linux)\n" ++
         "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
@@ -417,6 +420,10 @@ fn parseLongFlag(
     }
     if (std.mem.eql(u8, flag, "alert-exit")) {
         parsed.alert_exit_on_alert = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "kernel-probes")) {
+        parsed.kernel_probes = true;
         return;
     }
     if (std.mem.eql(u8, flag, "output")) {

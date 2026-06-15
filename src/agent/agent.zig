@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const flags = @import("flags");
+const kernel = @import("kernel");
 
 pub const config = @import("config.zig");
 pub const metrics = @import("metrics.zig");
@@ -73,6 +74,20 @@ pub fn run(
     defer w.deinit();
 
     const server_thread = try std.Thread.spawn(.{}, runServer, .{&srv});
+
+    var km: ?kernel.Monitor = if (args.kernel_probes)
+        kernel.Monitor.init(io, alert.kernelSinkThunk, &dispatcher)
+    else
+        null;
+    if (km) |*m_ref| {
+        m_ref.start() catch |err| {
+            log.warn("kernel probes failed to start: {t}", .{err});
+        };
+    }
+    defer if (km) |*m_ref| {
+        m_ref.stop();
+        m_ref.join();
+    };
 
     w.run() catch |err| {
         log.warn("watcher exited: {t}", .{err});

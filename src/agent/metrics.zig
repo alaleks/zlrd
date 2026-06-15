@@ -12,6 +12,9 @@ pub const RuleKind = enum {
     regex,
     first_seen,
     silence,
+    kernel_oom,
+    kernel_segfault,
+    kernel_panic,
 
     pub fn label(self: RuleKind) []const u8 {
         return switch (self) {
@@ -19,6 +22,9 @@ pub const RuleKind = enum {
             .regex => "regex",
             .first_seen => "first_seen",
             .silence => "silence",
+            .kernel_oom => "kernel_oom",
+            .kernel_segfault => "kernel_segfault",
+            .kernel_panic => "kernel_panic",
         };
     }
 };

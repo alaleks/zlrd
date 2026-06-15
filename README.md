@@ -576,7 +576,7 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Homebrew tap and apt repository
 - [x] **Agent mode: background watcher, HTTP metrics endpoint, alerting**
 - [ ] Sidecar mode: gRPC streaming to a central collector
-- [ ] eBPF probes for kernel-level OOM, segfault, and panic detection
+- [x] eBPF probes for kernel-level OOM, segfault, and panic detection
 
 ---
 

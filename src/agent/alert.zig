@@ -11,10 +11,20 @@ const std = @import("std");
 const config = @import("config.zig");
 const metrics = @import("metrics.zig");
 const rules = @import("rules.zig");
+const kernel = @import("kernel");
 
 /// Hooks set by the watcher / main loop so this file does not have to depend
 /// on `webhook.zig` (which pulls in std.http). Set after construction.
 pub const WebhookSender = *const fn (ctx: ?*anyopaque, url: []const u8, payload: []const u8) void;
+
+/// Thunk that adapts `Dispatcher.dispatchKernel` to the `kernel.Sink`
+/// signature. `ctx` must be a `*Dispatcher`. Reads wall-clock ms internally
+/// so callers don't have to thread `std.Io` through.
+pub fn kernelSinkThunk(ctx: ?*anyopaque, event: kernel.KernelEvent) void {
+    const d: *Dispatcher = @ptrCast(@alignCast(ctx orelse return));
+    const now_ms = std.Io.Timestamp.now(d.io, .real).toMilliseconds();
+    d.dispatchKernel(event, now_ms);
+}
 
 pub const Dispatcher = struct {
     io: std.Io,
@@ -66,6 +76,28 @@ pub const Dispatcher = struct {
 
     pub fn shouldExit(self: *const Dispatcher) bool {
         return self.exit_flag.load(.monotonic);
+    }
+
+    /// Fan out a kernel-level event to the same sinks. Distinct from
+    /// `dispatch` because kernel events have their own payload schema
+    /// (rendered by `kernel.formatEventJson`).
+    pub fn dispatchKernel(self: *Dispatcher, event: kernel.KernelEvent, now_ms: i64) void {
+        const rule_kind: metrics.RuleKind = switch (event.kind) {
+            .oom => .kernel_oom,
+            .segfault => .kernel_segfault,
+            .panic_prev_boot => .kernel_panic,
+        };
+        self.metrics.observeAlert(rule_kind);
+
+        var buf: [512]u8 = undefined;
+        const payload = kernel.formatEventJson(&buf, event, now_ms) catch return;
+
+        if (self.sinks.stderr) self.writeStderr(payload);
+        if (self.file != null) self.writeFile(payload);
+        if (self.webhook_sender) |send| {
+            for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
+        }
+        if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
 
     /// Fan out a single fired rule to all enabled sinks. Each sink is
