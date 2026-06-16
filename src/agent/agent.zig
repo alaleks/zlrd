@@ -16,6 +16,8 @@ pub const alert = @import("alert.zig");
 pub const server = @import("server.zig");
 pub const watcher = @import("watcher.zig");
 pub const webhook = @import("webhook.zig");
+pub const journal = @import("journal.zig");
+pub const service = @import("service.zig");
 
 const log = std.log.scoped(.zlrd_agent);
 
@@ -35,7 +37,7 @@ pub fn run(
     io: std.Io,
     args: flags.Args,
 ) !u8 {
-    if (args.files.len == 0) return error.NoFiles;
+    if (args.files.len == 0 and args.journal_units.len == 0) return error.NoFiles;
 
     var cfg = try config.AgentConfig.fromArgs(allocator, args);
     defer cfg.deinit(allocator);
@@ -89,6 +91,41 @@ pub fn run(
         m_ref.join();
     };
 
+    // Journal sources: one subprocess + thread per `--journal-unit` binding.
+    // The watcher's own crash regexes are shared via Watcher.detector.
+    var journals = std.ArrayList(*journal.JournalSource).empty;
+    defer journals.deinit(allocator);
+    var journal_threads = std.ArrayList(std.Thread).empty;
+    defer journal_threads.deinit(allocator);
+    defer {
+        for (journals.items) |js| {
+            js.requestStop();
+        }
+        for (journal_threads.items) |t| t.join();
+        for (journals.items) |js| {
+            js.deinit();
+            allocator.destroy(js);
+        }
+    }
+    for (cfg.journal_units) |spec| {
+        const js = try allocator.create(journal.JournalSource);
+        js.* = journal.JournalSource.init(
+            allocator,
+            io,
+            spec.name,
+            spec.pattern,
+            &dispatcher,
+            &w.detector,
+        );
+        try journals.append(allocator, js);
+        const th = std.Thread.spawn(.{}, runJournal, .{js}) catch |err| {
+            log.warn("failed to spawn journal thread for '{s}': {t}", .{ spec.name, err });
+            continue;
+        };
+        try journal_threads.append(allocator, th);
+        log.info("journal source '{s}' tracking unit pattern '{s}'", .{ spec.name, spec.pattern });
+    }
+
     w.run() catch |err| {
         log.warn("watcher exited: {t}", .{err});
     };
@@ -104,6 +141,12 @@ pub fn run(
 
 fn runServer(srv: *server.Server) void {
     srv.run();
+}
+
+fn runJournal(src: *journal.JournalSource) void {
+    src.run() catch |err| {
+        std.log.scoped(.zlrd_agent).warn("journal source '{s}' exited: {t}", .{ src.name, err });
+    };
 }
 
 /// Wall-clock milliseconds since epoch. Wraps the std.Io clock API so callers

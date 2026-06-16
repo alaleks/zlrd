@@ -1,4 +1,4 @@
-//! Service-level crash tracker.
+кл//! Service-level crash tracker.
 //!
 //! Per-service state machine that turns log-line observations into structured
 //! lifecycle events: `crash`, `stop`, `restart`. A "service" is whatever the
@@ -42,6 +42,7 @@ pub const MarkerKind = enum {
     fatal_level,
     panic_level,
     custom_regex,
+    systemd_signal,
 
     pub fn label(self: MarkerKind) []const u8 {
         return switch (self) {
@@ -51,6 +52,7 @@ pub const MarkerKind = enum {
             .fatal_level => "fatal_level",
             .panic_level => "panic_level",
             .custom_regex => "custom_regex",
+            .systemd_signal => "systemd_signal",
         };
     }
 };
@@ -231,11 +233,21 @@ pub const State = enum {
     stopped,
 };
 
+/// Source backing the tracker. The mode controls which lifecycle events the
+/// tracker emits — file-backed services surface stop/restart, while journal
+/// sources only surface crash signals (systemd already manages lifecycle and
+/// the user wants those treated as noise).
+pub const Mode = enum {
+    file,
+    journal,
+};
+
 /// Per-service tracker. One Tracker per `--service` binding; held inside the
 /// watcher's FileState.
 pub const Tracker = struct {
     name: []const u8,
     path: []const u8,
+    mode: Mode = .file,
     state: State = .running,
     last_log_ms: i64 = 0,
     crash_count: u64 = 0,
@@ -252,6 +264,19 @@ pub const Tracker = struct {
         return .{
             .name = name,
             .path = path,
+            .mode = .file,
+            .last_log_ms = now_ms,
+        };
+    }
+
+    /// Constructs a tracker for a journal-backed source. Lifecycle signals
+    /// (stop, restart) are not emitted in this mode — those are systemd's
+    /// concern and we deliberately leave them as noise.
+    pub fn initJournal(name: []const u8, path: []const u8, now_ms: i64) Tracker {
+        return .{
+            .name = name,
+            .path = path,
+            .mode = .journal,
             .last_log_ms = now_ms,
         };
     }
@@ -299,6 +324,9 @@ pub const Tracker = struct {
                 return null;
             },
             .crash_emitted => {
+                // Journal-mode trackers never emit stop — systemd already
+                // tracks unit liveness; surfacing it again is just noise.
+                if (self.mode == .journal) return null;
                 const silent: i64 = now_ms - self.last_log_ms;
                 if (silent >= @as(i64, @intCast(stop_window_ms))) {
                     self.state = .stopped;
@@ -516,6 +544,18 @@ test "Tracker.tick: emits stop after silence past stop_window" {
     try testing.expect(ev != null);
     try testing.expectEqual(EventKind.stop, ev.?.kind);
     try testing.expect(t.state == .stopped);
+}
+
+test "Tracker (journal mode): tick never emits stop after crash" {
+    var det: Detector = .{ .customs = &.{} };
+    var t = Tracker.initJournal("api", "myapp.service", 0);
+    _ = t.observe("panic: boom", null, &det, 100);
+    _ = t.tick(400, 250, 30_000); // flush crash collection
+    try testing.expect(t.state == .crash_emitted);
+
+    // Even far past the silence window, journal mode stays silent on stop.
+    try testing.expectEqual(@as(?ServiceEvent, null), t.tick(120_000, 250, 30_000));
+    try testing.expect(t.state == .crash_emitted);
 }
 
 test "Tracker.observeInodeChange: emits restart and resets crash state" {

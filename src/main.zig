@@ -50,7 +50,14 @@ pub fn main(opts: struct {
         }
     }
 
-    if (parsed_args.files.len == 0) {
+    // Agent mode with --journal-unit but no positional files is valid:
+    // journal sources don't need a file on disk. Skip auto-discovery in
+    // that case so we don't fail-fast on a cwd without log files.
+    const agent_journal_only = parsed_args.agent_mode and
+        parsed_args.files.len == 0 and
+        parsed_args.journal_units.len > 0;
+
+    if (parsed_args.files.len == 0 and !agent_journal_only) {
         discovered_files = findLogFiles(allocator, io) catch {
             fatal(io, "could not read current directory", "check read permissions: ls -la .");
             std.process.exit(1);
@@ -60,7 +67,7 @@ pub fn main(opts: struct {
             std.process.exit(1);
         }
         parsed_args.files = discovered_files;
-    } else {
+    } else if (parsed_args.files.len > 0) {
         var all_ok = true;
         for (parsed_args.files) |path| {
             if (parsed_args.tail_mode and gzip.isGzip(path)) {

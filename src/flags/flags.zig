@@ -100,6 +100,7 @@ pub const Args = struct {
     kernel_probes: bool = false,
     services: []const []const u8 = &.{},
     crash_markers: []const []const u8 = &.{},
+    journal_units: []const []const u8 = &.{},
 
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
@@ -124,6 +125,8 @@ pub const Args = struct {
         allocator.free(self.services);
         for (self.crash_markers) |s| allocator.free(s);
         allocator.free(self.crash_markers);
+        for (self.journal_units) |s| allocator.free(s);
+        allocator.free(self.journal_units);
     }
 
     pub fn isLevelEnabled(self: Args, lvl: Level) bool {
@@ -156,6 +159,7 @@ pub const ParseError = error{
     MissingWebhookHeader,
     MissingService,
     MissingCrashMarker,
+    MissingJournalUnit,
     UnknownArgument,
     OutOfMemory,
 };
@@ -246,6 +250,8 @@ pub fn printHelp() void {
         "          " ++ ar ++ "<N=PATH> " ++ r ++ "  Bind service name to a log file  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--crash-marker" ++ r ++
         "     " ++ ar ++ "<regex>  " ++ r ++ "  Extra crash pattern  " ++ ar ++ "(repeatable, ext: built-in set)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--journal-unit" ++ r ++
+        "     " ++ ar ++ "<N=PAT>  " ++ r ++ "  Track systemd journal unit (glob ok)  " ++ ar ++ "(repeatable, Linux)" ++ r ++ "\n" ++
         "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
@@ -288,6 +294,7 @@ const ParseBuffers = struct {
     webhook_headers: std.ArrayList([]const u8),
     services: std.ArrayList([]const u8),
     crash_markers: std.ArrayList([]const u8),
+    journal_units: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) !ParseBuffers {
         return .{
@@ -297,6 +304,7 @@ const ParseBuffers = struct {
             .webhook_headers = .empty,
             .services = .empty,
             .crash_markers = .empty,
+            .journal_units = .empty,
         };
     }
 
@@ -307,6 +315,7 @@ const ParseBuffers = struct {
         freeStringList(allocator, &self.webhook_headers);
         freeStringList(allocator, &self.services);
         freeStringList(allocator, &self.crash_markers);
+        freeStringList(allocator, &self.journal_units);
     }
 
     fn transferInto(self: *ParseBuffers, allocator: std.mem.Allocator, parsed: *Args) !void {
@@ -316,6 +325,7 @@ const ParseBuffers = struct {
         parsed.webhook_headers = try self.webhook_headers.toOwnedSlice(allocator);
         parsed.services = try self.services.toOwnedSlice(allocator);
         parsed.crash_markers = try self.crash_markers.toOwnedSlice(allocator);
+        parsed.journal_units = try self.journal_units.toOwnedSlice(allocator);
     }
 };
 
@@ -467,7 +477,7 @@ fn isValuedLongFlag(flag: []const u8) bool {
         "num-lines",     "aggregate-mode", "from",             "to",
         "listen",        "metrics-token",  "alert-error-rate", "alert-regex",
         "alert-silence", "alert-file",     "alert-webhook",    "webhook-header",
-        "service",       "crash-marker",
+        "service",       "crash-marker",   "journal-unit",
     };
     for (names) |n| {
         if (std.mem.eql(u8, flag, n)) return true;
@@ -562,6 +572,10 @@ fn applyValuedLongFlag(
         try appendString(allocator, &bufs.crash_markers, val);
         return true;
     }
+    if (std.mem.eql(u8, flag, "journal-unit")) {
+        try appendString(allocator, &bufs.journal_units, val);
+        return true;
+    }
     return false;
 }
 
@@ -585,6 +599,7 @@ fn missingValueError(flag: []const u8) ParseError {
     if (std.mem.eql(u8, flag, "webhook-header")) return error.MissingWebhookHeader;
     if (std.mem.eql(u8, flag, "service")) return error.MissingService;
     if (std.mem.eql(u8, flag, "crash-marker")) return error.MissingCrashMarker;
+    if (std.mem.eql(u8, flag, "journal-unit")) return error.MissingJournalUnit;
     return error.InvalidArgument;
 }
 
@@ -1374,6 +1389,29 @@ test "agent: missing --service value surfaces specific error" {
     const fake = FakeIter{ .argv = &.{ "zlrd", "--service" } };
     var it = fake;
     try testing.expectError(error.MissingService, parseArgsFromIter(allocator, &it));
+}
+
+test "agent: --journal-unit collects with NAME=pattern" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--journal-unit",
+        "api=myapp.service",
+        "--journal-unit=worker=myapp@*.service",
+    } };
+    var it = fake;
+    const parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), parsed.journal_units.len);
+    try testing.expectEqualStrings("api=myapp.service", parsed.journal_units[0]);
+    try testing.expectEqualStrings("worker=myapp@*.service", parsed.journal_units[1]);
+}
+
+test "agent: missing --journal-unit value surfaces specific error" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--journal-unit" } };
+    var it = fake;
+    try testing.expectError(error.MissingJournalUnit, parseArgsFromIter(allocator, &it));
 }
 
 test "agent: bool flags parse" {

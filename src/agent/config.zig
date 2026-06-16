@@ -38,6 +38,14 @@ pub const ServiceSpec = struct {
     path: []const u8,
 };
 
+/// Binding between a logical service name and a systemd unit pattern.
+/// `pattern` may contain glob characters; it is passed through to
+/// `journalctl -u` verbatim.
+pub const JournalSpec = struct {
+    name: []const u8,
+    pattern: []const u8,
+};
+
 pub const SinkConfig = struct {
     stderr: bool,
     file_path: ?[]const u8,
@@ -60,11 +68,13 @@ pub const AgentConfig = struct {
     alert_exit: bool,
     services: []ServiceSpec,
     crash_markers: []const []const u8,
+    journal_units: []JournalSpec,
 
     pub fn deinit(self: *AgentConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.regex_rules);
         allocator.free(self.sinks.webhook_headers);
         allocator.free(self.services);
+        allocator.free(self.journal_units);
         self.* = undefined;
     }
 
@@ -111,6 +121,12 @@ pub const AgentConfig = struct {
             services[i] = try parseServiceSpec(spec);
         }
 
+        const journal_units = try allocator.alloc(JournalSpec, args.journal_units.len);
+        errdefer allocator.free(journal_units);
+        for (args.journal_units, 0..) |spec, i| {
+            journal_units[i] = try parseJournalSpec(spec);
+        }
+
         // Default sink: if the user enabled agent mode but specified no sink at all,
         // emit alerts to stderr so the process is never silently producing them.
         const any_sink = args.alert_stderr or args.alert_file != null or args.alert_webhooks.len > 0;
@@ -132,6 +148,7 @@ pub const AgentConfig = struct {
             .alert_exit = args.alert_exit_on_alert,
             .services = services,
             .crash_markers = args.crash_markers,
+            .journal_units = journal_units,
         };
     }
 };
@@ -141,6 +158,14 @@ pub fn parseServiceSpec(s: []const u8) ParseError!ServiceSpec {
     const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidServiceSpec;
     if (eq == 0 or eq == s.len - 1) return error.InvalidServiceSpec;
     return .{ .name = s[0..eq], .path = s[eq + 1 ..] };
+}
+
+/// Parses `NAME=UNIT_PATTERN`. Pattern is opaque — passed through to
+/// `journalctl -u`, which natively supports `*` and `?` globs.
+pub fn parseJournalSpec(s: []const u8) ParseError!JournalSpec {
+    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidServiceSpec;
+    if (eq == 0 or eq == s.len - 1) return error.InvalidServiceSpec;
+    return .{ .name = s[0..eq], .pattern = s[eq + 1 ..] };
 }
 
 /// Parses an `N/Ws` threshold spec into its components. `W` accepts the same
@@ -298,6 +323,22 @@ test "parseServiceSpec: rejects malformed input" {
     try testing.expectError(error.InvalidServiceSpec, parseServiceSpec("noequals"));
     try testing.expectError(error.InvalidServiceSpec, parseServiceSpec("=onlypath"));
     try testing.expectError(error.InvalidServiceSpec, parseServiceSpec("onlyname="));
+}
+
+test "parseJournalSpec: splits NAME=UNIT_PATTERN" {
+    const s = try parseJournalSpec("api=myapp.service");
+    try testing.expectEqualStrings("api", s.name);
+    try testing.expectEqualStrings("myapp.service", s.pattern);
+
+    const s2 = try parseJournalSpec("worker=myapp@*.service");
+    try testing.expectEqualStrings("worker", s2.name);
+    try testing.expectEqualStrings("myapp@*.service", s2.pattern);
+}
+
+test "parseJournalSpec: rejects malformed input" {
+    try testing.expectError(error.InvalidServiceSpec, parseJournalSpec("noequals"));
+    try testing.expectError(error.InvalidServiceSpec, parseJournalSpec("=onlypath"));
+    try testing.expectError(error.InvalidServiceSpec, parseJournalSpec("onlyname="));
 }
 
 test "AgentConfig: services parsed and serviceForPath lookup works" {

@@ -111,6 +111,7 @@ pub fn build(b: *std.Build) void {
         "src/agent/alert.zig",
         "src/agent/server.zig",
         "src/agent/service.zig",
+        "src/agent/journal.zig",
     }) |path| {
         const mod = b.createModule(.{
             .root_source_file = b.path(path),
