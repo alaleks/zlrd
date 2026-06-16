@@ -54,6 +54,9 @@ stderr, files, or HTTP webhooks.
   - [HTTP API](#http-api)
   - [Alert rules](#alert-rules)
   - [Alert sinks](#alert-sinks)
+  - [Service crash tracking](#service-crash-tracking)
+  - [systemd journal sources](#systemd-journal-sources)
+  - [Kernel-level probes](#kernel-level-probes)
   - [Webhook integration](#webhook-integration)
   - [Prometheus scrape config](#prometheus-scrape-config)
   - [Production deployment](#production-deployment)
@@ -76,6 +79,10 @@ stderr, files, or HTTP webhooks.
 - **Agent mode** — background watcher with:
   - `/metrics` (Prometheus text + JSON snapshot)
   - error-rate, regex-rate, first-seen and silence alert rules
+  - **per-service crash tracking** with stack-trace capture (Go / Python / Java / custom)
+  - **stop vs. restart** detection via file inode change and silence windows
+  - **systemd-journal** sources (`--journal-unit`) with wildcards
+  - **kernel-level probes** (`--kernel-probes`) — OOM, segfault, prior-boot panic; eBPF when `-Dwith-ebpf=true`
   - stderr / JSONL file / HTTP webhook sinks
 - **Single static binary** — no runtime, no glibc, no surprises
 
@@ -266,6 +273,26 @@ Scrape it:
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9100/metrics | head
 ```
 
+A richer invocation that uses all the optional features at once:
+
+```bash
+zlrd --agent \
+     --metrics-token=$(openssl rand -hex 16) \
+     --listen=127.0.0.1:9100 \
+     --alert-error-rate=10/60s \
+     --alert-regex='panic:1/30s' \
+     --alert-first-seen \
+     --alert-silence=120s \
+     --alert-file=/var/log/zlrd/alerts.jsonl \
+     --alert-webhook=https://alerts.internal/zlrd/ingest \
+     --webhook-header='Authorization: Bearer wh-secret' \
+     --service=api=/var/log/api.log \
+     --crash-marker='runtime error:' \
+     --journal-unit=workers='myapp@*.service' \
+     --kernel-probes \
+     /var/log/api.log /var/log/gateway.log
+```
+
 ### How it fits together
 
 ```
@@ -415,6 +442,184 @@ never silently swallowed.
 | `observed_count` | How many events were in the window when the rule latched              |
 | `line`           | The triggering log line (omitted for `silence`)                        |
 
+### Service crash tracking
+
+`zlrd` can monitor named services for **abnormal termination** — panics,
+fatals, unhandled exceptions — and surface them with a captured **stack
+trace** and a tally of how often a given service has died and restarted.
+
+Bind a service to a log file path:
+
+```bash
+zlrd --agent --metrics-token=$TOKEN \
+     --service=api=/var/log/api.log \
+     --service=worker=/var/log/worker.log \
+     /var/log/api.log /var/log/worker.log
+```
+
+#### What counts as a crash
+
+A crash fires when a log line matches any of the built-in markers below.
+You can also add custom regex patterns with `--crash-marker '<regex>'`
+(repeatable; extends the built-in set):
+
+| Language / shape  | Marker pattern                                |
+| ----------------- | --------------------------------------------- |
+| Go                | line contains `panic:`                        |
+| Python            | line contains `Traceback (most recent call last):` |
+| Java / Kotlin     | line contains `Exception in thread `          |
+| JSON / logfmt     | detected `level=fatal` or `level=panic`       |
+| User-defined      | `--crash-marker '<regex>'`                    |
+
+#### Stack-trace capture
+
+After a marker is detected, `zlrd` keeps reading subsequent lines and appends
+them to the trace until the continuation heuristic breaks (next "normal" log
+entry, blank line, byte/line cap). Captured into a fixed 4 KiB / 32-line
+buffer per service — **zero per-line heap activity**.
+
+Heuristic for "trace continuation":
+- starts with a tab or two+ spaces (Java / Python / Go indent)
+- starts with `goroutine ` / `[signal ` (Go)
+- starts with `Caused by:` (Java)
+- starts with `0x` (raw backtrace)
+- one leading blank line is tolerated (Go's `panic:` → blank → `goroutine`)
+
+#### Stop vs. restart
+
+`zlrd` distinguishes service termination from process recycling using
+**file-level signals only** (no PID guessing, no kernel hooks needed):
+
+- **`service_restart`** — the file's **inode changed** under the path
+  (logrotate, `mv old new`, `rm + recreate`, container restart writing to
+  a new log file). Resets the tracker's in-flight crash collection.
+- **`service_stop`** — after a crash event, the log goes silent for the
+  configured stop window (30 s default). Indicates the process died and
+  was not respawned.
+- **`service_crash`** — a marker matched. Includes stack trace and PID
+  if discoverable from the trigger line.
+
+#### Alert payload (service events)
+
+```json
+{
+  "ts_ms": 1781552666549,
+  "kind": "service_crash",
+  "service": "api",
+  "file": "/var/log/api.log",
+  "marker": "go_panic",
+  "pid": 1234,
+  "crash_count": 1,
+  "restart_count": 0,
+  "detail": "panic: nil pointer dereference",
+  "stack_trace": "goroutine 1 [running]:\n\tmain.crash(0x0)\n\t\t/app/main.go:42\n\tmain.main()\n"
+}
+```
+
+| Field           | Notes                                                                          |
+| --------------- | ------------------------------------------------------------------------------ |
+| `kind`          | `service_crash` · `service_stop` · `service_restart`                           |
+| `marker`        | `go_panic` · `python_traceback` · `java_exception` · `fatal_level` · `panic_level` · `custom_regex` · `systemd_signal` |
+| `pid`           | Parsed from `"pid":N`, `pid=N`, or `[N]:` if present in the trigger line       |
+| `crash_count`   | Cumulative crashes seen for this service since agent start                     |
+| `restart_count` | Cumulative restarts (inode changes) seen for this service                      |
+| `stack_trace`   | Captured continuation lines (omitted for `stop` / `restart`)                   |
+
+### systemd journal sources
+
+On modern Linux, most services no longer write to flat log files — their
+stdout/stderr is captured by **journald**. Point `zlrd` at a unit (or a
+glob) and it streams the journal directly:
+
+```bash
+zlrd --agent --metrics-token=$TOKEN \
+     --journal-unit=api='myapp.service' \
+     --journal-unit=workers='myapp@*.service'
+```
+
+How it works: one `journalctl -fu '<pattern>' --output=json --no-pager
+--since now` subprocess per `--journal-unit`. Each entry is parsed and
+classified:
+
+| Source of message               | What `zlrd` does                                |
+| ------------------------------- | ----------------------------------------------- |
+| App-level `panic:` / `Traceback` / `level=fatal` in `MESSAGE` | Routed to the per-unit crash tracker (same as file-backed services) |
+| systemd lifecycle (`Started`, `Stopped`, `Stopping`, `Reloading`, `Deactivated`) | **Silently dropped** — systemd already owns lifecycle; surfacing it is noise |
+| systemd crash signal (`Main process exited, code=killed/dumped`, `Failed with result 'signal' / 'core-dump' / 'oom-kill' / 'watchdog'`) | Fires `service_crash` with `marker=systemd_signal` |
+
+**Wildcards** (`myapp@*.service`) are passed verbatim to `journalctl -u`,
+which expands them natively. Inside the source `zlrd` keeps a per-unit
+tracker (capped at 256 distinct unit instances) so each running instance
+gets its own crash/stack-trace accounting.
+
+Journal sources **do not emit `service_stop` or `service_restart`** —
+systemd already tracks unit liveness and the user (you) explicitly asked
+for crashes only. The `file` field in the payload uses a pseudo-path:
+
+```json
+{
+  "kind": "service_crash",
+  "service": "workers",
+  "file": "journal://myapp@worker1.service",
+  "marker": "systemd_signal",
+  "pid": 5678,
+  "detail": "Main process exited, code=killed, status=11/SEGV"
+}
+```
+
+**Dedup**: if the application logged a panic right before systemd noticed
+the unit died, `zlrd` suppresses the systemd-side `service_crash` for that
+unit — the app-level event already captured the trace.
+
+The agent runs with `--journal-unit` alone — no positional log files
+required. Requires Linux with systemd; on macOS/Windows the source logs
+a one-line "unsupported" notice and stays idle.
+
+### Kernel-level probes
+
+`--kernel-probes` enables a Linux-only **kernel event monitor** that
+surfaces OOM kills, segfaults, and prior-boot kernel panics as alerts.
+Three backends layered for accuracy vs. portability:
+
+| Backend  | What it catches                                       | Requirements                                  |
+| -------- | ----------------------------------------------------- | --------------------------------------------- |
+| `pstore` | **Prior-boot kernel panic** — scans `/sys/fs/pstore/` and the `TAINT_DIE` bit of `/proc/sys/kernel/tainted` at agent startup | Linux, pstore enabled                         |
+| `kmsg`   | **OOM** (always-on), **segfault** (when `kernel.print-fatal-signals=1`) | Linux, read access to `/dev/kmsg` (CAP_SYSLOG or `adm` group) |
+| `ebpf`   | **OOM** via tracepoint `oom:mark_victim`; segfault tracepoint coming next | Linux ≥ 5.8, CAP_BPF + CAP_PERFMON, `zig build -Dwith-ebpf=true` |
+
+```bash
+# Stock build (kmsg + pstore)
+zlrd --agent --metrics-token=$TOKEN --kernel-probes /var/log/app.log
+
+# With eBPF backend compiled in
+zig build -Doptimize=ReleaseFast -Dwith-ebpf=true
+sudo setcap cap_bpf,cap_perfmon,cap_syslog+ep ./zig-out/bin/zlrd
+zlrd --agent --metrics-token=$TOKEN --kernel-probes /var/log/app.log
+```
+
+Kernel events flow through the same alert sinks (stderr / file / webhook)
+as everything else, with a distinct payload kind:
+
+```json
+{
+  "ts_ms": 1781552666549,
+  "kind": "kernel_oom",
+  "source": "kmsg",
+  "pid": 7421,
+  "comm": "myapp",
+  "detail": "Killed process 7421 (myapp), UID 1000, total-vm:..."
+}
+```
+
+**Important**: a running kernel panic is **impossible to catch from
+userspace** — the userspace process is dead by definition. The pstore
+backend is the only way to detect that a panic happened, and it only
+fires once at the agent's next startup after the affected boot.
+
+On non-Linux hosts (`--kernel-probes` on macOS or Windows) the flag is
+accepted and the monitor logs a one-line notice that the feature is
+unsupported, then stays idle.
+
 ### Webhook integration
 
 Webhook delivery is best-effort — failures are logged via `std.log` and the
@@ -545,20 +750,35 @@ Tips:
 
 ### Agent options
 
-| Flag                          | Value      | Description                                                         |
-| ----------------------------- | ---------- | ------------------------------------------------------------------- |
-| `    --agent`                 |            | Run as a background watcher                                         |
-| `    --listen`                | `<addr>`   | HTTP bind address — default `127.0.0.1:9100`                        |
-| `    --metrics-token`         | `<token>`  | Bearer token (mandatory)                                            |
-| `    --alert-error-rate`      | `<N/Ws>`   | Error spike threshold (e.g. `10/60s`)                               |
-| `    --alert-regex`           | `<spec>`   | `pattern:N/Ws` — repeatable                                         |
-| `    --alert-first-seen`      |            | Alert on novel normalized error signatures                          |
-| `    --alert-silence`         | `<Ws>`     | Heartbeat: alert when no lines arrive in window                     |
-| `    --alert-stderr`          |            | Sink: JSON to stderr                                                |
-| `    --alert-file`            | `<path>`   | Sink: append JSONL                                                  |
-| `    --alert-webhook`         | `<url>`    | Sink: POST JSON — repeatable                                        |
-| `    --webhook-header`        | `<K: V>`   | Extra header for all webhooks — repeatable                          |
-| `    --alert-exit`            |            | Exit non-zero on first alert                                        |
+| Flag                          | Value      | Description                                                                  |
+| ----------------------------- | ---------- | ---------------------------------------------------------------------------- |
+| `    --agent`                 |            | Run as a background watcher                                                  |
+| `    --listen`                | `<addr>`   | HTTP bind address — default `127.0.0.1:9100`                                 |
+| `    --metrics-token`         | `<token>`  | Bearer token (mandatory)                                                     |
+| `    --alert-error-rate`      | `<N/Ws>`   | Error spike threshold (e.g. `10/60s`)                                        |
+| `    --alert-regex`           | `<spec>`   | `pattern:N/Ws` — repeatable                                                  |
+| `    --alert-first-seen`      |            | Alert on novel normalized error signatures                                   |
+| `    --alert-silence`         | `<Ws>`     | Heartbeat: alert when no lines arrive in window                              |
+| `    --alert-stderr`          |            | Sink: JSON to stderr                                                         |
+| `    --alert-file`            | `<path>`   | Sink: append JSONL                                                           |
+| `    --alert-webhook`         | `<url>`    | Sink: POST JSON — repeatable                                                 |
+| `    --webhook-header`        | `<K: V>`   | Extra header for all webhooks — repeatable                                   |
+| `    --alert-exit`            |            | Exit non-zero on first alert                                                 |
+
+### Service / kernel options
+
+| Flag                          | Value          | Description                                                                  |
+| ----------------------------- | -------------- | ---------------------------------------------------------------------------- |
+| `    --service`               | `<NAME=PATH>`  | Bind a service name to a log file — repeatable                               |
+| `    --crash-marker`          | `<regex>`      | Additional crash pattern (extends the built-in set) — repeatable             |
+| `    --journal-unit`          | `<NAME=PATTERN>` | Track a systemd unit (glob supported) via `journalctl` — Linux, repeatable |
+| `    --kernel-probes`         |                | Enable OOM / segfault / prior-boot panic detection (Linux)                   |
+
+Build-time options:
+
+| Option                        | Default    | Effect                                                                       |
+| ----------------------------- | ---------- | ---------------------------------------------------------------------------- |
+| `-Dwith-ebpf=true`            | `false`    | Compile in the eBPF kernel-probe backend (Linux only, needs CAP_BPF at runtime) |
 
 Duration suffixes: `ms`, `s`, `m`, `h`.
 
@@ -575,8 +795,11 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Pre-built binaries for macOS, Linux, Windows
 - [x] Homebrew tap and apt repository
 - [x] **Agent mode: background watcher, HTTP metrics endpoint, alerting**
+- [x] **Per-service crash tracking** with stack-trace capture (Go / Python / Java / custom)
+- [x] **systemd-journal sources** (`--journal-unit`) with wildcards
+- [x] **Kernel-level probes** — kmsg/pstore baseline, eBPF backend behind `-Dwith-ebpf`
 - [ ] Sidecar mode: gRPC streaming to a central collector
-- [x] eBPF probes for kernel-level OOM, segfault, and panic detection
+- [ ] Native `sd-journal` reader (drop the `journalctl` subprocess)
 
 ---
 

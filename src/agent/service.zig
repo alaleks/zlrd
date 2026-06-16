@@ -1,4 +1,4 @@
-кл//! Service-level crash tracker.
+//! Service-level crash tracker.
 //!
 //! Per-service state machine that turns log-line observations into structured
 //! lifecycle events: `crash`, `stop`, `restart`. A "service" is whatever the
