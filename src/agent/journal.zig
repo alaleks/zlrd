@@ -25,6 +25,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const flags = @import("flags");
+const native = @import("journal");
 
 const alert = @import("alert.zig");
 const config = @import("config.zig");
@@ -282,13 +283,92 @@ pub const JournalSource = struct {
         if (self.child) |*c| c.kill(self.io);
     }
 
-    /// Blocks until `requestStop` is called or the subprocess exits.
+    /// Blocks until `requestStop` is called or the data source ends. Prefers
+    /// the native reader (binary parsing of `system.journal`) and falls back
+    /// to `journalctl` only when the journal directory is missing or we're
+    /// not on Linux.
     pub fn run(self: *JournalSource) !void {
         if (comptime builtin.os.tag != .linux) {
             log.info("journal source '{s}' is no-op on this platform", .{self.name});
             return;
         }
-        try self.spawnAndRead();
+        const path = native.source.findActiveJournalPath(self.allocator, self.io) catch |err| {
+            log.info("journal source '{s}' falling back to journalctl: {t}", .{ self.name, err });
+            try self.spawnAndRead();
+            return;
+        };
+        defer self.allocator.free(path);
+        log.info("journal source '{s}' tailing {s} natively", .{ self.name, path });
+        try self.tailNative(path);
+    }
+
+    fn tailNative(self: *JournalSource, path: []const u8) !void {
+        var r = native.Reader.open(self.io, std.Io.Dir.cwd(), path) catch |err| {
+            log.warn("native open of {s} failed ({t}); falling back to journalctl", .{ path, err });
+            try self.spawnAndRead();
+            return;
+        };
+        defer r.deinit();
+
+        var it = r.iterator();
+        // Drain the existing tail without dispatching — `--since now`
+        // semantics. We discover the iterator's resume position by reading
+        // every entry once and discarding.
+        while (try it.next(self.allocator)) |entry| {
+            var e = entry;
+            e.deinit();
+        }
+
+        var watcher = native.Watcher.init(self.io, &r, .{
+            .dir = std.Io.Dir.cwd(),
+            .path = path,
+        });
+        defer watcher.deinit();
+
+        while (!self.stop_flag.load(.monotonic)) {
+            if (!watcher.waitForChange(&self.stop_flag)) break;
+            it.refresh() catch |err| {
+                log.warn("journal source '{s}' refresh failed: {t}", .{ self.name, err });
+                continue;
+            };
+            while (try it.next(self.allocator)) |entry| {
+                var e = entry;
+                defer e.deinit();
+                self.handleNativeEntry(&e);
+            }
+        }
+    }
+
+    fn handleNativeEntry(self: *JournalSource, e: *const native.Entry) void {
+        const message = e.get("MESSAGE") orelse return;
+        if (message.len == 0) return;
+
+        const unit = e.get("_SYSTEMD_UNIT") orelse self.pattern;
+        if (!native.source.matchesUnitGlob(self.pattern, unit)) return;
+        const syslog_id = e.get("SYSLOG_IDENTIFIER") orelse "";
+        const priority = e.get("PRIORITY") orelse "";
+        const level = priorityToLevel(priority);
+        const pid_str = e.get("_PID");
+        const pid: ?u32 = if (pid_str) |s| std.fmt.parseInt(u32, s, 10) catch null else null;
+        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+
+        if (std.mem.eql(u8, syslog_id, "systemd")) {
+            switch (classifySystemdMessage(message)) {
+                .lifecycle, .other => return,
+                .crash_signal => {
+                    self.emitSystemdCrash(unit, pid, message, now_ms);
+                    return;
+                },
+            }
+        }
+
+        const tracker = self.trackerFor(unit, now_ms) orelse return;
+        if (tracker.observe(message, level, self.detector, now_ms)) |ev| {
+            self.dispatcher.dispatchService(ev, now_ms);
+        }
+        if (tracker.tick(now_ms, service.default_trace_flush_ms, service.default_stop_window_ms)) |ev| {
+            self.dispatcher.dispatchService(ev, now_ms);
+        }
     }
 
     fn spawnAndRead(self: *JournalSource) !void {

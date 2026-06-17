@@ -44,6 +44,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const journal_mod = b.createModule(.{
+        .root_source_file = b.path("src/journal/journal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/agent.zig"),
         .target = target,
@@ -54,6 +60,7 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("simd", simd_mod);
     agent_mod.addImport("kernel", kernel_mod);
     agent_mod.addImport("sidecar", sidecar_mod);
+    agent_mod.addImport("journal", journal_mod);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -131,6 +138,24 @@ pub fn build(b: *std.Build) void {
         mod.addImport("simd", simd_mod);
         mod.addImport("kernel", kernel_mod);
         mod.addImport("sidecar", sidecar_mod);
+        mod.addImport("journal", journal_mod);
+
+        const tests = b.addTest(.{ .root_module = mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    inline for ([_][]const u8{
+        "src/journal/format.zig",
+        "src/journal/lz4.zig",
+        "src/journal/reader.zig",
+        "src/journal/tail.zig",
+        "src/journal/source.zig",
+    }) |path| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        });
 
         const tests = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);

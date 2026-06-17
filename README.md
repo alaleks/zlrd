@@ -798,8 +798,8 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] **Per-service crash tracking** with stack-trace capture (Go / Python / Java / custom)
 - [x] **systemd-journal sources** (`--journal-unit`) with wildcards
 - [x] **Kernel-level probes** — kmsg/pstore baseline, eBPF backend behind `-Dwith-ebpf`
-- [ ] Sidecar mode: gRPC streaming to a central collector
-- [ ] Native `sd-journal` reader (drop the `journalctl` subprocess)
+- [x] Sidecar mode: gRPC streaming to a central collector
+- [x] Native `sd-journal` reader (drop the `journalctl` subprocess)
 
 ---
 
