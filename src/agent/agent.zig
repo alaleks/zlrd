@@ -18,6 +18,7 @@ pub const watcher = @import("watcher.zig");
 pub const webhook = @import("webhook.zig");
 pub const journal = @import("journal.zig");
 pub const service = @import("service.zig");
+pub const exporter = @import("exporter.zig");
 
 const log = std.log.scoped(.zlrd_agent);
 
@@ -27,6 +28,8 @@ pub const RunError = error{
 } || config.ParseError || error{
     OutOfMemory,
     InvalidRegexPattern,
+    TlsRequired,
+    InvalidUrl,
 };
 
 /// Runs agent mode until `--alert-exit` fires or the process receives a stop
@@ -56,6 +59,39 @@ pub fn run(
         sender_storage = try webhook.Sender.init(allocator, io, cfg.sinks.webhook_headers);
         dispatcher.setWebhookSender(webhook.sendThunk, &sender_storage.?);
     }
+
+    // Sidecar exporter — OTLP/HTTP stream of alerts + metrics. Set up
+    // before the watcher runs so no early events are missed.
+    var sidecar_headers_storage: []std.http.Header = &.{};
+    defer if (sidecar_headers_storage.len > 0) allocator.free(sidecar_headers_storage);
+    var sidecar_storage: ?exporter.Sidecar = null;
+    defer if (sidecar_storage) |*s| s.deinit();
+    if (cfg.sidecar.enabled()) {
+        sidecar_headers_storage = try allocator.alloc(std.http.Header, cfg.sidecar.headers.len);
+        for (cfg.sidecar.headers, 0..) |h, i| {
+            sidecar_headers_storage[i] = .{ .name = h.name, .value = h.value };
+        }
+        sidecar_storage = try exporter.Sidecar.init(allocator, io, .{
+            .base_url = cfg.sidecar.url.?,
+            .headers = sidecar_headers_storage,
+            .flush_interval_ms = cfg.sidecar.flush_interval_ms,
+            .max_queue = cfg.sidecar.batch_size,
+            .metrics = &m,
+        });
+        try sidecar_storage.?.start();
+        dispatcher.setSidecarSink(.{
+            .record_fired = exporter.recordFiredThunk,
+            .record_kernel = exporter.recordKernelThunk,
+            .record_service = exporter.recordServiceThunk,
+            .ctx = &sidecar_storage.?,
+        });
+        log.info("sidecar exporting to {s} every {d}ms (queue cap {d})", .{
+            cfg.sidecar.url.?,
+            cfg.sidecar.flush_interval_ms,
+            cfg.sidecar.batch_size,
+        });
+    }
+    defer if (sidecar_storage) |*s| s.stop();
 
     var srv = try server.Server.listen(allocator, io, &m, .{
         .listen_addr = cfg.listen_addr,

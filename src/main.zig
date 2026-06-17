@@ -249,6 +249,10 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.MissingAlertFile => "missing value for --alert-file",
         error.MissingAlertWebhook => "missing value for --alert-webhook",
         error.MissingWebhookHeader => "missing value for --webhook-header",
+        error.MissingSidecarUrl => "missing value for --sidecar",
+        error.MissingSidecarHeader => "missing value for --sidecar-header",
+        error.MissingSidecarFlushInterval => "missing value for --sidecar-flush-interval",
+        error.MissingSidecarBatchSize => "missing value for --sidecar-batch-size",
         else => @errorName(err),
     };
 }
@@ -263,6 +267,9 @@ fn agentErrorMessage(err: anyerror) []const u8 {
         error.InvalidRegexSpec => "invalid --alert-regex spec (expected <pattern>:N/Ws)",
         error.InvalidRegexPattern => "invalid regex pattern in --alert-regex",
         error.InvalidHeaderSpec => "invalid --webhook-header spec (expected 'Name: Value')",
+        error.InvalidBatchSize => "invalid --sidecar-batch-size (expected positive integer)",
+        error.InvalidSidecarUrl => "invalid --sidecar URL (must start with https://)",
+        error.TlsRequired => "sidecar requires an https:// URL",
         else => runtimeErrorMessage(err),
     };
 }
@@ -273,6 +280,7 @@ fn agentErrorHint(err: anyerror) ?[]const u8 {
         error.MissingMetricsToken => "generate one and export it: --metrics-token=$(openssl rand -hex 16)",
         error.InvalidThresholdSpec => "example: --alert-error-rate 10/60s",
         error.InvalidRegexSpec => "example: --alert-regex 'panic:5/30s'",
+        error.InvalidSidecarUrl, error.TlsRequired => "example: --sidecar https://collector.example.com:4318",
         else => null,
     };
 }

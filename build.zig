@@ -38,6 +38,12 @@ pub fn build(b: *std.Build) void {
     });
     kernel_mod.addImport("build_options", build_options_mod);
 
+    const sidecar_mod = b.createModule(.{
+        .root_source_file = b.path("src/sidecar/sidecar.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/agent.zig"),
         .target = target,
@@ -47,6 +53,7 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("regex", regex_mod);
     agent_mod.addImport("simd", simd_mod);
     agent_mod.addImport("kernel", kernel_mod);
+    agent_mod.addImport("sidecar", sidecar_mod);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -112,6 +119,7 @@ pub fn build(b: *std.Build) void {
         "src/agent/server.zig",
         "src/agent/service.zig",
         "src/agent/journal.zig",
+        "src/agent/exporter.zig",
     }) |path| {
         const mod = b.createModule(.{
             .root_source_file = b.path(path),
@@ -122,6 +130,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("regex", regex_mod);
         mod.addImport("simd", simd_mod);
         mod.addImport("kernel", kernel_mod);
+        mod.addImport("sidecar", sidecar_mod);
 
         const tests = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);
@@ -140,6 +149,26 @@ pub fn build(b: *std.Build) void {
         mod.addImport("build_options", build_options_mod);
 
         const tests = b.addTest(.{ .root_module = mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    inline for ([_][]const u8{
+        "src/sidecar/protobuf.zig",
+        "src/sidecar/otlp.zig",
+        "src/sidecar/transport.zig",
+    }) |path| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const tests = b.addTest(.{ .root_module = mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    {
+        const tests = b.addTest(.{ .root_module = sidecar_mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 

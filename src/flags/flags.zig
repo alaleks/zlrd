@@ -102,6 +102,12 @@ pub const Args = struct {
     crash_markers: []const []const u8 = &.{},
     journal_units: []const []const u8 = &.{},
 
+    // Sidecar mode flags. See src/sidecar/ for the implementation.
+    sidecar_url: ?[]const u8 = null,
+    sidecar_headers: []const []const u8 = &.{},
+    sidecar_flush_interval: ?[]const u8 = null,
+    sidecar_batch_size: ?[]const u8 = null,
+
     pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
         allocator.free(self.files);
@@ -127,6 +133,11 @@ pub const Args = struct {
         allocator.free(self.crash_markers);
         for (self.journal_units) |s| allocator.free(s);
         allocator.free(self.journal_units);
+        if (self.sidecar_url) |s| allocator.free(s);
+        if (self.sidecar_flush_interval) |s| allocator.free(s);
+        if (self.sidecar_batch_size) |s| allocator.free(s);
+        for (self.sidecar_headers) |s| allocator.free(s);
+        allocator.free(self.sidecar_headers);
     }
 
     pub fn isLevelEnabled(self: Args, lvl: Level) bool {
@@ -160,6 +171,10 @@ pub const ParseError = error{
     MissingService,
     MissingCrashMarker,
     MissingJournalUnit,
+    MissingSidecarUrl,
+    MissingSidecarHeader,
+    MissingSidecarFlushInterval,
+    MissingSidecarBatchSize,
     UnknownArgument,
     OutOfMemory,
 };
@@ -253,6 +268,16 @@ pub fn printHelp() void {
         "      " ++ lo ++ "--journal-unit" ++ r ++
         "     " ++ ar ++ "<N=PAT>  " ++ r ++ "  Track systemd journal unit (glob ok)  " ++ ar ++ "(repeatable, Linux)" ++ r ++ "\n" ++
         "\n" ++
+        b ++ "Sidecar mode (OTLP/HTTP)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--sidecar" ++ r ++
+        "          " ++ ar ++ "<url>    " ++ r ++ "  OTLP/HTTP base URL (https only)  " ++ ar ++ "e.g. https://collector:4318" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--sidecar-header" ++ r ++
+        "   " ++ ar ++ "<K: V>   " ++ r ++ "  Extra header for OTLP requests  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--sidecar-flush-interval" ++ r ++
+        " " ++ ar ++ "<dur>" ++ r ++ "    Flush cadence  " ++ ar ++ "(default 5s)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--sidecar-batch-size" ++ r ++
+        "     " ++ ar ++ "<N>  " ++ r ++ "    Max queued events between flushes  " ++ ar ++ "(default 1024)" ++ r ++ "\n" ++
+        "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd -l error,warn app.log" ++ r ++ "\n" ++
@@ -295,6 +320,7 @@ const ParseBuffers = struct {
     services: std.ArrayList([]const u8),
     crash_markers: std.ArrayList([]const u8),
     journal_units: std.ArrayList([]const u8),
+    sidecar_headers: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) !ParseBuffers {
         return .{
@@ -305,6 +331,7 @@ const ParseBuffers = struct {
             .services = .empty,
             .crash_markers = .empty,
             .journal_units = .empty,
+            .sidecar_headers = .empty,
         };
     }
 
@@ -316,6 +343,7 @@ const ParseBuffers = struct {
         freeStringList(allocator, &self.services);
         freeStringList(allocator, &self.crash_markers);
         freeStringList(allocator, &self.journal_units);
+        freeStringList(allocator, &self.sidecar_headers);
     }
 
     fn transferInto(self: *ParseBuffers, allocator: std.mem.Allocator, parsed: *Args) !void {
@@ -326,6 +354,7 @@ const ParseBuffers = struct {
         parsed.services = try self.services.toOwnedSlice(allocator);
         parsed.crash_markers = try self.crash_markers.toOwnedSlice(allocator);
         parsed.journal_units = try self.journal_units.toOwnedSlice(allocator);
+        parsed.sidecar_headers = try self.sidecar_headers.toOwnedSlice(allocator);
     }
 };
 
@@ -473,11 +502,12 @@ fn parseLongFlag(
 
 fn isValuedLongFlag(flag: []const u8) bool {
     const names = [_][]const u8{
-        "file",          "search",         "level",            "date",
-        "num-lines",     "aggregate-mode", "from",             "to",
-        "listen",        "metrics-token",  "alert-error-rate", "alert-regex",
-        "alert-silence", "alert-file",     "alert-webhook",    "webhook-header",
-        "service",       "crash-marker",   "journal-unit",
+        "file",           "search",                 "level",              "date",
+        "num-lines",      "aggregate-mode",         "from",               "to",
+        "listen",         "metrics-token",          "alert-error-rate",   "alert-regex",
+        "alert-silence",  "alert-file",             "alert-webhook",      "webhook-header",
+        "service",        "crash-marker",           "journal-unit",       "sidecar",
+        "sidecar-header", "sidecar-flush-interval", "sidecar-batch-size",
     };
     for (names) |n| {
         if (std.mem.eql(u8, flag, n)) return true;
@@ -576,6 +606,22 @@ fn applyValuedLongFlag(
         try appendString(allocator, &bufs.journal_units, val);
         return true;
     }
+    if (std.mem.eql(u8, flag, "sidecar")) {
+        try replaceOwnedString(allocator, &parsed.sidecar_url, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "sidecar-header")) {
+        try appendString(allocator, &bufs.sidecar_headers, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "sidecar-flush-interval")) {
+        try replaceOwnedString(allocator, &parsed.sidecar_flush_interval, val);
+        return true;
+    }
+    if (std.mem.eql(u8, flag, "sidecar-batch-size")) {
+        try replaceOwnedString(allocator, &parsed.sidecar_batch_size, val);
+        return true;
+    }
     return false;
 }
 
@@ -600,6 +646,10 @@ fn missingValueError(flag: []const u8) ParseError {
     if (std.mem.eql(u8, flag, "service")) return error.MissingService;
     if (std.mem.eql(u8, flag, "crash-marker")) return error.MissingCrashMarker;
     if (std.mem.eql(u8, flag, "journal-unit")) return error.MissingJournalUnit;
+    if (std.mem.eql(u8, flag, "sidecar")) return error.MissingSidecarUrl;
+    if (std.mem.eql(u8, flag, "sidecar-header")) return error.MissingSidecarHeader;
+    if (std.mem.eql(u8, flag, "sidecar-flush-interval")) return error.MissingSidecarFlushInterval;
+    if (std.mem.eql(u8, flag, "sidecar-batch-size")) return error.MissingSidecarBatchSize;
     return error.InvalidArgument;
 }
 

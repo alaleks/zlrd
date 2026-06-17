@@ -18,6 +18,16 @@ const service = @import("service.zig");
 /// on `webhook.zig` (which pulls in std.http). Set after construction.
 pub const WebhookSender = *const fn (ctx: ?*anyopaque, url: []const u8, payload: []const u8) void;
 
+/// Sidecar sink: three thunks that mirror the three dispatch entry points.
+/// Set after construction via `setSidecarSink`. Implementations live in
+/// `sidecar.zig` — they enqueue OTLP log records for async delivery.
+pub const SidecarSink = struct {
+    record_fired: *const fn (ctx: ?*anyopaque, fired: rules.Fired, now_ms: i64) void,
+    record_kernel: *const fn (ctx: ?*anyopaque, ev: kernel.KernelEvent, now_ms: i64) void,
+    record_service: *const fn (ctx: ?*anyopaque, ev: service.ServiceEvent, now_ms: i64) void,
+    ctx: ?*anyopaque,
+};
+
 /// Thunk that adapts `Dispatcher.dispatchKernel` to the `kernel.Sink`
 /// signature. `ctx` must be a `*Dispatcher`. Reads wall-clock ms internally
 /// so callers don't have to thread `std.Io` through.
@@ -38,6 +48,7 @@ pub const Dispatcher = struct {
     alert_exit: bool,
     webhook_sender: ?WebhookSender,
     webhook_ctx: ?*anyopaque,
+    sidecar_sink: ?SidecarSink,
 
     pub fn init(
         io: std.Io,
@@ -62,12 +73,17 @@ pub const Dispatcher = struct {
             .alert_exit = alert_exit,
             .webhook_sender = null,
             .webhook_ctx = null,
+            .sidecar_sink = null,
         };
     }
 
     pub fn setWebhookSender(self: *Dispatcher, sender: WebhookSender, ctx: ?*anyopaque) void {
         self.webhook_sender = sender;
         self.webhook_ctx = ctx;
+    }
+
+    pub fn setSidecarSink(self: *Dispatcher, sink: SidecarSink) void {
+        self.sidecar_sink = sink;
     }
 
     pub fn deinit(self: *Dispatcher) void {
@@ -99,6 +115,7 @@ pub const Dispatcher = struct {
         if (self.webhook_sender) |send| {
             for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
         }
+        if (self.sidecar_sink) |sink| sink.record_service(sink.ctx, event, now_ms);
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
 
@@ -121,6 +138,7 @@ pub const Dispatcher = struct {
         if (self.webhook_sender) |send| {
             for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
         }
+        if (self.sidecar_sink) |sink| sink.record_kernel(sink.ctx, event, now_ms);
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
 
@@ -141,6 +159,7 @@ pub const Dispatcher = struct {
                 send(self.webhook_ctx, url, payload);
             }
         }
+        if (self.sidecar_sink) |sink| sink.record_fired(sink.ctx, fired, now_ms);
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
 

@@ -31,6 +31,8 @@ pub const ParseError = error{
     InvalidHeaderSpec,
     InvalidServiceSpec,
     MissingMetricsToken,
+    InvalidBatchSize,
+    InvalidSidecarUrl,
 };
 
 pub const ServiceSpec = struct {
@@ -57,6 +59,19 @@ pub const SinkConfig = struct {
     }
 };
 
+/// Sidecar export config. `enabled = url != null`. Defaults: 5s flush, 1024
+/// batch. Headers are pre-parsed `Name: Value` pairs.
+pub const SidecarConfig = struct {
+    url: ?[]const u8,
+    headers: []HeaderSpec,
+    flush_interval_ms: u64,
+    batch_size: u32,
+
+    pub fn enabled(self: SidecarConfig) bool {
+        return self.url != null;
+    }
+};
+
 pub const AgentConfig = struct {
     listen_addr: []const u8,
     metrics_token: []const u8,
@@ -69,12 +84,14 @@ pub const AgentConfig = struct {
     services: []ServiceSpec,
     crash_markers: []const []const u8,
     journal_units: []JournalSpec,
+    sidecar: SidecarConfig,
 
     pub fn deinit(self: *AgentConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.regex_rules);
         allocator.free(self.sinks.webhook_headers);
         allocator.free(self.services);
         allocator.free(self.journal_units);
+        allocator.free(self.sidecar.headers);
         self.* = undefined;
     }
 
@@ -127,6 +144,24 @@ pub const AgentConfig = struct {
             journal_units[i] = try parseJournalSpec(spec);
         }
 
+        const sidecar_headers = try allocator.alloc(HeaderSpec, args.sidecar_headers.len);
+        errdefer allocator.free(sidecar_headers);
+        for (args.sidecar_headers, 0..) |spec, i| {
+            sidecar_headers[i] = try parseHeaderSpec(spec);
+        }
+
+        const sidecar_flush_ms: u64 = if (args.sidecar_flush_interval) |s|
+            try parseDuration(s)
+        else
+            5_000;
+        const sidecar_batch_size: u32 = if (args.sidecar_batch_size) |s|
+            std.fmt.parseInt(u32, s, 10) catch return error.InvalidBatchSize
+        else
+            1024;
+        if (args.sidecar_url) |url| {
+            if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidSidecarUrl;
+        }
+
         // Default sink: if the user enabled agent mode but specified no sink at all,
         // emit alerts to stderr so the process is never silently producing them.
         const any_sink = args.alert_stderr or args.alert_file != null or args.alert_webhooks.len > 0;
@@ -149,6 +184,12 @@ pub const AgentConfig = struct {
             .services = services,
             .crash_markers = args.crash_markers,
             .journal_units = journal_units,
+            .sidecar = .{
+                .url = args.sidecar_url,
+                .headers = sidecar_headers,
+                .flush_interval_ms = sidecar_flush_ms,
+                .batch_size = sidecar_batch_size,
+            },
         };
     }
 };
