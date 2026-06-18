@@ -302,22 +302,52 @@ pub const JournalSource = struct {
         try self.tailNative(path);
     }
 
-    fn tailNative(self: *JournalSource, path: []const u8) !void {
-        var r = native.Reader.open(self.io, std.Io.Dir.cwd(), path) catch |err| {
-            log.warn("native open of {s} failed ({t}); falling back to journalctl", .{ path, err });
-            try self.spawnAndRead();
-            return;
-        };
+    fn tailNative(self: *JournalSource, initial_path: []const u8) !void {
+        // The active path can change while we tail — on rotation, systemd
+        // moves `system.journal` aside and creates a fresh one. We keep
+        // ownership of the path string in this local so reopen calls can
+        // free the old one without dangling references.
+        var path = try self.allocator.dupe(u8, initial_path);
+        defer self.allocator.free(path);
+
+        while (!self.stop_flag.load(.monotonic)) {
+            const continue_tail = self.tailOneFile(path) catch |err| {
+                log.warn("native tail of {s} failed: {t}; falling back to journalctl", .{ path, err });
+                try self.spawnAndRead();
+                return;
+            };
+            if (!continue_tail) return;
+
+            // Rotation: rediscover the current `system.journal` and loop.
+            const fresh = native.source.findActiveJournalPath(self.allocator, self.io) catch |err| {
+                log.warn("journal source '{s}' lost active file after rotation: {t}", .{ self.name, err });
+                return;
+            };
+            self.allocator.free(path);
+            path = fresh;
+            log.info("journal source '{s}' followed rotation to {s}", .{ self.name, path });
+        }
+    }
+
+    /// Tails `path` until rotation or shutdown. Returns true if rotation
+    /// happened (caller should rediscover and retry), false if the loop
+    /// exited cleanly (stop requested).
+    fn tailOneFile(self: *JournalSource, path: []const u8) !bool {
+        var r = try native.Reader.open(self.io, std.Io.Dir.cwd(), path);
         defer r.deinit();
 
         var it = r.iterator();
-        // Drain the existing tail without dispatching — `--since now`
-        // semantics. We discover the iterator's resume position by reading
-        // every entry once and discarding.
-        while (try it.next(self.allocator)) |entry| {
-            var e = entry;
-            e.deinit();
-        }
+        // Bulk-skip existing entries without resolving each entry's fields.
+        // `seekToEnd` walks just the entry-array chain headers (no data
+        // payload reads, no LZ4 decode, no per-entry arena), so even a
+        // multi-GB journal is past in tens of milliseconds.
+        try it.seekToEnd();
+
+        // Enable the DATA-object cache for live tailing — hot fields like
+        // `_SYSTEMD_UNIT` are referenced by every entry of a service and
+        // would otherwise hit the disk (+LZ4) once per entry.
+        try it.enableCache(self.allocator);
+        defer it.disableCache(self.allocator);
 
         var watcher = native.Watcher.init(self.io, &r, .{
             .dir = std.Io.Dir.cwd(),
@@ -326,7 +356,11 @@ pub const JournalSource = struct {
         defer watcher.deinit();
 
         while (!self.stop_flag.load(.monotonic)) {
-            if (!watcher.waitForChange(&self.stop_flag)) break;
+            switch (watcher.waitForChange(&self.stop_flag)) {
+                .stop => return false,
+                .rotated, .deleted => return true,
+                .modified => {},
+            }
             it.refresh() catch |err| {
                 log.warn("journal source '{s}' refresh failed: {t}", .{ self.name, err });
                 continue;
@@ -337,6 +371,7 @@ pub const JournalSource = struct {
                 self.handleNativeEntry(&e);
             }
         }
+        return false;
     }
 
     fn handleNativeEntry(self: *JournalSource, e: *const native.Entry) void {

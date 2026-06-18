@@ -123,13 +123,12 @@ pub fn decompressBlock(src: []const u8, dst: []u8) Error!usize {
     return dp;
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────
-
-const testing = std.testing;
+// ─── Test helpers (exported for the journal reader's own tests) ─────────
 
 /// Encodes `input` as a single all-literal LZ4 block. Useful for crafting
 /// known-good fixtures in tests without depending on a real encoder.
-fn encodeAllLiterals(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+/// Exported so `reader.zig`'s SyntheticBuilder can reuse it.
+pub fn encodeAllLiterals(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
@@ -149,6 +148,10 @@ fn encodeAllLiterals(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     try out.appendSlice(allocator, input);
     return out.toOwnedSlice(allocator);
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
 
 test "all-literal block round-trips" {
     const payload = "MESSAGE=hello world from lz4";

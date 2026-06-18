@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const fmt = @import("format.zig");
 const reader_mod = @import("reader.zig");
 const tail_mod = @import("tail.zig");
 
@@ -26,24 +27,58 @@ pub const DiscoveryError = error{
     JournalDirNotFound,
 } || std.mem.Allocator.Error;
 
-/// Returns an owned path to the active `system.journal` file. Prefers the
-/// persistent location over the volatile one — matches systemd's own
-/// preference order. Caller frees with `allocator`.
+/// Returns an owned path to the active `system.journal` file. Walks both
+/// the persistent (`/var/log/journal`) and volatile (`/run/log/journal`)
+/// roots and picks the one whose header's `tail_entry_realtime` is freshest
+/// — matches the behavior of systemd's own writer when both directories
+/// are populated (e.g. transient → persistent migration). Falls back to the
+/// systemd-default persistent-over-volatile preference if neither file is
+/// readable. Caller frees with `allocator`.
 pub fn findActiveJournalPath(allocator: std.mem.Allocator, io: std.Io) DiscoveryError![]u8 {
     if (comptime builtin.os.tag != .linux) return error.NotLinux;
 
     var mid_buf: [40]u8 = undefined;
     const mid = try readMachineId(io, &mid_buf);
 
+    var best_path: ?[]u8 = null;
+    errdefer if (best_path) |p| allocator.free(p);
+    var best_realtime: u64 = 0;
+
     for ([_][]const u8{ persistent_root, volatile_root }) |root| {
         const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{
             root, mid, system_journal_basename,
         });
-        errdefer allocator.free(candidate);
-        if (pathExists(io, candidate)) return candidate;
-        allocator.free(candidate);
+        var keep = false;
+        defer if (!keep) allocator.free(candidate);
+
+        const rt = journalTailRealtime(io, candidate) catch continue;
+        // Either no contender yet, or this file's tail is newer.
+        if (best_path == null or rt > best_realtime) {
+            if (best_path) |old| allocator.free(old);
+            best_path = candidate;
+            best_realtime = rt;
+            keep = true;
+        }
     }
-    return error.JournalDirNotFound;
+
+    return best_path orelse error.JournalDirNotFound;
+}
+
+/// Reads just enough of a journal file's header to extract the writer's
+/// `tail_entry_realtime` (the wall-clock microseconds of the most recent
+/// entry). Cheaper than opening a full `Reader` since we don't validate
+/// the rest of the file.
+fn journalTailRealtime(io: std.Io, path: []const u8) !u64 {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return error.OpenFailed;
+    defer f.close(io);
+
+    var hdr_bytes: [@sizeOf(fmt.Header)]u8 = undefined;
+    const n = f.readPositional(io, &.{&hdr_bytes}, 0) catch return error.ReadFailed;
+    if (n != hdr_bytes.len) return error.ReadFailed;
+
+    const hdr = std.mem.bytesAsValue(fmt.Header, &hdr_bytes).*;
+    if (!std.mem.eql(u8, &hdr.signature, &fmt.signature_magic)) return error.BadMagic;
+    return hdr.tail_entry_realtime;
 }
 
 fn readMachineId(io: std.Io, buf: []u8) DiscoveryError![]const u8 {
@@ -59,42 +94,45 @@ fn readMachineId(io: std.Io, buf: []u8) DiscoveryError![]const u8 {
     return buf[0..trimmed.len];
 }
 
-fn pathExists(io: std.Io, path: []const u8) bool {
-    const f = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return false;
-    f.close(io);
-    return true;
-}
 
-/// True if `unit` matches the user-supplied `pattern`. The pattern syntax is
-/// the same shell-style glob that `journalctl -u` accepts, restricted to the
-/// `*` wildcard (no `?`, no character classes) — sufficient for everything
-/// agent mode realistically encounters.
+/// True if `unit` matches the user-supplied `pattern`. The pattern syntax
+/// is the same shell-style glob that `journalctl -u` accepts, restricted
+/// to the `*` wildcard (no `?`, no character classes).
+///
+/// Implemented as an iterative two-pointer match with backtracking. The
+/// previous recursive implementation was O(2^n) for patterns like
+/// `*a*a*a*a*` against `aaaa...`; this one is O(n*m).
 pub fn matchesUnitGlob(pattern: []const u8, unit: []const u8) bool {
-    return globMatch(pattern, 0, unit, 0);
-}
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var star_text: usize = 0;
 
-fn globMatch(pat: []const u8, pi: usize, txt: []const u8, ti: usize) bool {
-    var p = pi;
-    var t = ti;
-    while (p < pat.len) {
-        switch (pat[p]) {
-            '*' => {
-                // Skip consecutive stars.
-                while (p < pat.len and pat[p] == '*') p += 1;
-                if (p == pat.len) return true; // trailing `*` matches the rest
-                while (t <= txt.len) : (t += 1) {
-                    if (globMatch(pat, p, txt, t)) return true;
-                }
-                return false;
-            },
-            else => {
-                if (t >= txt.len or pat[p] != txt[t]) return false;
-                p += 1;
-                t += 1;
-            },
+    while (t < unit.len) {
+        if (p < pattern.len and pattern[p] == '*') {
+            // Collapse runs of `**` and remember where to backtrack to.
+            while (p < pattern.len and pattern[p] == '*') p += 1;
+            star = p;
+            star_text = t;
+            if (p == pattern.len) return true;
+            continue;
         }
+        if (p < pattern.len and pattern[p] == unit[t]) {
+            p += 1;
+            t += 1;
+            continue;
+        }
+        if (star) |sp| {
+            // Back off: the `*` we last saw must swallow one more byte of `unit`.
+            p = sp;
+            star_text += 1;
+            t = star_text;
+            continue;
+        }
+        return false;
     }
-    return t == txt.len;
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

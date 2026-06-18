@@ -23,6 +23,22 @@ const log = std.log.scoped(.zlrd_journal_tail);
 /// blocking syscall.
 pub const StopFlag = std.atomic.Value(bool);
 
+/// What caused `waitForChange` to wake up. Callers behave differently for
+/// modify (drain new entries) vs rotated/deleted (reopen the file from
+/// the directory).
+pub const WakeReason = enum {
+    /// `stop_flag` was set or the underlying syscall reported an error.
+    stop,
+    /// The file was modified (data appended).
+    modified,
+    /// The file was renamed away from its watched path. Real systemd
+    /// rotation moves `system.journal` aside to `system@<id>.journal`.
+    rotated,
+    /// The watched path was unlinked. Practically the same as `rotated`
+    /// for our purposes — we need to re-discover the active file.
+    deleted,
+};
+
 pub const Options = struct {
     /// Where the .journal file lives on disk. Required for the inotify watch
     /// (and for the poll fallback's `statFile`).
@@ -67,20 +83,20 @@ pub const Watcher = struct {
         }
     }
 
-    /// Blocks until the file changes or `stop_flag` is set. Returns true if a
-    /// change was observed, false on stop. The polling fallback wakes on its
-    /// own interval and checks the flag.
-    pub fn waitForChange(self: *Watcher, stop_flag: *StopFlag) bool {
+    /// Blocks until the file changes or `stop_flag` is set. Returns the
+    /// reason for waking: `.modified` for normal appends, `.rotated`/
+    /// `.deleted` when the file moved or disappeared (caller should reopen),
+    /// `.stop` when shut down.
+    pub fn waitForChange(self: *Watcher, stop_flag: *StopFlag) WakeReason {
         if (builtin.os.tag == .linux and self.inotify_fd >= 0) {
             return self.waitInotify(stop_flag);
         }
         return self.waitPolling(stop_flag);
     }
 
-    fn waitInotify(self: *Watcher, stop_flag: *StopFlag) bool {
-        // Block on inotify_fd in chunks so we can re-check stop_flag every
-        // `poll_interval_ms` even if no event ever arrives.
-        var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
+    fn waitInotify(self: *Watcher, stop_flag: *StopFlag) WakeReason {
+        const linux = std.os.linux;
+        var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
         while (!stop_flag.load(.acquire)) {
             // poll() with a timeout lets the loop honor stop_flag.
             var pfd = [_]std.posix.pollfd{.{
@@ -88,27 +104,52 @@ pub const Watcher = struct {
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = std.posix.poll(&pfd, @intCast(self.opts.poll_interval_ms)) catch return false;
+            const ready = std.posix.poll(&pfd, @intCast(self.opts.poll_interval_ms)) catch return .stop;
             if (ready == 0) continue;
-            const n = std.posix.read(@intCast(self.inotify_fd), &buf) catch return false;
-            if (n > 0) return true;
+            // POLLHUP/POLLERR mean the fd is unusable — exit instead of
+            // spinning on a dead descriptor.
+            if ((pfd[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) return .stop;
+            if ((pfd[0].revents & std.posix.POLL.IN) == 0) continue;
+
+            const n = std.posix.read(@intCast(self.inotify_fd), &buf) catch return .stop;
+            if (n == 0) continue;
+
+            // Walk the event packet. Any DELETE/MOVE wins over a plain
+            // MODIFY — rotation needs the caller's full attention.
+            var reason: WakeReason = .modified;
+            var off: usize = 0;
+            const hdr_sz = @sizeOf(linux.inotify_event);
+            while (off + hdr_sz <= n) {
+                const ev_ptr: *const linux.inotify_event = @ptrCast(@alignCast(&buf[off]));
+                const mask = ev_ptr.mask;
+                if ((mask & linux.IN.MOVE_SELF) != 0) reason = .rotated;
+                if ((mask & linux.IN.DELETE_SELF) != 0) reason = .deleted;
+                off += hdr_sz + ev_ptr.len;
+            }
+            return reason;
         }
-        return false;
+        return .stop;
     }
 
-    fn waitPolling(self: *Watcher, stop_flag: *StopFlag) bool {
+    fn waitPolling(self: *Watcher, stop_flag: *StopFlag) WakeReason {
         while (!stop_flag.load(.acquire)) {
             const size = self.statFile() catch {
-                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(self.opts.poll_interval_ms), .awake) catch {};
-                continue;
+                // Path went away — treat as deletion so the agent can
+                // reopen against the freshly-rotated file.
+                return .deleted;
             };
+            if (size < self.last_size) {
+                // File truncated — practically equivalent to a fresh file.
+                self.last_size = size;
+                return .rotated;
+            }
             if (size != self.last_size) {
                 self.last_size = size;
-                return true;
+                return .modified;
             }
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(self.opts.poll_interval_ms), .awake) catch return false;
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(self.opts.poll_interval_ms), .awake) catch return .stop;
         }
-        return false;
+        return .stop;
     }
 
     fn statFile(self: *Watcher) !u64 {
@@ -181,7 +222,7 @@ test "polling watcher detects file growth" {
     defer t.join();
 
     var stop = StopFlag.init(false);
-    try testing.expect(w.waitForChange(&stop));
+    try testing.expectEqual(WakeReason.modified, w.waitForChange(&stop));
     try testing.expectEqual(@as(u64, 6), w.last_size);
 }
 
@@ -214,5 +255,5 @@ test "stop flag wakes the polling watcher" {
     defer t.join();
 
     // File isn't growing — only the stop flag can wake us.
-    try testing.expect(!w.waitForChange(&stop));
+    try testing.expectEqual(WakeReason.stop, w.waitForChange(&stop));
 }

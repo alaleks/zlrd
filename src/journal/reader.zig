@@ -19,6 +19,12 @@ const lz4 = @import("lz4.zig");
 const log = std.log.scoped(.zlrd_journal);
 const debug_io = std.Options.debug_io;
 
+/// Defensive caps on values pulled from on-disk object headers. A corrupted
+/// or maliciously crafted journal can claim absurd sizes; without these we
+/// would happily try to allocate gigabytes or recurse millions of times.
+pub const max_entry_fields: usize = 4096;
+pub const max_data_payload_bytes: usize = 16 * 1024 * 1024;
+
 pub const Error = error{
     InvalidMagic,
     InvalidHeaderSize,
@@ -28,6 +34,8 @@ pub const Error = error{
     InvalidObjectSize,
     UnsupportedCompression,
     InvalidField,
+    EntryTooLarge,
+    PayloadTooLarge,
 } || std.mem.Allocator.Error || error{
     /// Underlying I/O failed. We collapse the std.Io.File errors into a
     /// single variant so the public API stays small.
@@ -96,6 +104,10 @@ pub const Reader = struct {
             return error.UnsupportedIncompatFlag;
         }
 
+        if (header.entry_array_offset != 0 and header.entry_array_offset >= size) {
+            return error.InvalidOffset;
+        }
+
         return .{
             .io = io,
             .file = f,
@@ -114,22 +126,39 @@ pub const Reader = struct {
     }
 
     pub fn iterator(self: *Reader) Iterator {
+        const compact = self.isCompact();
         return .{
             .reader = self,
             .array_offset = self.header.entry_array_offset,
             .array_index = 0,
             .array_capacity = 0,
+            .initial_chain_head = self.header.entry_array_offset,
+            .compact = compact,
+            .array_item_sz = fmt.entryArrayItemSize(compact),
+            .entry_item_sz = fmt.entryItemSize(compact),
         };
     }
 
-    /// Re-reads the file header and updates the cached `file_size`. Used by
-    /// the tail watcher to pick up appends without reopening the file.
+    /// Re-reads the volatile portion of the file header — just the fields
+    /// that change as new entries are appended (tail pointers, entry counts,
+    /// chain head). The static fields (signature, machine_id, flags, file
+    /// id) never change after open so we don't pay for re-reading them.
+    /// 80 bytes vs 240 bytes — meaningful at high inotify-wake rates.
     pub fn refresh(self: *Reader) Error!void {
         self.file_size = self.file.length(self.io) catch return error.IoError;
-        var header_bytes: [@sizeOf(fmt.Header)]u8 = undefined;
-        const n = self.file.readPositional(self.io, &.{&header_bytes}, 0) catch return error.IoError;
-        if (n != header_bytes.len) return error.IoError;
-        self.header = std.mem.bytesAsValue(fmt.Header, &header_bytes).*;
+
+        // Read the contiguous slab covering `tail_object_offset` (offset 152)
+        // through `n_entry_arrays` (offset 232). That's everything the
+        // iterator's `refresh` cares about.
+        const refresh_start: u64 = @offsetOf(fmt.Header, "tail_object_offset");
+        const refresh_end: u64 = @sizeOf(fmt.Header);
+        const refresh_len = refresh_end - refresh_start;
+        var buf: [refresh_len]u8 = undefined;
+        const n = self.file.readPositional(self.io, &.{&buf}, refresh_start) catch return error.IoError;
+        if (n != buf.len) return error.IoError;
+
+        const dst = @as([*]u8, @ptrCast(&self.header)) + refresh_start;
+        @memcpy(dst[0..refresh_len], &buf);
     }
 
     /// Reads `len` bytes at `pos` into `dst`. Errors if the read is short
@@ -138,13 +167,6 @@ pub const Reader = struct {
         if (pos + dst.len > self.file_size) return error.InvalidOffset;
         const n = self.file.readPositional(self.io, &.{dst}, pos) catch return error.IoError;
         if (n != dst.len) return error.IoError;
-    }
-
-    fn readObjectHeader(self: *Reader, offset: u64) Error!fmt.ObjectHeader {
-        if (offset == 0) return error.InvalidOffset;
-        var buf: [@sizeOf(fmt.ObjectHeader)]u8 = undefined;
-        try self.readAt(offset, &buf);
-        return std.mem.bytesAsValue(fmt.ObjectHeader, &buf).*;
     }
 };
 
@@ -164,6 +186,20 @@ pub const Iterator = struct {
     /// offset above, this lets a tail consumer resume exactly where it left
     /// off after a `refresh()`.
     last_array_index: u64 = 0,
+    /// Snapshot of `Header.entry_array_offset` at iterator creation. Used
+    /// by `refresh` to detect a fresh chain head (rotation/snapshot).
+    initial_chain_head: u64 = 0,
+    /// Hoisted out of the hot loops: encoded once at iterator creation so
+    /// `readEntry`/`readArrayItem`/etc. don't re-check the incompat flag
+    /// or call out to `entryItemSize` on every iteration.
+    compact: bool = false,
+    array_item_sz: usize = 8,
+    entry_item_sz: usize = 16,
+    /// Optional DATA-object cache. Systemd journals deduplicate field
+    /// objects via a hash table — the SAME `_SYSTEMD_UNIT=foo.service`
+    /// DATA payload is referenced by every entry of that unit. Without a
+    /// cache we re-read (and re-LZ4-decode) it once per entry.
+    cache: ?*DataCache = null,
 
     /// Advances to the next entry. Returns null at EOF. Caller owns the
     /// returned `Entry` and must call `deinit`.
@@ -188,12 +224,31 @@ pub const Iterator = struct {
     /// Re-reads the most recent array's header so the iterator can see new
     /// items appended to it, or a newly-linked next array. Safe to call
     /// after `next()` has returned null.
+    ///
+    /// Also detects when `Header.entry_array_offset` switches to a brand-new
+    /// chain head (snapshot/compaction in upstream systemd writers) — in
+    /// that case we resume from the new head instead of staying stuck on
+    /// the old one.
     pub fn refresh(self: *Iterator) Error!void {
         try self.reader.refresh();
+
+        // Did the writer install a fresh chain head? If so, jump there.
+        const fresh_head = self.reader.header.entry_array_offset;
+        if (fresh_head != 0 and fresh_head != self.initial_chain_head) {
+            self.initial_chain_head = fresh_head;
+            self.array_offset = fresh_head;
+            self.array_index = 0;
+            self.array_capacity = 0;
+            self.next_array_offset = 0;
+            self.last_array_offset = 0;
+            self.last_array_index = 0;
+            return;
+        }
+
         const probe = if (self.array_offset != 0) self.array_offset else self.last_array_offset;
         if (probe == 0) {
             // The file never had an entry-array; fall back to the header.
-            self.array_offset = self.reader.header.entry_array_offset;
+            self.array_offset = fresh_head;
             self.array_index = 0;
             self.array_capacity = 0;
             return;
@@ -205,8 +260,7 @@ pub const Iterator = struct {
         if (head.object.type != @intFromEnum(fmt.ObjectType.entry_array)) return error.InvalidObjectType;
         if (head.object.size < @sizeOf(fmt.EntryArrayHead)) return error.InvalidObjectSize;
 
-        const item_sz = fmt.entryArrayItemSize(self.reader.isCompact());
-        const new_capacity = (head.object.size - @sizeOf(fmt.EntryArrayHead)) / item_sz;
+        const new_capacity = (head.object.size - @sizeOf(fmt.EntryArrayHead)) / self.array_item_sz;
 
         // If we're mid-array, just extend the capacity and pick up new items.
         // Otherwise (we'd exhausted the chain), re-arm to the next-linked
@@ -238,8 +292,7 @@ pub const Iterator = struct {
         if (head.object.type != @intFromEnum(fmt.ObjectType.entry_array)) return error.InvalidObjectType;
         if (head.object.size < @sizeOf(fmt.EntryArrayHead)) return error.InvalidObjectSize;
 
-        const item_sz = fmt.entryArrayItemSize(self.reader.isCompact());
-        const capacity = (head.object.size - @sizeOf(fmt.EntryArrayHead)) / item_sz;
+        const capacity = (head.object.size - @sizeOf(fmt.EntryArrayHead)) / self.array_item_sz;
 
         // EntryArray often pre-allocates trailing slots; only the populated
         // prefix has non-zero offsets. We still iterate the full capacity —
@@ -258,9 +311,8 @@ pub const Iterator = struct {
 
     /// Returns the entry-object offset of the i-th item in the current array.
     fn readArrayItem(self: *Iterator, index: u64) Error!u64 {
-        const item_sz = fmt.entryArrayItemSize(self.reader.isCompact());
-        const item_pos = self.array_offset + @sizeOf(fmt.EntryArrayHead) + index * item_sz;
-        if (self.reader.isCompact()) {
+        const item_pos = self.array_offset + @sizeOf(fmt.EntryArrayHead) + index * self.array_item_sz;
+        if (self.compact) {
             var buf: [4]u8 = undefined;
             try self.reader.readAt(item_pos, &buf);
             // When the array is exhausted, fall through to the next-array
@@ -275,6 +327,51 @@ pub const Iterator = struct {
         }
     }
 
+    /// Walks the entry-array chain WITHOUT resolving any entries. Used by
+    /// callers (typically tail-follow) that want to skip the file's existing
+    /// content and only emit newly-appended entries. Reading entries one by
+    /// one just to discard them turns a multi-second startup on a large
+    /// journal into a tens-of-milliseconds bookkeeping pass.
+    pub fn seekToEnd(self: *Iterator) Error!void {
+        while (self.array_offset != 0) {
+            var head_buf: [@sizeOf(fmt.EntryArrayHead)]u8 = undefined;
+            try self.reader.readAt(self.array_offset, &head_buf);
+            const head = std.mem.bytesAsValue(fmt.EntryArrayHead, &head_buf).*;
+            if (head.object.type != @intFromEnum(fmt.ObjectType.entry_array)) return error.InvalidObjectType;
+            if (head.object.size < @sizeOf(fmt.EntryArrayHead)) return error.InvalidObjectSize;
+
+            const capacity = (head.object.size - @sizeOf(fmt.EntryArrayHead)) / self.array_item_sz;
+
+            // Pretend we just consumed the last item of this array.
+            self.last_array_offset = self.array_offset;
+            self.last_array_index = if (capacity == 0) 0 else capacity - 1;
+            self.next_array_offset = head.next_entry_array_offset;
+
+            self.array_offset = head.next_entry_array_offset;
+            self.array_index = 0;
+            self.array_capacity = 0;
+        }
+    }
+
+    /// Opts the iterator into a small DATA-object cache. Cuts repeat reads
+    /// of high-cardinality fields (`_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`,
+    /// `_HOSTNAME`, …) which are referenced by every entry of a service.
+    pub fn enableCache(self: *Iterator, allocator: std.mem.Allocator) Error!void {
+        if (self.cache != null) return;
+        const c = try allocator.create(DataCache);
+        c.* = .{};
+        self.cache = c;
+    }
+
+    /// Releases the cache allocated by `enableCache`. Safe to call when no
+    /// cache is attached.
+    pub fn disableCache(self: *Iterator, allocator: std.mem.Allocator) void {
+        if (self.cache) |c| {
+            allocator.destroy(c);
+            self.cache = null;
+        }
+    }
+
     /// Reads an entry object at `offset` and resolves all its data items into
     /// field key/value pairs.
     fn readEntry(self: *Iterator, allocator: std.mem.Allocator, offset: u64) Error!Entry {
@@ -285,10 +382,11 @@ pub const Iterator = struct {
         if (head.object.type != @intFromEnum(fmt.ObjectType.entry)) return error.InvalidObjectType;
         if (head.object.size < @sizeOf(fmt.EntryHead)) return error.InvalidObjectSize;
 
-        const compact = self.reader.isCompact();
-        const item_sz = fmt.entryItemSize(compact);
+        const compact = self.compact;
+        const item_sz = self.entry_item_sz;
         const items_bytes = head.object.size - @sizeOf(fmt.EntryHead);
         const n_items = items_bytes / item_sz;
+        if (n_items > max_entry_fields) return error.EntryTooLarge;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -326,10 +424,14 @@ pub const Iterator = struct {
     }
 
     /// Reads a DATA object at `offset` and splits its payload on the first
-    /// `=` byte into key + value. Allocates copies in `arena` so the entry
-    /// owns its bytes. Decompresses LZ4-flagged payloads transparently; XZ
-    /// and ZSTD are still rejected.
+    /// `=` byte into key + value. Decompresses LZ4-flagged payloads
+    /// transparently; XZ and ZSTD are still rejected. Looks up `offset` in
+    /// the optional cache first and writes back on miss.
     fn readDataField(self: *Iterator, arena: std.mem.Allocator, offset: u64, compact: bool) Error!Field {
+        if (self.cache) |c| {
+            if (c.get(offset)) |cached| return splitField(cached);
+        }
+
         var head_buf: [@sizeOf(fmt.DataHead)]u8 = undefined;
         try self.reader.readAt(offset, &head_buf);
         const head = std.mem.bytesAsValue(fmt.DataHead, &head_buf).*;
@@ -341,6 +443,7 @@ pub const Iterator = struct {
         if (head.object.size < payload_start) return error.InvalidObjectSize;
         const payload_len = head.object.size - payload_start;
         if (payload_len == 0) return error.InvalidField;
+        if (payload_len > max_data_payload_bytes) return error.PayloadTooLarge;
 
         const raw = try arena.alloc(u8, payload_len);
         try self.reader.readAt(offset + payload_start, raw);
@@ -351,37 +454,60 @@ pub const Iterator = struct {
             else => return error.UnsupportedCompression,
         };
 
-        const eq = std.mem.indexOfScalar(u8, payload, '=') orelse return error.InvalidField;
-        if (eq == 0) return error.InvalidField;
-        return .{ .key = payload[0..eq], .value = payload[eq + 1 ..] };
+        if (self.cache) |c| c.put(offset, payload);
+        return splitField(payload);
+    }
+};
+
+/// Splits a `KEY=value` payload into a `Field`. Shared by the cache-hit
+/// and cache-miss paths to keep the split logic in one place.
+inline fn splitField(payload: []const u8) Error!Field {
+    const eq = std.mem.indexOfScalar(u8, payload, '=') orelse return error.InvalidField;
+    if (eq == 0) return error.InvalidField;
+    return .{ .key = payload[0..eq], .value = payload[eq + 1 ..] };
+}
+
+/// Bounded fixed-size cache mapping DATA-object file offsets to their
+/// decoded payloads. Sized to capture the working set of high-cardinality
+/// dedup fields without paying for a real hashmap: each slot is 4 KiB so
+/// the total footprint is `cache_slots * 4 KiB` = 64 KiB.
+pub const DataCache = struct {
+    pub const slot_count = 16;
+    pub const slot_bytes = 4 * 1024;
+
+    const Slot = struct {
+        offset: u64 = 0, // 0 = empty
+        len: u16 = 0,
+        buf: [slot_bytes]u8 = undefined,
+    };
+
+    slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
+    /// Round-robin replacement index. Simple FIFO, no real LRU — the
+    /// access pattern (repeated high-cardinality fields hit the same
+    /// slots) makes this nearly equivalent in practice.
+    next_evict: u8 = 0,
+
+    pub fn get(self: *const DataCache, offset: u64) ?[]const u8 {
+        if (offset == 0) return null;
+        for (&self.slots) |*slot| {
+            if (slot.offset == offset) return slot.buf[0..slot.len];
+        }
+        return null;
+    }
+
+    pub fn put(self: *DataCache, offset: u64, payload: []const u8) void {
+        if (offset == 0 or payload.len > slot_bytes) return;
+        const idx = self.next_evict;
+        self.next_evict = (self.next_evict + 1) % slot_count;
+        self.slots[idx].offset = offset;
+        self.slots[idx].len = @intCast(payload.len);
+        @memcpy(self.slots[idx].buf[0..payload.len], payload);
     }
 };
 
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-/// Encodes `input` as a single all-literal LZ4 block. Mirrors the helper in
-/// `lz4.zig` — duplicated to avoid surfacing test-only encoders in lz4.zig's
-/// public API.
-fn encodeAllLiteralsForBuilder(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    var lit_len = input.len;
-    const token_hi: u8 = if (lit_len < 15) @intCast(lit_len) else 15;
-    try out.append(allocator, token_hi << 4);
-    if (lit_len >= 15) {
-        lit_len -= 15;
-        while (lit_len >= 255) {
-            try out.append(allocator, 0xFF);
-            lit_len -= 255;
-        }
-        try out.append(allocator, @intCast(lit_len));
-    }
-    try out.appendSlice(allocator, input);
-    return out.toOwnedSlice(allocator);
-}
 
 /// Builds a synthetic journal file in-memory. Used by tests so we don't need
 /// a real /var/log/journal/*.journal fixture.
@@ -447,7 +573,7 @@ const SyntheticBuilder = struct {
     /// decompression payload; the builder wraps it in systemd's
     /// 8-byte-size-prefixed all-literal block.
     fn writeDataLz4(self: *SyntheticBuilder, plain: []const u8) !u64 {
-        const block = try encodeAllLiteralsForBuilder(self.allocator, plain);
+        const block = try lz4.encodeAllLiterals(self.allocator, plain);
         defer self.allocator.free(block);
         var wrapped = std.ArrayList(u8).empty;
         defer wrapped.deinit(self.allocator);
@@ -656,6 +782,115 @@ test "Reader decompresses LZ4-flagged data payloads" {
     try testing.expectEqualStrings("6", got.get("PRIORITY").?);
     try testing.expectEqualStrings("lz4-compressed payload, hello", got.get("MESSAGE").?);
     try testing.expect((try it.next(testing.allocator)) == null);
+}
+
+test "Iterator.seekToEnd jumps past existing entries without reading them" {
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    const d = try b.writeData("MESSAGE=cold");
+    const e1 = try b.writeEntry(1, 1, &.{d});
+    const e2 = try b.writeEntry(2, 2, &.{d});
+    const arr = try b.writeEntryArray(&.{ e1, e2 });
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{ .sub_path = "seek.journal", .data = b.bytes.items });
+
+    var r = try Reader.open(tio, tmp.dir, "seek.journal");
+    defer r.deinit();
+
+    var it = r.iterator();
+    try it.seekToEnd();
+    // No entries should surface from before the seek point.
+    try testing.expect((try it.next(testing.allocator)) == null);
+    // And we should still remember the last array we walked, so a future
+    // refresh+next can resume from new appends.
+    try testing.expectEqual(arr, it.last_array_offset);
+    try testing.expectEqual(@as(u64, 1), it.last_array_index);
+}
+
+test "DataCache returns cached payloads for repeat offsets" {
+    var cache: DataCache = .{};
+    try testing.expect(cache.get(0) == null);
+    try testing.expect(cache.get(64) == null);
+
+    cache.put(64, "MESSAGE=cached-hit");
+    const hit = cache.get(64).?;
+    try testing.expectEqualStrings("MESSAGE=cached-hit", hit);
+
+    // Different offsets hit different slots.
+    cache.put(128, "PRIORITY=3");
+    try testing.expectEqualStrings("MESSAGE=cached-hit", cache.get(64).?);
+    try testing.expectEqualStrings("PRIORITY=3", cache.get(128).?);
+
+    // Round-robin replacement: fill enough new entries to cycle back to
+    // slot 0 (which holds offset 64). After `slot_count` more inserts the
+    // oldest entry must have been evicted.
+    var k: usize = 0;
+    while (k < DataCache.slot_count) : (k += 1) {
+        cache.put(@intCast(200 + 8 * k), "x=y");
+    }
+    try testing.expect(cache.get(64) == null);
+}
+
+test "readDataField uses cache on a hit" {
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    // Two entries share the same DATA object — the second one must
+    // be served from cache when the cache is enabled.
+    const d_unit = try b.writeData("_SYSTEMD_UNIT=api.service");
+    const d_msg1 = try b.writeData("MESSAGE=one");
+    const d_msg2 = try b.writeData("MESSAGE=two");
+    const e1 = try b.writeEntry(1, 1, &.{ d_unit, d_msg1 });
+    const e2 = try b.writeEntry(2, 2, &.{ d_unit, d_msg2 });
+    const arr = try b.writeEntryArray(&.{ e1, e2 });
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{ .sub_path = "cache.journal", .data = b.bytes.items });
+
+    var r = try Reader.open(tio, tmp.dir, "cache.journal");
+    defer r.deinit();
+
+    var it = r.iterator();
+    try it.enableCache(testing.allocator);
+    defer it.disableCache(testing.allocator);
+
+    var first = (try it.next(testing.allocator)) orelse return error.Missing;
+    defer first.deinit();
+    try testing.expectEqualStrings("api.service", first.get("_SYSTEMD_UNIT").?);
+
+    // After the first iteration the cache must hold the shared unit's payload.
+    try testing.expect(it.cache.?.get(d_unit) != null);
+
+    var second = (try it.next(testing.allocator)) orelse return error.Missing;
+    defer second.deinit();
+    try testing.expectEqualStrings("api.service", second.get("_SYSTEMD_UNIT").?);
+}
+
+test "Reader.open rejects out-of-range entry_array_offset" {
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    // Point the header at an offset past EOF.
+    const fake_offset: u64 = @intCast(b.bytes.items.len + 1024);
+    b.patchHeaderEntryArray(fake_offset);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{ .sub_path = "bad.journal", .data = b.bytes.items });
+
+    try testing.expectError(error.InvalidOffset, Reader.open(tio, tmp.dir, "bad.journal"));
 }
 
 test "Iterator follows next_entry_array_offset chain" {
