@@ -42,6 +42,11 @@ pub fn run(
     return runLinux(sink, ctx, stop);
 }
 
+/// Reasonable upper bound on number of CPUs we attach to. 1024 covers any
+/// machine zlrd realistically runs on; the array sits in the function frame
+/// (4 KiB) so we avoid an allocator dependency for startup.
+const max_cpus: usize = 1024;
+
 fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool)) !void {
     if (comptime builtin.os.tag != .linux) return;
 
@@ -67,16 +72,34 @@ fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool)) 
         log.warn("tracepoint id read failed: {t}", .{err});
         return;
     };
-    const perf_fd = openTracepoint(tp_id) catch |err| {
-        log.warn("perf_event_open failed: {t}", .{err});
-        return;
-    };
-    defer _ = linux.close(perf_fd);
 
-    setBpfAndEnable(perf_fd, oom_prog_fd) catch |err| {
-        log.warn("attach BPF to tracepoint failed: {t}", .{err});
+    // Tracepoint perf events are per-CPU: pid=-1 requires cpu>=0, and an fd
+    // attached to cpu N only catches the tracepoint when it fires on cpu N.
+    // We open one perf event per online CPU, attach the BPF program to each,
+    // and close them all on exit. Without this we'd miss OOM events that fire
+    // on every CPU but the first one.
+    const nr_cpus = std.Thread.getCpuCount() catch 1;
+    const cpus = @min(nr_cpus, max_cpus);
+    var perf_fds: [max_cpus]i32 = undefined;
+    var attached: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < attached) : (i += 1) _ = linux.close(perf_fds[i]);
+    }
+
+    for (0..cpus) |cpu| {
+        const fd = openTracepoint(tp_id, @intCast(cpu)) catch continue;
+        setBpfAndEnable(fd, oom_prog_fd) catch {
+            _ = linux.close(fd);
+            continue;
+        };
+        perf_fds[attached] = fd;
+        attached += 1;
+    }
+    if (attached == 0) {
+        log.warn("ebpf: failed to attach OOM tracepoint on any CPU", .{});
         return;
-    };
+    }
 
     // 4. mmap the ringbuf consumer page + data area, run the consumer loop.
     var consumer = RingbufConsumer.init(map_fd) catch |err| {
@@ -85,7 +108,7 @@ fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool)) 
     };
     defer consumer.deinit();
 
-    log.info("ebpf backend up; OOM tracepoint attached", .{});
+    log.info("ebpf backend up; OOM tracepoint attached on {d} CPU(s)", .{attached});
 
     var pollfd = [_]std.posix.pollfd{.{
         .fd = map_fd,
@@ -107,6 +130,10 @@ fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool)) 
 /// Builds the BPF program that runs on `oom:mark_victim`. Reads the victim
 /// pid from the tracepoint context (offset 8 in the standard layout) and
 /// writes a 4-byte record to the ringbuf.
+///
+/// Licensed as GPL: `bpf_ringbuf_output` is marked `gpl_only` in upstream
+/// kernels, so loading with `MIT` (or any non-GPL string) fails immediately
+/// with `EACCES` at `BPF_PROG_LOAD`. Tracepoint programs are GPL-only too.
 fn loadOomProgram(ringbuf_map_fd: i32) !i32 {
     if (comptime builtin.os.tag != .linux) return error.Unsupported;
     const linux = std.os.linux;
@@ -136,7 +163,7 @@ fn loadOomProgram(ringbuf_map_fd: i32) !i32 {
         Insn.exit(),
     };
 
-    return BPF.prog_load(.tracepoint, &insns, null, "MIT", 0, 0);
+    return BPF.prog_load(.tracepoint, &insns, null, "GPL", 0, 0);
 }
 
 /// Resolves the kernel-assigned numeric id for a tracepoint by reading
@@ -166,8 +193,10 @@ fn readTracepointId(category: []const u8, name: []const u8) !u64 {
     return std.fmt.parseInt(u64, trimmed, 10) catch return error.InvalidId;
 }
 
-/// Opens a perf event for the given tracepoint id, cpu-wide, all-tasks.
-fn openTracepoint(tracepoint_id: u64) !i32 {
+/// Opens a perf event for the given tracepoint id on a specific CPU.
+/// pid=-1 + cpu>=0 → all tasks on that CPU. One fd per online CPU is
+/// required because tracepoint perf events are per-CPU instruments.
+fn openTracepoint(tracepoint_id: u64, cpu: i32) !i32 {
     if (comptime builtin.os.tag != .linux) return error.Unsupported;
     const linux = std.os.linux;
 
@@ -179,10 +208,7 @@ fn openTracepoint(tracepoint_id: u64) !i32 {
     attr.flags.disabled = true;
     attr.wakeup = .{ .events = 1 };
 
-    // pid=-1, cpu=0 → all tasks, cpu 0. For multi-cpu coverage you would
-    // open one fd per cpu; OOM events are global enough that one is enough
-    // in practice.
-    const rc = linux.perf_event_open(&attr, -1, 0, -1, 0);
+    const rc = linux.perf_event_open(&attr, -1, cpu, -1, 0);
     if (std.posix.errno(rc) != .SUCCESS) return error.PerfEventOpen;
     return @intCast(rc);
 }
@@ -263,37 +289,155 @@ const RingbufConsumer = struct {
         return @ptrCast(@alignCast(self.producer_pages.ptr));
     }
 
-    /// Drains all currently-available records, calling `sink` for each one.
+    /// Drains all currently-available records via the pure `drainBuffer`
+    /// helper. The split makes the record-walking logic testable without
+    /// having to mmap a real BPF ringbuf.
     fn drain(self: *RingbufConsumer, sink: kernel.Sink, ctx: ?*anyopaque) void {
-        const mask: u64 = ringbuf_size - 1;
         const consumer = self.consumerPos();
         const producer = self.producerPos();
-
         var cpos = consumer.load(.acquire);
         const ppos = producer.load(.acquire);
-
-        while (cpos < ppos) {
-            const off: usize = @intCast(cpos & mask);
-            // Each record begins with an 8-byte header: u32 length, u32 padding.
-            // If `length` has the BUSY bit set (0x80000000), the producer is
-            // still writing — stop here and resume next drain.
-            const hdr_ptr: *const [8]u8 = @ptrCast(&self.data[off]);
-            const len_raw: u32 = std.mem.readInt(u32, hdr_ptr[0..4], .little);
-            if ((len_raw & 0x80000000) != 0) break;
-            const data_len: usize = @intCast(len_raw & 0x7FFFFFFF);
-            const data_off = off + 8;
-            if (data_off + data_len > self.data.len) break;
-
-            if (data_len >= 4) {
-                const pid_ptr: *const [4]u8 = @ptrCast(&self.data[data_off]);
-                const pid: u32 = std.mem.readInt(u32, pid_ptr, .little);
-                sink(ctx, kernel.makeEvent(.oom, .ebpf, pid, "", ""));
-            }
-
-            // Records are 8-byte aligned. Advance past header + padded payload.
-            const padded = (data_len + 7) & ~@as(usize, 7);
-            cpos += 8 + padded;
-            consumer.store(cpos, .release);
-        }
+        const start = cpos;
+        cpos = drainBuffer(self.data, cpos, ppos, sink, ctx);
+        // Publish the new consumer position once at the end — on bursts this
+        // collapses N atomic stores into one.
+        if (cpos != start) consumer.store(cpos, .release);
     }
 };
+
+/// Walks BPF-ringbuf records in `data` from `cpos` toward `ppos`, calling
+/// `sink` for each committed record. Honors the BUSY bit (stops there;
+/// producer still writing) and the DISCARD bit (skips payload but still
+/// advances past the record). Returns the new consumer position.
+///
+/// Without DISCARD handling, the previous implementation would wedge on
+/// the first discarded record forever because `len_raw & 0x7FFFFFFF` left
+/// bit 30 set, producing a ~1 GiB length that always failed the bounds
+/// check.
+fn drainBuffer(data: []const u8, cpos_in: u64, ppos: u64, sink: kernel.Sink, ctx: ?*anyopaque) u64 {
+    const busy_bit: u32 = 0x80000000;
+    const discard_bit: u32 = 0x40000000;
+    const len_mask: u32 = 0x3FFFFFFF;
+    const mask: u64 = data.len - 1;
+
+    var cpos = cpos_in;
+    while (cpos < ppos) {
+        const off: usize = @intCast(cpos & mask);
+        if (off + 8 > data.len) break;
+        const hdr_ptr: *const [8]u8 = @ptrCast(&data[off]);
+        const len_raw: u32 = std.mem.readInt(u32, hdr_ptr[0..4], .little);
+        if ((len_raw & busy_bit) != 0) break;
+
+        const discarded = (len_raw & discard_bit) != 0;
+        const data_len: usize = @intCast(len_raw & len_mask);
+        const data_off = off + 8;
+        if (data_off + data_len > data.len) break;
+
+        if (!discarded and data_len >= 4) {
+            const pid_ptr: *const [4]u8 = @ptrCast(&data[data_off]);
+            const pid: u32 = std.mem.readInt(u32, pid_ptr, .little);
+            sink(ctx, kernel.makeEvent(.oom, .ebpf, pid, "", ""));
+        }
+
+        // Records are 8-byte aligned. Advance past header + padded payload.
+        const padded = (data_len + 7) & ~@as(usize, 7);
+        cpos += 8 + padded;
+    }
+    return cpos;
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// Writes a synthetic BPF-ringbuf record header into `buf[off..]`.
+/// `len` is the payload length; `discard` sets bit 30; `busy` sets bit 31.
+fn writeRingbufRecord(buf: []u8, off: usize, payload: []const u8, discard: bool, busy: bool) usize {
+    var len_raw: u32 = @intCast(payload.len);
+    if (discard) len_raw |= 0x40000000;
+    if (busy) len_raw |= 0x80000000;
+    std.mem.writeInt(u32, buf[off..][0..4], len_raw, .little);
+    std.mem.writeInt(u32, buf[off + 4 ..][0..4], 0, .little);
+    @memcpy(buf[off + 8 ..][0..payload.len], payload);
+    const padded = (payload.len + 7) & ~@as(usize, 7);
+    return 8 + padded;
+}
+
+test "drainBuffer: emits committed records and advances cpos correctly" {
+    var data: [256]u8 = undefined;
+    @memset(&data, 0);
+
+    var pid1_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pid1_bytes, 1234, .little);
+    var pid2_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pid2_bytes, 5678, .little);
+
+    const r1 = writeRingbufRecord(&data, 0, &pid1_bytes, false, false);
+    const r2 = writeRingbufRecord(&data, r1, &pid2_bytes, false, false);
+
+    const Cap = struct {
+        var seen: [4]u32 = .{ 0, 0, 0, 0 };
+        var n: usize = 0;
+        fn cb(_: ?*anyopaque, ev: kernel.KernelEvent) void {
+            seen[n] = ev.pid;
+            n += 1;
+        }
+    };
+    Cap.n = 0;
+    const new_cpos = drainBuffer(&data, 0, r1 + r2, Cap.cb, null);
+    try testing.expectEqual(@as(usize, 2), Cap.n);
+    try testing.expectEqual(@as(u32, 1234), Cap.seen[0]);
+    try testing.expectEqual(@as(u32, 5678), Cap.seen[1]);
+    try testing.expectEqual(@as(u64, r1 + r2), new_cpos);
+}
+
+test "drainBuffer: DISCARDed record is skipped but advances cpos" {
+    var data: [256]u8 = undefined;
+    @memset(&data, 0);
+
+    var pid_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pid_bytes, 9999, .little);
+
+    // First record is discarded (should be skipped); second is a normal
+    // record whose pid must surface — proving cpos advanced past the
+    // discarded one rather than wedging on it.
+    const r1 = writeRingbufRecord(&data, 0, &pid_bytes, true, false);
+    const r2 = writeRingbufRecord(&data, r1, &pid_bytes, false, false);
+
+    const Cap = struct {
+        var seen: [4]u32 = .{ 0, 0, 0, 0 };
+        var n: usize = 0;
+        fn cb(_: ?*anyopaque, ev: kernel.KernelEvent) void {
+            seen[n] = ev.pid;
+            n += 1;
+        }
+    };
+    Cap.n = 0;
+    const new_cpos = drainBuffer(&data, 0, r1 + r2, Cap.cb, null);
+    try testing.expectEqual(@as(usize, 1), Cap.n);
+    try testing.expectEqual(@as(u32, 9999), Cap.seen[0]);
+    try testing.expectEqual(@as(u64, r1 + r2), new_cpos);
+}
+
+test "drainBuffer: stops at a BUSY record without advancing past it" {
+    var data: [256]u8 = undefined;
+    @memset(&data, 0);
+
+    var pid_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pid_bytes, 1, .little);
+
+    // Producer is mid-write on this record — consumer must stop and resume
+    // on a later drain (when BUSY clears).
+    _ = writeRingbufRecord(&data, 0, &pid_bytes, false, true);
+
+    const Cap = struct {
+        var n: usize = 0;
+        fn cb(_: ?*anyopaque, _: kernel.KernelEvent) void {
+            n += 1;
+        }
+    };
+    Cap.n = 0;
+    const new_cpos = drainBuffer(&data, 0, 128, Cap.cb, null);
+    try testing.expectEqual(@as(usize, 0), Cap.n);
+    try testing.expectEqual(@as(u64, 0), new_cpos);
+}

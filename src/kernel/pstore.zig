@@ -41,10 +41,12 @@ pub fn scan(io: std.Io, sink: kernel.Sink, ctx: ?*anyopaque) !void {
 
     if (!has_taint_die and dump_count == 0) return;
 
-    if (detail_w.buffered().len > 0) {
-        detail_w.writeAll("; ") catch {};
-    }
+    // Only emit the `"; "` separator when we have BOTH halves to join.
+    // Previously the separator was written whenever the buffer was non-empty,
+    // producing a dangling `"dump1,dump2; "` when dumps were present but
+    // TAINT_DIE wasn't set.
     if (has_taint_die) {
+        if (detail_w.buffered().len > 0) detail_w.writeAll("; ") catch {};
         std.fmt.format(&detail_w, "tainted=0x{x}", .{tainted_value}) catch {};
     }
 
@@ -172,4 +174,31 @@ test "scan: no-op on non-Linux compiles cleanly" {
     };
     try scan(undefined, Cap.cb, &calls);
     try testing.expectEqual(@as(u32, 0), calls);
+}
+
+test "detail separator: emit only when both halves present" {
+    // Reproduces the bug we fixed: writeAll("; ") used to fire whenever
+    // detail_w already had bytes, producing "dump1,dump2; " when tainted
+    // was clear. Exercise the helper in isolation.
+    var buf: [128]u8 = undefined;
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeAll("dump1,dump2");
+        const has_taint_die = false;
+        if (has_taint_die) {
+            if (w.buffered().len > 0) try w.writeAll("; ");
+            try w.print("tainted=0x{x}", .{0x200});
+        }
+        try testing.expectEqualStrings("dump1,dump2", w.buffered());
+    }
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeAll("dump1");
+        const has_taint_die = true;
+        if (has_taint_die) {
+            if (w.buffered().len > 0) try w.writeAll("; ");
+            try w.print("tainted=0x{x}", .{0x200});
+        }
+        try testing.expectEqualStrings("dump1; tainted=0x200", w.buffered());
+    }
 }

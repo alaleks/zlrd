@@ -17,7 +17,11 @@ const kernel = @import("kernel.zig");
 
 const log = std.log.scoped(.zlrd_kmsg);
 
-const read_buf_size = 8 * 1024;
+/// `/dev/kmsg` returns one record per read. LOG_LINE_MAX is 1024 by default
+/// but distro kernels often raise it; a max-length record plus KV postfix
+/// can approach 16 KiB. Sizing the buffer to that means a single read
+/// pulls the whole record even on the worst-case kernel build.
+const read_buf_size = 16 * 1024;
 const poll_timeout_ms: i32 = 500;
 const kmsg_path = "/dev/kmsg";
 

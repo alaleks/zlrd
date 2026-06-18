@@ -106,11 +106,16 @@ pub const Sink = *const fn (ctx: ?*anyopaque, event: KernelEvent) void;
 
 /// Background kernel-event monitor. Owns one OS thread per active backend.
 pub const Monitor = struct {
+    /// One thread slot per concurrently-running background backend. Today:
+    /// kmsg (always) + eBPF (gated by `with_ebpf`). Pstore is synchronous
+    /// at startup and doesn't need a slot.
+    pub const max_threads = 2;
+
     io: std.Io,
     sink: Sink,
     ctx: ?*anyopaque,
     stop_flag: std.atomic.Value(bool),
-    threads: [3]?std.Thread,
+    threads: [max_threads]?std.Thread,
     threads_len: usize,
 
     pub fn init(io: std.Io, sink: Sink, ctx: ?*anyopaque) Monitor {
@@ -119,7 +124,7 @@ pub const Monitor = struct {
             .sink = sink,
             .ctx = ctx,
             .stop_flag = .init(false),
-            .threads = .{ null, null, null },
+            .threads = [_]?std.Thread{null} ** max_threads,
             .threads_len = 0,
         };
     }
@@ -156,18 +161,23 @@ fn linuxStart(self: *Monitor) !void {
     };
 
     // kmsg backend lives in its own thread so the watcher loop is unaffected.
-    self.threads[self.threads_len] = std.Thread.spawn(.{}, kmsgThread, .{ self, &self.stop_flag }) catch |err| {
+    // A kmsg-spawn failure used to short-circuit the function and silently
+    // disable eBPF too — fall through instead so each backend stands on its
+    // own.
+    if (std.Thread.spawn(.{}, kmsgThread, .{ self, &self.stop_flag })) |th| {
+        self.threads[self.threads_len] = th;
+        self.threads_len += 1;
+    } else |err| {
         log.warn("failed to spawn kmsg thread: {t}", .{err});
-        return;
-    };
-    self.threads_len += 1;
+    }
 
     if (comptime with_ebpf) {
-        self.threads[self.threads_len] = std.Thread.spawn(.{}, ebpfThread, .{ self, &self.stop_flag }) catch |err| {
+        if (std.Thread.spawn(.{}, ebpfThread, .{ self, &self.stop_flag })) |th| {
+            self.threads[self.threads_len] = th;
+            self.threads_len += 1;
+        } else |err| {
             log.warn("failed to spawn ebpf thread: {t}", .{err});
-            return;
-        };
-        self.threads_len += 1;
+        }
     }
 }
 
@@ -218,8 +228,17 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
             '\n' => try w.writeAll("\\n"),
             '\r' => try w.writeAll("\\r"),
             '\t' => try w.writeAll("\\t"),
-            0...0x07, 0x0b, 0x0e...0x1f => try w.print("\\u{x:0>4}", .{c}),
-            else => try w.writeByte(c),
+            0x08 => try w.writeAll("\\b"),
+            0x0c => try w.writeAll("\\f"),
+            // ASCII printable, excluding `"` (0x22) and `\\` (0x5c) which
+            // are handled above as explicit escape arms.
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try w.writeByte(c),
+            // Everything else: remaining controls, DEL, and high bytes.
+            // Kernel `task->comm` / kmsg messages are nominally ASCII, but
+            // corrupted input or module names with odd encodings can leak
+            // high bytes. Emit them as `\uXX` so the output stays valid
+            // JSON regardless.
+            else => try w.print("\\u{x:0>4}", .{c}),
         }
     }
     try w.writeByte('"');
@@ -264,4 +283,25 @@ test "Kind.label: stable wire names" {
     try testing.expectEqualStrings("kernel_oom", KernelEvent.Kind.oom.label());
     try testing.expectEqualStrings("kernel_segfault", KernelEvent.Kind.segfault.label());
     try testing.expectEqualStrings("kernel_panic", KernelEvent.Kind.panic_prev_boot.label());
+}
+
+test "writeJsonString: escapes \\b and \\f shortforms" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&w, "\x08\x0c");
+    try testing.expectEqualStrings("\"\\b\\f\"", w.buffered());
+}
+
+test "writeJsonString: escapes DEL and high bytes as \\uXX" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&w, "\x7f\xc3\xa9");
+    try testing.expectEqualStrings("\"\\u007f\\u00c3\\u00a9\"", w.buffered());
+}
+
+test "writeJsonString: preserves printable ASCII including '!' and '~'" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&w, "hello !~");
+    try testing.expectEqualStrings("\"hello !~\"", w.buffered());
 }
