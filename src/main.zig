@@ -292,6 +292,7 @@ fn runtimeErrorMessage(err: anyerror) []const u8 {
         error.IsDir => "path is a directory, not a file",
         error.NotOpenForReading => "file is not open for reading",
         error.OutOfMemory => "out of memory",
+        error.LineTooLong => "log line exceeds 4 MiB limit (likely a binary file or corrupted input)",
         else => @errorName(err),
     };
 }

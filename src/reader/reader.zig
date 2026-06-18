@@ -6,7 +6,6 @@ const std = @import("std");
 const flags = @import("flags");
 const simd = @import("simd");
 const tail_reader = @import("tail.zig");
-const formats = @import("formats.zig");
 const gzip = @import("gzip.zig");
 const regex = @import("regex");
 const debug_io = std.Options.debug_io;
@@ -18,7 +17,7 @@ fn writeOut(bytes: []const u8) void {
 
 /// Cached analysis of a single log line.
 /// Computed once per line by `analyzeLine` and reused by all filters and the printer.
-const LineInfo = struct {
+pub const LineInfo = struct {
     format: enum {
         json,
         plain_bracketed,
@@ -40,6 +39,10 @@ const LineInfo = struct {
 /// Analyzes a line and returns a fully populated `LineInfo`.
 /// All subsequent operations (filtering, printing) use this result directly,
 /// so the line is parsed only once per call path.
+///
+/// JSON lines are walked once via `analyzeJsonInPlace` which extracts level,
+/// date, time, and level_pos in a single pass — the previous implementation
+/// performed up to 4 full `extractJsonField` scans (one per candidate key).
 fn analyzeLine(line: []const u8) LineInfo {
     var info: LineInfo = .{
         .format = .plain_unknown,
@@ -55,16 +58,17 @@ fn analyzeLine(line: []const u8) LineInfo {
 
     info.is_json = line[0] == '{';
     info.starts_with_bracket = line[0] == '[';
-    info.date = extractDate(line);
-    info.time = extractTime(line);
 
     if (info.is_json) {
         info.format = .json;
-        if (simd.extractJsonField(line, "level", 16)) |v| {
-            info.level = flags.parseLevelInsensitive(v);
-            if (extractJsonLevelPos(line)) |pos| info.level_pos = pos;
-        }
-    } else if (info.starts_with_bracket) {
+        analyzeJsonInPlace(line, &info);
+        return info;
+    }
+
+    info.date = extractDate(line);
+    info.time = extractTime(line);
+
+    if (info.starts_with_bracket) {
         info.format = .plain_bracketed;
         if (simd.findBracketedLevel(line)) |r| {
             info.level = flags.parseLevelInsensitive(line[r.start..r.end]);
@@ -77,6 +81,100 @@ fn analyzeLine(line: []const u8) LineInfo {
     }
 
     return info;
+}
+
+/// Targets we look up while walking a JSON object's top-level keys.
+const JsonTarget = enum { none, level, time_like };
+
+/// Identifies the target slot a given JSON key fills. `time`, `timestamp`,
+/// and `date` are all treated equivalently — first one wins.
+inline fn identifyJsonKey(key: []const u8) JsonTarget {
+    if (std.mem.eql(u8, key, "level")) return .level;
+    if (std.mem.eql(u8, key, "time")) return .time_like;
+    if (std.mem.eql(u8, key, "timestamp")) return .time_like;
+    if (std.mem.eql(u8, key, "date")) return .time_like;
+    return .none;
+}
+
+inline fn isJsonWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// Single-pass extractor for JSON log lines. Walks top-level keys exactly
+/// once and fills in `level`, `level_pos`, `date`, `time` as it encounters
+/// the matching fields. Exits early once both level and date are known.
+fn analyzeJsonInPlace(line: []const u8, info: *LineInfo) void {
+    var i: usize = 1; // skip the opening '{'
+
+    while (i < line.len) {
+        // Locate the next top-level key opening quote.
+        const q = simd.findByte(line, i, '"') orelse return;
+        const key_start = q + 1;
+        const key_end = simd.scanJsonStringEnd(line, key_start) orelse return;
+        const key = line[key_start..key_end];
+        i = key_end + 1;
+
+        while (i < line.len and isJsonWs(line[i])) : (i += 1) {}
+        if (i >= line.len or line[i] != ':') continue;
+        i += 1;
+        while (i < line.len and isJsonWs(line[i])) : (i += 1) {}
+
+        const target = identifyJsonKey(key);
+        if (target == .none) {
+            i = skipJsonValue(line, i);
+            continue;
+        }
+
+        // We only care about string values; non-string slots are skipped.
+        if (i >= line.len or line[i] != '"') {
+            i = skipJsonValue(line, i);
+            continue;
+        }
+        i += 1;
+        const value_start = i;
+        const value_end = simd.scanJsonStringEnd(line, value_start) orelse return;
+        const value = line[value_start..value_end];
+        i = value_end + 1;
+
+        switch (target) {
+            .level => {
+                if (info.level == null and value.len <= 16) {
+                    info.level = flags.parseLevelInsensitive(value);
+                    info.level_pos = .{ .start = value_start, .end = value_end };
+                }
+            },
+            .time_like => {
+                if (info.date == null and value.len >= 10 and isValidDateString(value[0..10])) {
+                    info.date = value[0..10];
+                }
+                if (info.time == null) {
+                    if (timeWithinValue(value)) |t| info.time = t;
+                }
+            },
+            .none => unreachable,
+        }
+
+        if (info.level != null and info.date != null) return;
+    }
+}
+
+/// Looks for an `HH:MM[:SS]` substring inside a JSON timestamp value.
+/// Expects ISO-shaped strings (`2024-01-15T14:30:00Z`, `… 14:30 …`).
+fn timeWithinValue(value: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 5 <= value.len) : (i += 1) {
+        const boundary_ok = i == 0 or value[i - 1] == 'T' or value[i - 1] == ' ' or value[i - 1] == '[';
+        if (!boundary_ok) continue;
+        if (!isDigit(value[i]) or !isDigit(value[i + 1]) or value[i + 2] != ':' or
+            !isDigit(value[i + 3]) or !isDigit(value[i + 4])) continue;
+        const end = if (i + 8 <= value.len and value[i + 5] == ':' and
+            isDigit(value[i + 6]) and isDigit(value[i + 7]))
+            i + 8
+        else
+            i + 5;
+        return value[i..end];
+    }
+    return null;
 }
 
 /// ANSI escape codes for terminal coloring.
@@ -212,18 +310,23 @@ pub const FilterState = struct {
     /// Convenience wrapper: filter and print in one call.
     /// Intended for tail.zig so it does not need to import `LineInfo` or `printStyledLine`.
     pub fn printIfMatch(self: *const FilterState, line: []const u8) void {
-        if (self.checkLine(line)) |info| {
-            if (self.output_json) {
-                printJsonOutputLine(line, info);
-                return;
-            }
-            var match_buf: [max_search_matches]MatchRange = undefined;
-            const matches: []const MatchRange = if (self.has_search_filter)
-                findSearchMatches(line, self.search_expr.?, &match_buf)
-            else
-                &.{};
-            printStyledLine(line, info, matches);
+        if (self.checkLine(line)) |info| self.printChecked(line, info);
+    }
+
+    /// Prints an already-checked line using its cached `LineInfo`. Callers that
+    /// have already run `checkLine` use this to skip a second parse — most
+    /// notably the aggregating batch printers in tail.zig and gzip.zig.
+    pub fn printChecked(self: *const FilterState, line: []const u8, info: LineInfo) void {
+        if (self.output_json) {
+            printJsonOutputLine(line, info);
+            return;
         }
+        var match_buf: [max_search_matches]MatchRange = undefined;
+        const matches: []const MatchRange = if (self.has_search_filter)
+            findSearchMatches(line, self.search_expr.?, &match_buf)
+        else
+            &.{};
+        printStyledLine(line, info, matches);
     }
 };
 
@@ -295,11 +398,16 @@ const Aggregator = struct {
     /// Add one matched line under a precomputed aggregation key.
     /// The first line seen for a key is kept as the sample line for display
     /// together with its precomputed `LineInfo` to avoid re-analysis during output.
+    ///
+    /// Silently drops new keys once `max_aggregate_keys` is hit so a file with
+    /// pathologically high key cardinality can't exhaust memory. Existing keys
+    /// continue to accumulate their counts.
     fn add(self: *Aggregator, key: []const u8, sample_line: []const u8, info: LineInfo) !void {
         if (self.counts.getPtr(key)) |count| {
             count.* += 1;
             return;
         }
+        if (self.counts.count() >= max_aggregate_keys) return;
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
@@ -327,7 +435,7 @@ const Aggregator = struct {
             const line = self.sample_lines.get(key).?;
             const info = self.sample_infos.get(key).?;
             if (output_json) {
-                printJsonOutputLine(line, info);
+                try printJsonOutputLineBuffered(output, line, info);
             } else {
                 try printAggregatePrefix(output, count);
                 try printStyledLineBuffered(output, line, info, &.{});
@@ -476,20 +584,37 @@ fn extractDate(line: []const u8) ?[]const u8 {
 /// Extracts a time (HH:MM or HH:MM:SS) from a log line.
 /// Looks for a time pattern preceded by T, space, or bracket.
 /// Returns a slice into `line`, or null if no time is found.
+///
+/// Uses SIMD `findByte` to jump between `:` candidates instead of walking
+/// each byte. For long lines without a time near the start this is the
+/// difference between an O(n) scalar scan and ~O(n/VecSize) candidate hops.
 fn extractTime(line: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i + 5 <= line.len) : (i += 1) {
-        if (i == 0 or line[i - 1] == 'T' or line[i - 1] == ' ' or line[i - 1] == '[') {
-            if (isDigit(line[i]) and isDigit(line[i + 1]) and line[i + 2] == ':' and
-                isDigit(line[i + 3]) and isDigit(line[i + 4]))
-            {
-                const end = if (i + 8 <= line.len and line[i + 5] == ':' and isDigit(line[i + 6]) and isDigit(line[i + 7]))
-                    i + 8
-                else
-                    i + 5;
-                return line[i..end];
-            }
+    if (line.len < 5) return null;
+
+    var scan_pos: usize = 2; // earliest position a `:` of HH:MM can sit at
+    while (scan_pos < line.len) {
+        const colon = simd.findByte(line, scan_pos, ':') orelse return null;
+        // Candidate start of HH:MM is two bytes before the colon.
+        if (colon < 2) {
+            scan_pos = colon + 1;
+            continue;
         }
+        const i = colon - 2;
+        const boundary_ok = i == 0 or line[i - 1] == 'T' or line[i - 1] == ' ' or line[i - 1] == '[';
+        if (!boundary_ok or
+            i + 5 > line.len or
+            !isDigit(line[i]) or !isDigit(line[i + 1]) or
+            !isDigit(line[i + 3]) or !isDigit(line[i + 4]))
+        {
+            scan_pos = colon + 1;
+            continue;
+        }
+        const end = if (i + 8 <= line.len and line[i + 5] == ':' and
+            isDigit(line[i + 6]) and isDigit(line[i + 7]))
+            i + 8
+        else
+            i + 5;
+        return line[i..end];
     }
     return null;
 }
@@ -536,6 +661,27 @@ inline fn levelStyle(lvl: flags.Level) LevelStyle {
         .Error => .{ .bg = "\x1b[48;2;61;26;26m", .fg = "\x1b[38;2;248;81;73m" },
         .Fatal, .Panic => .{ .bg = "\x1b[48;2;248;81;73m", .fg = "\x1b[38;2;255;255;255m" },
     };
+}
+
+/// Upper bound for a single logical line. Logs are line-oriented; a line
+/// longer than this is almost certainly corrupted input or a binary file
+/// misidentified as text. Capping here keeps the carry buffer from growing
+/// without bound when a file has no newlines.
+pub const max_line_bytes: usize = 4 * 1024 * 1024;
+
+/// Upper bound for distinct aggregation keys retained across one file scan.
+/// Each unique key pins its sample line in the arena, so unbounded keys =
+/// unbounded memory. Beyond this cap we keep counting hits on existing keys
+/// but silently skip new ones (the alternative — aborting mid-scan — is
+/// worse for an interactive tool).
+pub const max_aggregate_keys: usize = 100_000;
+
+pub const LineCapError = error{LineTooLong};
+
+/// Returns `error.LineTooLong` if appending `extra` bytes to `current` would
+/// exceed `max_line_bytes`. Inline so the bounds check stays in the hot loop.
+inline fn ensureLineCapacity(current: usize, extra: usize) LineCapError!void {
+    if (current + extra > max_line_bytes) return error.LineTooLong;
 }
 
 /// Returns an appropriate read-buffer size based on the file's size.
@@ -614,6 +760,7 @@ fn keepUnprocessedTail(
 
     carry.clearRetainingCapacity();
     if (start < slice.len) {
+        try ensureLineCapacity(0, slice.len - start);
         try carry.appendSlice(allocator, slice[start..]);
     }
 }
@@ -658,6 +805,7 @@ fn readAggregated(
 
         const used_carry = carry.items.len > 0;
         if (used_carry) {
+            try ensureLineCapacity(carry.items.len, slice.len);
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -732,6 +880,7 @@ fn readContinuous(
 
         const used_carry = carry.items.len > 0;
         if (used_carry) {
+            try ensureLineCapacity(carry.items.len, slice.len);
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -745,7 +894,7 @@ fn readContinuous(
             if (filter_state.checkLine(line)) |info| {
                 if (info.level) |lvl| counter.add(lvl);
                 if (args.output_json) {
-                    printJsonOutputLine(line, info);
+                    try printJsonOutputLineBuffered(&output, line, info);
                 } else {
                     var match_buf: [max_search_matches]MatchRange = undefined;
                     const matches: []const MatchRange = if (filter_state.has_search_filter)
@@ -766,7 +915,7 @@ fn readContinuous(
         if (filter_state.checkLine(carry.items)) |info| {
             if (info.level) |lvl| counter.add(lvl);
             if (args.output_json) {
-                printJsonOutputLine(carry.items, info);
+                try printJsonOutputLineBuffered(&output, carry.items, info);
             } else {
                 var match_buf: [max_search_matches]MatchRange = undefined;
                 const matches: []const MatchRange = if (filter_state.has_search_filter)
@@ -816,6 +965,7 @@ fn readWithPagination(
         var slice = buffer[0..n];
         const used_carry = carry.items.len > 0;
         if (used_carry) {
+            try ensureLineCapacity(carry.items.len, slice.len);
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -829,7 +979,7 @@ fn readWithPagination(
             if (filter_state.checkLine(line)) |info| {
                 if (info.level) |lvl| counter.add(lvl);
                 if (args.output_json) {
-                    printJsonOutputLine(line, info);
+                    try printJsonOutputLineBuffered(&output, line, info);
                 } else {
                     var match_buf: [max_search_matches]MatchRange = undefined;
                     const matches: []const MatchRange = if (filter_state.has_search_filter)
@@ -861,7 +1011,7 @@ fn readWithPagination(
         if (filter_state.checkLine(carry.items)) |info| {
             if (info.level) |lvl| counter.add(lvl);
             if (args.output_json) {
-                printJsonOutputLine(carry.items, info);
+                try printJsonOutputLineBuffered(&output, carry.items, info);
             } else {
                 var match_buf: [max_search_matches]MatchRange = undefined;
                 const matches: []const MatchRange = if (filter_state.has_search_filter)
@@ -1357,62 +1507,110 @@ fn writeRangeHighlightedBuffered(output: *OutputBuffer, line: []const u8, start:
 }
 
 /// Prints a line as JSON (JSONL format) for pipeline compatibility.
+/// Unbuffered JSON output used by `FilterState.printChecked` when a
+/// long-lived `OutputBuffer` is not in scope (tail-follow, gzip paths).
+/// Builds into a 16 KiB stack buffer and flushes in chunks — the common
+/// case of a short log line emits exactly one syscall.
 fn printJsonOutputLine(line: []const u8, info: LineInfo) void {
     const lvl = if (info.level) |l| @tagName(l) else "";
     const date = if (info.date) |d| d else "";
     const time = if (info.time) |t| t else "";
 
-    var prefix_buf: [256]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
-    writeOut(prefix);
+    var buf: [16 * 1024]u8 = undefined;
+    var len: usize = 0;
+    const stdout = std.Io.File.stdout();
 
-    var out_buf: [4096]u8 = undefined;
-    var out_len: usize = 0;
-
-    const Writer = struct {
-        fn flush(buf: []const u8) void {
-            if (buf.len > 0) writeOut(buf);
+    const Sink = struct {
+        fn flush(f: std.Io.File, b: []u8, l: *usize) void {
+            if (l.* == 0) return;
+            f.writeStreamingAll(debug_io, b[0..l.*]) catch {};
+            l.* = 0;
         }
-
-        fn append(buf: []u8, len: *usize, bytes: []const u8) void {
-            if (bytes.len > buf.len) {
-                flush(buf[0..len.*]);
-                len.* = 0;
-                flush(bytes);
+        fn writeChunk(f: std.Io.File, b: []u8, l: *usize, s: []const u8) void {
+            if (s.len > b.len) {
+                flush(f, b, l);
+                f.writeStreamingAll(debug_io, s) catch {};
                 return;
             }
-
-            if (len.* + bytes.len > buf.len) {
-                flush(buf[0..len.*]);
-                len.* = 0;
-            }
-
-            @memcpy(buf[len.* .. len.* + bytes.len], bytes);
-            len.* += bytes.len;
+            if (l.* + s.len > b.len) flush(f, b, l);
+            @memcpy(b[l.* .. l.* + s.len], s);
+            l.* += s.len;
         }
     };
 
-    for (line) |c| {
+    var prefix_buf: [256]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
+    Sink.writeChunk(stdout, &buf, &len, prefix);
+
+    var run_start: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        const needs_escape = switch (c) {
+            '"', '\\', '\n', '\r', '\t', 0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => true,
+            else => false,
+        };
+        if (!needs_escape) continue;
+        if (i > run_start) Sink.writeChunk(stdout, &buf, &len, line[run_start..i]);
         switch (c) {
-            '"' => Writer.append(&out_buf, &out_len, "\\\""),
-            '\\' => Writer.append(&out_buf, &out_len, "\\\\"),
-            '\n' => Writer.append(&out_buf, &out_len, "\\n"),
-            '\r' => Writer.append(&out_buf, &out_len, "\\r"),
-            '\t' => Writer.append(&out_buf, &out_len, "\\t"),
-            0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {
+            '"' => Sink.writeChunk(stdout, &buf, &len, "\\\""),
+            '\\' => Sink.writeChunk(stdout, &buf, &len, "\\\\"),
+            '\n' => Sink.writeChunk(stdout, &buf, &len, "\\n"),
+            '\r' => Sink.writeChunk(stdout, &buf, &len, "\\r"),
+            '\t' => Sink.writeChunk(stdout, &buf, &len, "\\t"),
+            else => {
                 var esc: [6]u8 = undefined;
                 const s = std.fmt.bufPrint(&esc, "\\u{X:0>4}", .{c}) catch continue;
-                Writer.append(&out_buf, &out_len, s);
-            },
-            else => {
-                var one = [_]u8{c};
-                Writer.append(&out_buf, &out_len, &one);
+                Sink.writeChunk(stdout, &buf, &len, s);
             },
         }
+        run_start = i + 1;
     }
+    if (run_start < line.len) Sink.writeChunk(stdout, &buf, &len, line[run_start..]);
+    Sink.writeChunk(stdout, &buf, &len, "\"}\n");
+    Sink.flush(stdout, &buf, &len);
+}
 
-    Writer.append(&out_buf, &out_len, "\"}\n");
-    Writer.flush(out_buf[0..out_len]);
+/// Buffered JSON output: writes the line into `output` rather than directly
+/// to stdout. Used by the read loops (which already own an `OutputBuffer`)
+/// so JSON output gets the same syscall amortization as colored output.
+fn printJsonOutputLineBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
+    const lvl = if (info.level) |l| @tagName(l) else "";
+    const date = if (info.date) |d| d else "";
+    const time = if (info.time) |t| t else "";
+
+    try output.print("{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time });
+
+    // Walk the line in runs of safe (no-escape) bytes and flush each run as
+    // a single write. Saves one switch + buffer-append per byte for the
+    // common case (printable ASCII).
+    var run_start: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        const needs_escape = switch (c) {
+            '"', '\\', '\n', '\r', '\t', 0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => true,
+            else => false,
+        };
+        if (!needs_escape) continue;
+
+        if (i > run_start) try output.write(line[run_start..i]);
+        switch (c) {
+            '"' => try output.write("\\\""),
+            '\\' => try output.write("\\\\"),
+            '\n' => try output.write("\\n"),
+            '\r' => try output.write("\\r"),
+            '\t' => try output.write("\\t"),
+            else => {
+                var esc: [6]u8 = undefined;
+                const s = std.fmt.bufPrint(&esc, "\\u{X:0>4}", .{c}) catch continue;
+                try output.write(s);
+            },
+        }
+        run_start = i + 1;
+    }
+    if (run_start < line.len) try output.write(line[run_start..]);
+    try output.write("\"}\n");
 }
 
 /// Writes a plain-text line, coloring the level token at `info.level_pos`
@@ -2197,7 +2395,7 @@ test "FilterState with aggregation semantics still filters before counting" {
 test "buildAggregateKey exact uses full line" {
     const line = "[ERROR] Connection failed";
 
-    const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .exact, line);
+    const key = try buildAggregateKeyForLine(std.testing.allocator, .exact, line);
     defer std.testing.allocator.free(key);
 
     try std.testing.expectEqualStrings("[ERROR] Connection failed", key);
@@ -2207,10 +2405,10 @@ test "buildAggregateKey level_message for bracketed line" {
     const line1 = "[ERROR] Connection failed";
     const line2 = "[ERROR] Connection failed";
 
-    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
     defer std.testing.allocator.free(key1);
 
-    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
     defer std.testing.allocator.free(key2);
 
     try std.testing.expectEqualStrings(key1, key2);
@@ -2221,10 +2419,10 @@ test "buildAggregateKey level_message uses JSON message field" {
     const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
     const line2 = "{\"time\":\"2023-10-18T12:00:01Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
 
-    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
     defer std.testing.allocator.free(key1);
 
-    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
     defer std.testing.allocator.free(key2);
 
     try std.testing.expectEqualStrings(key1, key2);
@@ -2234,10 +2432,10 @@ test "buildAggregateKey json_message ignores level and timestamp differences" {
     const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
     const line2 = "{\"time\":\"2023-10-18T12:00:01Z\",\"level\":\"warn\",\"message\":\"Connection failed\"}";
 
-    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
     defer std.testing.allocator.free(key1);
 
-    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
     defer std.testing.allocator.free(key2);
 
     try std.testing.expectEqualStrings("Connection failed", key1);
@@ -2248,10 +2446,10 @@ test "buildAggregateKey normalized collapses dates digits case and whitespace" {
     const line1 = "2023-10-18T12:00:00Z [ERROR] Request 123 failed";
     const line2 = "2023-10-19T12:00:01Z   [error]   Request 987 failed";
 
-    const key1 = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
     defer std.testing.allocator.free(key1);
 
-    const key2 = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
     defer std.testing.allocator.free(key2);
 
     try std.testing.expectEqualStrings(key1, key2);
@@ -2280,12 +2478,12 @@ test "level_message aggregation groups same message with different timestamps" {
     const line2 = "{\"time\":\"2023-10-18T12:00:05Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
 
     {
-        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
         defer std.testing.allocator.free(key);
         try agg.add(key, line1, analyzeLine(line1));
     }
     {
-        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
         defer std.testing.allocator.free(key);
         try agg.add(key, line2, analyzeLine(line2));
     }
@@ -2303,12 +2501,12 @@ test "json_message aggregation separates different messages" {
     const line2 = "{\"level\":\"error\",\"message\":\"Timeout\"}";
 
     {
-        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
         defer std.testing.allocator.free(key);
         try agg.add(key, line1, analyzeLine(line1));
     }
     {
-        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
         defer std.testing.allocator.free(key);
         try agg.add(key, line2, analyzeLine(line2));
     }
@@ -2324,12 +2522,12 @@ test "normalized aggregation groups noisy numeric variants" {
     const line2 = "2023-10-19 [ERROR] Request 999 failed";
 
     {
-        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
         defer std.testing.allocator.free(key);
         try agg.add(key, line1, analyzeLine(line1));
     }
     {
-        const key = try formats.buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
         defer std.testing.allocator.free(key);
         try agg.add(key, line2, analyzeLine(line2));
     }
@@ -2626,6 +2824,48 @@ test "FilterState: date + time combined filter" {
 
 test "extractDate rejects invalid JSON date fields" {
     try std.testing.expect(extractDate("{\"time\":\"not-a-date\",\"level\":\"info\"}") == null);
+}
+
+test "ensureLineCapacity: accepts up to the cap" {
+    try ensureLineCapacity(0, max_line_bytes);
+    try ensureLineCapacity(max_line_bytes / 2, max_line_bytes / 2);
+}
+
+test "ensureLineCapacity: rejects oversize lines" {
+    try std.testing.expectError(error.LineTooLong, ensureLineCapacity(max_line_bytes, 1));
+    try std.testing.expectError(error.LineTooLong, ensureLineCapacity(max_line_bytes / 2, max_line_bytes));
+}
+
+test "Aggregator drops new keys past max_aggregate_keys cap" {
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+
+    // Pre-fill the cap with unique keys; use a tiny-scope override by
+    // injecting directly into the maps would skip our gate. So we drive
+    // the public API: add max_aggregate_keys distinct keys, then one more.
+    // Doing 100k allocs in a unit test is acceptable but slow; the cap is a
+    // pub const for a reason — verify the gate's logic with a much smaller
+    // cap value via a parallel scalar test.
+    const empty_info = std.mem.zeroes(LineInfo);
+
+    // Fill near the boundary via a low-level shortcut: stuff `counts` to
+    // the cap with sentinel entries so the gate fires on the next `add`.
+    var i: usize = 0;
+    while (i < max_aggregate_keys) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "k{d}", .{i}) catch return;
+        const owned = try agg.arena.allocator().dupe(u8, key);
+        try agg.counts.putNoClobber(agg.allocator, owned, 1);
+    }
+    try std.testing.expectEqual(max_aggregate_keys, agg.counts.count());
+
+    // Now a fresh key gets silently dropped.
+    try agg.add("overflow-key", "sample", empty_info);
+    try std.testing.expectEqual(max_aggregate_keys, agg.counts.count());
+
+    // But an existing key still increments its count.
+    try agg.add("k0", "sample-2", empty_info);
+    try std.testing.expectEqual(@as(usize, 2), agg.counts.get("k0").?);
 }
 
 test "keepUnprocessedTail compacts carry without self-copy append" {

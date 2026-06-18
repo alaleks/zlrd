@@ -1,7 +1,16 @@
 const std = @import("std");
 const flags = @import("flags");
 const formats = @import("formats.zig");
+const reader = @import("reader.zig");
 const simd = @import("simd");
+
+/// Same cap as `reader.max_line_bytes`; lifted to a local alias so the hot
+/// loop avoids the indirection on every iteration.
+const max_line_bytes: usize = reader.max_line_bytes;
+
+inline fn ensureLineCapacity(current: usize, extra: usize) reader.LineCapError!void {
+    if (current + extra > max_line_bytes) return error.LineTooLong;
+}
 
 // Track open files with manual position tracking.
 const OpenFile = struct {
@@ -63,11 +72,14 @@ fn findLastNLinesStart(f: *OpenFile, file_size: u64, n: usize, scan_buf: []u8) !
 
 /// Batch-local aggregator used by tail reads.
 /// Keeps first-seen order within one read batch and prints once per key.
+/// Caches the `LineInfo` produced by `FilterState.checkLine` so `printAll`
+/// can reuse it via `printChecked` instead of re-parsing every line.
 const BatchAggregator = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     counts: std.StringHashMapUnmanaged(usize),
     sample_lines: std.StringHashMapUnmanaged([]const u8),
+    sample_infos: std.StringHashMapUnmanaged(formats.LineInfo),
     order: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) !BatchAggregator {
@@ -76,6 +88,7 @@ const BatchAggregator = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .counts = .{},
             .sample_lines = .{},
+            .sample_infos = .{},
             .order = try std.ArrayList([]const u8).initCapacity(allocator, 32),
         };
     }
@@ -83,11 +96,17 @@ const BatchAggregator = struct {
     fn deinit(self: *BatchAggregator) void {
         self.counts.deinit(self.allocator);
         self.sample_lines.deinit(self.allocator);
+        self.sample_infos.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.arena.deinit();
     }
 
-    fn add(self: *BatchAggregator, key: []const u8, sample_line: []const u8) !void {
+    fn add(
+        self: *BatchAggregator,
+        key: []const u8,
+        sample_line: []const u8,
+        info: formats.LineInfo,
+    ) !void {
         if (self.counts.getPtr(key)) |count| {
             count.* += 1;
             return;
@@ -102,6 +121,9 @@ const BatchAggregator = struct {
         try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
         errdefer _ = self.sample_lines.remove(owned_key);
 
+        try self.sample_infos.putNoClobber(self.allocator, owned_key, info);
+        errdefer _ = self.sample_infos.remove(owned_key);
+
         try self.order.append(self.allocator, owned_key);
     }
 
@@ -109,6 +131,7 @@ const BatchAggregator = struct {
         for (self.order.items) |key| {
             const count = self.counts.get(key).?;
             const line = self.sample_lines.get(key).?;
+            const info = self.sample_infos.get(key).?;
 
             if (count > 1 and !filter_state.output_json) {
                 var buf: [128]u8 = undefined;
@@ -116,7 +139,9 @@ const BatchAggregator = struct {
                 std.Io.File.stdout().writeStreamingAll(tail_io, prefix) catch {};
             }
 
-            filter_state.printIfMatch(line);
+            // Line + info were already validated by checkLine in processLine;
+            // print directly to avoid a redundant second parse.
+            filter_state.printChecked(line, info);
         }
     }
 };
@@ -187,7 +212,10 @@ pub fn follow(
         var any_read = false;
 
         for (files_buf[0..files_len], carries) |*f, *carry| {
-            const stat = f.fd.stat(tail_io) catch continue;
+            const stat = f.fd.stat(tail_io) catch |err| {
+                logTailError("stat", f.path, err);
+                continue;
+            };
 
             if (f.position > stat.size) {
                 // File was truncated — reset to beginning.
@@ -196,7 +224,10 @@ pub fn follow(
                 continue;
             }
 
-            const bytes_read = readAvailable(allocator, f, args, &filter_state, carry, read_buf) catch continue;
+            const bytes_read = readAvailable(allocator, f, args, &filter_state, carry, read_buf) catch |err| {
+                logTailError("read", f.path, err);
+                continue;
+            };
             if (bytes_read > 0) any_read = true;
         }
 
@@ -204,6 +235,16 @@ pub fn follow(
             std.Io.sleep(tail_io, std.Io.Duration.fromMilliseconds(100), .awake) catch continue;
         }
     }
+}
+
+/// Prints a one-line warning to stderr when a tail-follow read fails. Tail
+/// mode must keep running across transient errors (file rotated, network
+/// fs hiccup), but we shouldn't swallow them silently — every failed read
+/// is a potentially lost log entry.
+fn logTailError(op: []const u8, path: []const u8, err: anyerror) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "tail {s} {s}: {s}\n", .{ op, path, @errorName(err) }) catch return;
+    std.Io.File.stderr().writeStreamingAll(tail_io, msg) catch {};
 }
 
 /// Reads the last `args.num_lines` lines (default 10) from `file`,
@@ -288,6 +329,7 @@ fn readToEOFInternal(
 
         const used_carry = carry.items.len > 0;
         if (used_carry) {
+            try ensureLineCapacity(carry.items.len, slice.len);
             try carry.appendSlice(allocator, slice);
             slice = carry.items;
         }
@@ -334,6 +376,7 @@ fn keepUnprocessedTail(
 
     carry.clearRetainingCapacity();
     if (start < slice.len) {
+        try ensureLineCapacity(0, slice.len - start);
         try carry.appendSlice(allocator, slice[start..]);
     }
 }
@@ -351,12 +394,13 @@ fn processLine(
     }
 
     // Reuse LineInfo produced by checkLine — buildAggregateKey accepts it
-    // directly, avoiding a second parse of the line for key construction.
+    // directly, avoiding a second parse of the line for key construction,
+    // and the aggregator caches it so printAll skips a third one.
     if (filter_state.checkLine(line)) |info| {
         const key = try formats.buildAggregateKey(allocator, args.aggregate_mode, line, info);
         defer allocator.free(key);
 
-        try aggregator.?.add(key, line);
+        try aggregator.?.add(key, line, info);
     }
 }
 
@@ -590,9 +634,11 @@ test "batch aggregator counts identical keys and keeps first line" {
     var agg = try BatchAggregator.init(testing.allocator);
     defer agg.deinit();
 
-    try agg.add("error\x1ffailed", "[ERROR] failed");
-    try agg.add("error\x1ffailed", "[ERROR] failed");
-    try agg.add("warn\x1fslow", "[WARN] slow");
+    // Use a no-op LineInfo — the tests below only assert counts/sample lines.
+    const empty_info: formats.LineInfo = std.mem.zeroes(formats.LineInfo);
+    try agg.add("error\x1ffailed", "[ERROR] failed", empty_info);
+    try agg.add("error\x1ffailed", "[ERROR] failed", empty_info);
+    try agg.add("warn\x1fslow", "[WARN] slow", empty_info);
 
     try testing.expectEqual(@as(usize, 2), agg.order.items.len);
     try testing.expectEqual(@as(usize, 2), agg.counts.get("error\x1ffailed").?);

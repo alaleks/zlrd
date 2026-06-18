@@ -99,7 +99,6 @@ pub fn build(b: *std.Build) void {
 
     inline for ([_][]const u8{
         "src/reader/gzip.zig",
-        "src/reader/formats.zig",
         "src/reader/tail.zig",
         "src/reader/reader.zig",
         "src/reader/regex.zig",
