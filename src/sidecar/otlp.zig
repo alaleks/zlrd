@@ -154,27 +154,55 @@ fn encodeNumberDataPoint(enc: *pb.Encoder, point: MetricPoint) !void {
     enc.endMessage(dp);
 }
 
-fn encodeMetric(enc: *pb.Encoder, point: MetricPoint) !void {
+/// Emits one OTLP `Metric` message containing every data point in `group`.
+/// All points in `group` must share the same `name` and `is_monotonic` — the
+/// caller (`encodeMetricsRequest`) guarantees this by grouping. Per OTLP
+/// spec, distinct attribute sets become NumberDataPoint entries inside the
+/// same Metric, NOT separate Metric entries with the same name.
+fn encodeMetricGroup(enc: *pb.Encoder, group: []const MetricPoint) !void {
+    if (group.len == 0) return;
+    const first = group[0];
+
     // ScopeMetrics.metrics = 2
     const m = try enc.beginMessage(2);
-    try enc.writeStringField(1, point.name);
-    if (point.description.len > 0) try enc.writeStringField(2, point.description);
-    if (point.unit.len > 0) try enc.writeStringField(3, point.unit);
+    try enc.writeStringField(1, first.name);
+    if (first.description.len > 0) try enc.writeStringField(2, first.description);
+    if (first.unit.len > 0) try enc.writeStringField(3, first.unit);
 
-    if (point.is_monotonic) {
+    if (first.is_monotonic) {
         // Metric.sum = 7
         const sum = try enc.beginMessage(7);
-        try encodeNumberDataPoint(enc, point);
+        for (group) |p| try encodeNumberDataPoint(enc, p);
         try enc.writeVarintField(2, 2); // aggregation_temporality = CUMULATIVE
         try enc.writeVarintField(3, 1); // is_monotonic = true
         enc.endMessage(sum);
     } else {
         // Metric.gauge = 5
         const gauge = try enc.beginMessage(5);
-        try encodeNumberDataPoint(enc, point);
+        for (group) |p| try encodeNumberDataPoint(enc, p);
         enc.endMessage(gauge);
     }
     enc.endMessage(m);
+}
+
+/// Walks `points` in order, accumulating contiguous runs of equal `name`
+/// into a single OTLP `Metric` message. The caller is responsible for
+/// presenting points already ordered by name (the agent's metric emitters
+/// naturally produce this layout — each name is emitted as a contiguous
+/// block).
+fn emitGroupedMetrics(enc: *pb.Encoder, points: []const MetricPoint) !void {
+    var i: usize = 0;
+    while (i < points.len) {
+        const name = points[i].name;
+        const monotonic = points[i].is_monotonic;
+        var j: usize = i + 1;
+        while (j < points.len and
+            std.mem.eql(u8, points[j].name, name) and
+            points[j].is_monotonic == monotonic) : (j += 1)
+        {}
+        try encodeMetricGroup(enc, points[i..j]);
+        i = j;
+    }
 }
 
 /// Encodes an `ExportMetricsServiceRequest` carrying a single ResourceMetrics
@@ -205,7 +233,7 @@ pub fn encodeMetricsRequest(
             try enc.writeStringField(1, scope_name);
             enc.endMessage(scope);
         }
-        for (points) |p| try encodeMetric(&enc, p);
+        try emitGroupedMetrics(&enc, points);
         enc.endMessage(sm);
     }
 
@@ -344,4 +372,70 @@ test "encodeMetricsRequest: gauge variant skips Sum" {
     // Metric.gauge = 5 should be present; Metric.sum = 7 should not.
     try testing.expect(findLenField(metric, 5) != null);
     try testing.expect(findLenField(metric, 7) == null);
+}
+
+test "encodeMetricsRequest: groups same-name points into one Metric" {
+    // Three points all named zlrd_lines_total with different label sets:
+    // per OTLP spec they MUST share a single Metric with three NumberDataPoint
+    // entries inside its Sum field — emitting three separate Metric messages
+    // is non-canonical and inflates the payload.
+    const a1: [1]Attr = .{.{ .key = "level", .value = .{ .string = "info" } }};
+    const a2: [1]Attr = .{.{ .key = "level", .value = .{ .string = "warn" } }};
+    const a3: [1]Attr = .{.{ .key = "level", .value = .{ .string = "error" } }};
+    const base: MetricPoint = .{
+        .name = "zlrd_lines_total",
+        .is_monotonic = true,
+        .time_unix_nano = 2_000_000_000,
+        .start_time_unix_nano = 1_000_000_000,
+        .value = 0,
+        .attrs = &.{},
+    };
+    var points: [3]MetricPoint = .{ base, base, base };
+    points[0].attrs = &a1;
+    points[0].value = 1;
+    points[1].attrs = &a2;
+    points[1].value = 2;
+    points[2].attrs = &a3;
+    points[2].value = 3;
+
+    const bytes = try encodeMetricsRequest(testing.allocator, &.{}, &points);
+    defer testing.allocator.free(bytes);
+
+    // ResourceMetrics → ScopeMetrics → exactly ONE Metric entry should exist.
+    const rm = findLenField(bytes, 1) orelse return error.MissingResourceMetrics;
+    const sm = findLenField(rm, 2) orelse return error.MissingScopeMetrics;
+
+    // Count direct Metric (field 2) children under sm.
+    var i: usize = 0;
+    var metric_count: usize = 0;
+    while (i < sm.len) {
+        var tag: u64 = 0;
+        var shift: u6 = 0;
+        while (i < sm.len) {
+            const byte = sm[i];
+            i += 1;
+            tag |= @as(u64, byte & 0x7f) << shift;
+            if (byte & 0x80 == 0) break;
+            shift += 7;
+        }
+        const fnum: u32 = @intCast(tag >> 3);
+        const wire: u3 = @intCast(tag & 0x7);
+        if (wire == 2) { // LEN
+            var len: u64 = 0;
+            shift = 0;
+            while (i < sm.len) {
+                const byte = sm[i];
+                i += 1;
+                len |= @as(u64, byte & 0x7f) << shift;
+                if (byte & 0x80 == 0) break;
+                shift += 7;
+            }
+            if (fnum == 2) metric_count += 1;
+            i += @intCast(len);
+        } else if (wire == 0) {
+            while (i < sm.len) : (i += 1) if (sm[i] & 0x80 == 0) break;
+            i += 1;
+        } else break;
+    }
+    try testing.expectEqual(@as(usize, 1), metric_count);
 }

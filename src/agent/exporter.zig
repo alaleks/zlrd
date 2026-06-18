@@ -47,6 +47,11 @@ const QueuedLog = struct {
     attrs: []otlp.Attr,
 };
 
+/// Per-flush wall-clock budget. Default 30 s — generous for healthy
+/// collectors, short enough that a wedge gets noticed within seconds of
+/// shutdown.
+pub const default_flush_deadline_ms: u64 = 30_000;
+
 pub const Options = struct {
     /// OTLP/HTTP base URL — must be https://.
     base_url: []const u8,
@@ -54,6 +59,8 @@ pub const Options = struct {
     headers: []const std.http.Header,
     /// Background flush cadence. Default 5s.
     flush_interval_ms: u64 = default_flush_interval_ms,
+    /// Per-flush deadline (see `flush_deadline_ms` on `Sidecar`).
+    flush_deadline_ms: u64 = default_flush_deadline_ms,
     /// Max events buffered between flushes. Default 1024.
     max_queue: usize = default_max_queue,
     /// Resource attributes attached to every batch (e.g. `host.name`,
@@ -69,24 +76,43 @@ pub const Sidecar = struct {
     transport: transport.Transport,
     flush_interval_ms: u64,
     max_queue: usize,
+    /// Per-flush wall-clock budget. If a flush exceeds this we log a warning
+    /// and (on shutdown) abort the transport so the process can exit even if
+    /// the upstream collector wedged. std.http.Client 0.16 has no per-request
+    /// timeout, so this is enforced as a watchdog on the flush thread itself.
+    flush_deadline_ms: u64,
+
     metrics: *const metrics_mod.Metrics,
 
     /// Resource attrs always sent with each batch (owns the slice copy so the
     /// caller's storage can be transient).
     resource_attrs: []otlp.Attr,
 
+    /// Std 0.16 unified mutex API behind the `std.Io` abstraction. The
+    /// previous comment about preferring `std.Thread.Mutex` doesn't apply
+    /// here: that type was removed in 0.16 alongside the I/O migration.
     mutex: std.Io.Mutex = .init,
     /// Active producer-facing buffer + arena. Swapped under `mutex` at flush.
     active: Buffer,
 
     /// Set by `stop` — the flush thread observes it on each tick.
     shutdown: std.atomic.Value(bool) = .init(false),
-    /// Number of events dropped because the queue was full since startup.
-    dropped: std.atomic.Value(u64) = .init(0),
-    /// Number of events successfully posted since startup.
+    /// Events dropped because the queue hit its `max_queue` cap.
+    dropped_queue_full: std.atomic.Value(u64) = .init(0),
+    /// Events dropped because cloning into the arena ran out of memory.
+    dropped_alloc: std.atomic.Value(u64) = .init(0),
+    /// Number of log records successfully posted since startup.
     sent: std.atomic.Value(u64) = .init(0),
-    /// Number of failed POSTs since startup (after retries exhausted).
-    failed: std.atomic.Value(u64) = .init(0),
+    /// Failed POSTs after exhausting retries (transient — likely worth alerting).
+    failed_retryable: std.atomic.Value(u64) = .init(0),
+    /// Failed POSTs from non-retryable status codes (config bugs — alert page).
+    failed_non_retryable: std.atomic.Value(u64) = .init(0),
+
+    /// Monotonic timestamp the most recent flush started at (ms). Used by
+    /// `stop` to detect a wedged flush and force-abort the transport.
+    flush_started_at_ms: std.atomic.Value(i64) = .init(0),
+    /// Set by the flush thread when it returns; cleared at flush start.
+    flush_in_progress: std.atomic.Value(bool) = .init(false),
 
     thread: ?std.Thread = null,
 
@@ -115,6 +141,7 @@ pub const Sidecar = struct {
         errdefer tr.deinit();
 
         const attrs_copy = try allocator.alloc(otlp.Attr, opts.resource_attrs.len);
+        errdefer allocator.free(attrs_copy);
         @memcpy(attrs_copy, opts.resource_attrs);
 
         return .{
@@ -122,6 +149,7 @@ pub const Sidecar = struct {
             .io = io,
             .transport = tr,
             .flush_interval_ms = opts.flush_interval_ms,
+            .flush_deadline_ms = opts.flush_deadline_ms,
             .max_queue = opts.max_queue,
             .metrics = opts.metrics,
             .resource_attrs = attrs_copy,
@@ -140,15 +168,52 @@ pub const Sidecar = struct {
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
-    /// Signals shutdown and joins the flush thread. Calls a final flush so
-    /// in-flight events are not lost.
+    /// Signals shutdown and joins the flush thread. Time-bounded: if the
+    /// flush thread is wedged inside a stalled HTTP fetch, we give it
+    /// `flush_deadline_ms` to settle, then tear down the HTTP client to
+    /// unblock the syscall. After join returns we drain one final flush
+    /// so in-flight events aren't lost (unless the watchdog already aborted
+    /// the transport).
     pub fn stop(self: *Sidecar) void {
         self.shutdown.store(true, .release);
         if (self.thread) |t| {
-            t.join();
+            self.joinWithWatchdog(t);
             self.thread = null;
         }
         self.flushOnce();
+    }
+
+    fn joinWithWatchdog(self: *Sidecar, t: std.Thread) void {
+        // Spawn a watchdog that, after `flush_deadline_ms`, force-aborts the
+        // in-flight flush by tearing down the HTTP client. join() then
+        // unblocks because the syscall inside fetch returns an error.
+        const Wd = struct {
+            fn run(s: *Sidecar) void {
+                const deadline_ms = s.flush_deadline_ms;
+                var elapsed: u64 = 0;
+                const tick: u64 = 100;
+                while (elapsed < deadline_ms) {
+                    if (!s.flush_in_progress.load(.acquire)) return;
+                    std.Io.sleep(s.io, std.Io.Duration.fromMilliseconds(@intCast(tick)), .awake) catch return;
+                    elapsed += tick;
+                }
+                if (s.flush_in_progress.load(.acquire)) {
+                    log.warn("sidecar: flush wedged past deadline; aborting transport", .{});
+                    s.transport.client.deinit();
+                    // Re-init a fresh client so subsequent flushOnce calls
+                    // from `stop()` (after join returns) don't double-free.
+                    s.transport.client = .{ .allocator = s.allocator, .io = s.io };
+                }
+            }
+        };
+        const watchdog = std.Thread.spawn(.{}, Wd.run, .{self}) catch {
+            // Best-effort: without a watchdog we may block on join, but the
+            // process is shutting down anyway.
+            t.join();
+            return;
+        };
+        t.join();
+        watchdog.join();
     }
 
     // ─── Producer API ────────────────────────────────────────────────────
@@ -262,28 +327,28 @@ pub const Sidecar = struct {
         defer self.mutex.unlock(self.io);
 
         if (self.active.queue.items.len >= self.max_queue) {
-            _ = self.dropped.fetchAdd(1, .monotonic);
+            _ = self.dropped_queue_full.fetchAdd(1, .monotonic);
             return;
         }
 
         const arena_alloc = self.active.arena.allocator();
         const body_copy = arena_alloc.dupe(u8, body) catch {
-            _ = self.dropped.fetchAdd(1, .monotonic);
+            _ = self.dropped_alloc.fetchAdd(1, .monotonic);
             return;
         };
 
         const attrs_copy = arena_alloc.alloc(otlp.Attr, attrs_in.len) catch {
-            _ = self.dropped.fetchAdd(1, .monotonic);
+            _ = self.dropped_alloc.fetchAdd(1, .monotonic);
             return;
         };
         for (attrs_in, 0..) |a, i| {
             const key_copy = arena_alloc.dupe(u8, a.key) catch {
-                _ = self.dropped.fetchAdd(1, .monotonic);
+                _ = self.dropped_alloc.fetchAdd(1, .monotonic);
                 return;
             };
             const value_copy: otlp.Value = switch (a.value) {
                 .string => |s| .{ .string = arena_alloc.dupe(u8, s) catch {
-                    _ = self.dropped.fetchAdd(1, .monotonic);
+                    _ = self.dropped_alloc.fetchAdd(1, .monotonic);
                     return;
                 } },
                 .int => |n| .{ .int = n },
@@ -292,6 +357,8 @@ pub const Sidecar = struct {
             attrs_copy[i] = .{ .key = key_copy, .value = value_copy };
         }
 
+        // `severity_text` is borrowed from a static table (`severityText`)
+        // and has program-wide lifetime — no clone needed.
         self.active.queue.append(self.allocator, .{
             .time_unix_nano = time_ns,
             .severity = severity,
@@ -299,14 +366,23 @@ pub const Sidecar = struct {
             .body = body_copy,
             .attrs = attrs_copy,
         }) catch {
-            _ = self.dropped.fetchAdd(1, .monotonic);
+            _ = self.dropped_alloc.fetchAdd(1, .monotonic);
         };
     }
 
+    /// Drift-free scheduler: sleeps until `last_tick + interval` rather than
+    /// for a fixed `interval` regardless of how long the previous flush took.
+    /// Prevents the cadence from slowly skewing on slow collectors.
     fn runLoop(self: *Sidecar) void {
+        var next_wake_ms = nowMs(self.io) + @as(i64, @intCast(self.flush_interval_ms));
         while (!self.shutdown.load(.acquire)) {
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(self.flush_interval_ms)), .awake) catch break;
+            const now = nowMs(self.io);
+            const sleep_ms: u64 = if (next_wake_ms > now) @intCast(next_wake_ms - now) else 0;
+            if (sleep_ms > 0) {
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(sleep_ms)), .awake) catch break;
+            }
             self.flushOnce();
+            next_wake_ms += @intCast(self.flush_interval_ms);
         }
     }
 
@@ -322,16 +398,34 @@ pub const Sidecar = struct {
         };
         defer stale.deinit(self.allocator);
 
+        self.flush_started_at_ms.store(nowMs(self.io), .release);
+        self.flush_in_progress.store(true, .release);
+        defer self.flush_in_progress.store(false, .release);
+
         if (stale.queue.items.len > 0) {
             self.sendLogs(stale.queue.items);
         }
         self.sendMetrics();
     }
 
+    /// Splits `items` into chunks no larger than `max_records_per_batch`
+    /// and posts each chunk separately. Collectors enforce per-request
+    /// size limits (typically 4 MiB); without chunking a max_queue=1024
+    /// flush could produce an oversized payload that gets rejected with
+    /// 413 — every event in the batch lost.
     fn sendLogs(self: *Sidecar, items: []const QueuedLog) void {
-        // Map QueuedLog → otlp.LogRecord. Slices are already in the stale arena.
+        const max_records_per_batch: usize = 256;
+        var off: usize = 0;
+        while (off < items.len) {
+            const end = @min(off + max_records_per_batch, items.len);
+            self.sendLogsChunk(items[off..end]);
+            off = end;
+        }
+    }
+
+    fn sendLogsChunk(self: *Sidecar, items: []const QueuedLog) void {
         const records = self.allocator.alloc(otlp.LogRecord, items.len) catch {
-            _ = self.failed.fetchAdd(1, .monotonic);
+            _ = self.failed_retryable.fetchAdd(1, .monotonic);
             return;
         };
         defer self.allocator.free(records);
@@ -346,15 +440,15 @@ pub const Sidecar = struct {
         }
 
         const payload = otlp.encodeLogsRequest(self.allocator, self.resource_attrs, records) catch {
-            _ = self.failed.fetchAdd(1, .monotonic);
+            _ = self.failed_retryable.fetchAdd(1, .monotonic);
             return;
         };
         defer self.allocator.free(payload);
 
-        if (self.transport.send(.logs, payload)) {
-            _ = self.sent.fetchAdd(@intCast(items.len), .monotonic);
-        } else {
-            _ = self.failed.fetchAdd(1, .monotonic);
+        switch (self.transport.send(.logs, payload)) {
+            .success => _ = self.sent.fetchAdd(@intCast(items.len), .monotonic),
+            .retryable_exhausted, .encoding_failed => _ = self.failed_retryable.fetchAdd(1, .monotonic),
+            .non_retryable => _ = self.failed_non_retryable.fetchAdd(1, .monotonic),
         }
     }
 
@@ -369,25 +463,31 @@ pub const Sidecar = struct {
         const start_ns = timeNsFromMs(self.metrics.started_at_ms);
 
         addCounters(a, &points, self.metrics, now_ns, start_ns) catch {
-            _ = self.failed.fetchAdd(1, .monotonic);
+            _ = self.failed_retryable.fetchAdd(1, .monotonic);
             return;
         };
         addSidecarSelfMetrics(a, &points, self, now_ns, start_ns) catch {
-            _ = self.failed.fetchAdd(1, .monotonic);
+            _ = self.failed_retryable.fetchAdd(1, .monotonic);
             return;
         };
 
         const payload = otlp.encodeMetricsRequest(self.allocator, self.resource_attrs, points.items) catch {
-            _ = self.failed.fetchAdd(1, .monotonic);
+            _ = self.failed_retryable.fetchAdd(1, .monotonic);
             return;
         };
         defer self.allocator.free(payload);
 
-        if (!self.transport.send(.metrics, payload)) {
-            _ = self.failed.fetchAdd(1, .monotonic);
+        switch (self.transport.send(.metrics, payload)) {
+            .success => {},
+            .retryable_exhausted, .encoding_failed => _ = self.failed_retryable.fetchAdd(1, .monotonic),
+            .non_retryable => _ = self.failed_non_retryable.fetchAdd(1, .monotonic),
         }
     }
 };
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
+}
 
 fn timeNsFromMs(ms: i64) u64 {
     if (ms <= 0) return 0;
@@ -411,6 +511,10 @@ fn addCounters(
     start_ns: u64,
 ) !void {
     // Per-level line counters → Sum/CUMULATIVE with `level` attribute.
+    // Emitted as a contiguous block of MetricPoints sharing one `name` so
+    // `encodeMetricsRequest` can group them into a single OTLP `Metric`
+    // with multiple NumberDataPoint entries (canonical per spec; collectors
+    // reject duplicate Metric identities within a ScopeMetrics).
     for (metrics_mod.level_labels, 0..) |level_label, i| {
         const attrs = try a.alloc(otlp.Attr, 1);
         attrs[0] = .{ .key = "level", .value = .{ .string = level_label } };
@@ -425,7 +529,7 @@ fn addCounters(
         });
     }
 
-    // Per-rule alert counters.
+    // Per-rule alert counters — same grouping principle as above.
     const rule_fields = @typeInfo(metrics_mod.RuleKind).@"enum".fields;
     inline for (rule_fields) |f| {
         const kind: metrics_mod.RuleKind = @enumFromInt(f.value);
@@ -498,23 +602,53 @@ fn addSidecarSelfMetrics(
         .value = @intCast(s.sent.load(.monotonic)),
         .attrs = &.{},
     });
+    // Two `zlrd_sidecar_dropped_total` points, labelled by drop reason —
+    // they share a name so the encoder will group them under one Metric.
+    const queue_attrs = try a.alloc(otlp.Attr, 1);
+    queue_attrs[0] = .{ .key = "reason", .value = .{ .string = "queue_full" } };
     try points.append(a, .{
         .name = "zlrd_sidecar_dropped_total",
-        .description = "Events dropped because the queue was full.",
+        .description = "Events dropped, by reason.",
         .is_monotonic = true,
         .time_unix_nano = now_ns,
         .start_time_unix_nano = start_ns,
-        .value = @intCast(s.dropped.load(.monotonic)),
-        .attrs = &.{},
+        .value = @intCast(s.dropped_queue_full.load(.monotonic)),
+        .attrs = queue_attrs,
     });
+    const alloc_attrs = try a.alloc(otlp.Attr, 1);
+    alloc_attrs[0] = .{ .key = "reason", .value = .{ .string = "alloc_failed" } };
+    try points.append(a, .{
+        .name = "zlrd_sidecar_dropped_total",
+        .description = "Events dropped, by reason.",
+        .is_monotonic = true,
+        .time_unix_nano = now_ns,
+        .start_time_unix_nano = start_ns,
+        .value = @intCast(s.dropped_alloc.load(.monotonic)),
+        .attrs = alloc_attrs,
+    });
+
+    // Two `zlrd_sidecar_failed_total` points, labelled by category.
+    const retry_attrs = try a.alloc(otlp.Attr, 1);
+    retry_attrs[0] = .{ .key = "category", .value = .{ .string = "retryable_exhausted" } };
     try points.append(a, .{
         .name = "zlrd_sidecar_failed_total",
-        .description = "Failed POSTs after exhausting retries.",
+        .description = "Failed POSTs, by category.",
         .is_monotonic = true,
         .time_unix_nano = now_ns,
         .start_time_unix_nano = start_ns,
-        .value = @intCast(s.failed.load(.monotonic)),
-        .attrs = &.{},
+        .value = @intCast(s.failed_retryable.load(.monotonic)),
+        .attrs = retry_attrs,
+    });
+    const nonretry_attrs = try a.alloc(otlp.Attr, 1);
+    nonretry_attrs[0] = .{ .key = "category", .value = .{ .string = "non_retryable" } };
+    try points.append(a, .{
+        .name = "zlrd_sidecar_failed_total",
+        .description = "Failed POSTs, by category.",
+        .is_monotonic = true,
+        .time_unix_nano = now_ns,
+        .start_time_unix_nano = start_ns,
+        .value = @intCast(s.failed_non_retryable.load(.monotonic)),
+        .attrs = nonretry_attrs,
     });
 }
 
