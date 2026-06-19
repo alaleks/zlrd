@@ -21,6 +21,15 @@ const log = std.log.scoped(.zlrd_watcher);
 const read_buf_size = 64 * 1024;
 const poll_interval_ms = 100;
 const silence_check_interval_ms = 1_000;
+
+/// Soft cap on bytes consumed from a single file per outer iteration. The
+/// previous "one chunk per iteration" rule was too aggressive — a multi-MB
+/// backlog turned into thousands of extra stat() syscalls because the
+/// rotation-detection stat was done per chunk. The new policy: drain up to
+/// `max_bytes_per_pass` bytes (≈ 64 chunks) from a file in one go, then
+/// yield so other files get a turn. Fairness is preserved (one busy file
+/// can't starve others indefinitely) and syscall overhead drops by ~64×.
+const max_bytes_per_pass: usize = 4 * 1024 * 1024;
 /// Cap on a single line. Anything longer is truncated; the truncated portion
 /// is dropped (and the next byte after the cap starts a new line).
 ///
@@ -43,6 +52,10 @@ const FileState = struct {
     /// Per-file lifecycle tracker. Non-null only when the file's path is
     /// bound to a `--service NAME=PATH` mapping.
     tracker: ?service.Tracker,
+    /// Per-file latch for the silence rule. Owned here (rather than on the
+    /// `RuleSet`) so one file's silence alert doesn't suppress the alert
+    /// for every other silent file in the same window.
+    silence_latch_epoch: ?u64 = null,
 };
 
 pub const Watcher = struct {
@@ -193,12 +206,11 @@ pub const Watcher = struct {
         }
     }
 
-    /// Reads at most one `read_buf_size` chunk per call so the outer loop
-    /// in `run()` round-robins fairly across all watched files. The previous
-    /// implementation drained one file to EOF before moving on — a busy file
-    /// could starve all the others. The outer loop sets `any_read=true`
-    /// whenever any file produced bytes, so fast files still get back-to-back
-    /// iterations and aren't throttled by the no-data sleep.
+    /// Drains up to `max_bytes_per_pass` bytes from one file, then yields so
+    /// the outer loop can give other files a turn. The two stat() syscalls
+    /// (rotation + size) happen once per pass, not once per chunk — the
+    /// previous "one chunk per call" version cost an extra 30k+ syscalls
+    /// when starting up against a large backlog.
     fn drainFile(self: *Watcher, f: *FileState) !usize {
         // Path-level stat catches the "logrotate / restart created a new
         // file at this path" case — the open fd still points at the old
@@ -222,11 +234,18 @@ pub const Watcher = struct {
         }
         if (stat.size == f.position) return 0;
 
-        const n = try f.fd.readPositional(self.io, &.{self.read_buf}, f.position);
-        if (n == 0) return 0;
-        f.position += n;
-        try self.processChunk(f, self.read_buf[0..n]);
-        return n;
+        var consumed: usize = 0;
+        while (consumed < max_bytes_per_pass) {
+            const n = try f.fd.readPositional(self.io, &.{self.read_buf}, f.position);
+            if (n == 0) break;
+            consumed += n;
+            f.position += n;
+            try self.processChunk(f, self.read_buf[0..n]);
+            // Short read → caught up with EOF for now, stop and let other
+            // files get a turn.
+            if (n < self.read_buf.len) break;
+        }
+        return consumed;
     }
 
     fn handleRotation(self: *Watcher, f: *FileState, new_inode: u64) !void {
@@ -286,7 +305,14 @@ pub const Watcher = struct {
     fn runSilenceChecks(self: *Watcher, now_ms: i64) void {
         var fired: [1]rules.Fired = undefined;
         for (self.files) |*f| {
-            const n = self.rules.checkSilence(self.io, f.path, f.last_line_ms, now_ms, &fired);
+            const n = self.rules.checkSilence(
+                self.io,
+                f.path,
+                f.last_line_ms,
+                now_ms,
+                &f.silence_latch_epoch,
+                &fired,
+            );
             for (fired[0..n]) |entry| self.dispatcher.dispatch(entry, now_ms);
         }
     }

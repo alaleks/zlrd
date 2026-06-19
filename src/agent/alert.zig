@@ -110,8 +110,12 @@ pub const Dispatcher = struct {
         var buf: [8192]u8 = undefined;
         const payload = formatServiceEventJson(&buf, event, now_ms) catch return;
 
+        // `.crash` is the only durability-critical kind here — `stop` and
+        // `restart` are housekeeping that don't justify a per-record fsync.
+        const sync_to_disk = event.kind == .crash;
+
         if (self.sinks.stderr) self.writeStderr(payload);
-        if (self.file != null) self.writeFile(payload);
+        if (self.file != null) self.writeFile(payload, sync_to_disk);
         if (self.webhook_sender) |send| {
             for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
         }
@@ -134,7 +138,9 @@ pub const Dispatcher = struct {
         const payload = kernel.formatEventJson(&buf, event, now_ms) catch return;
 
         if (self.sinks.stderr) self.writeStderr(payload);
-        if (self.file != null) self.writeFile(payload);
+        // Every kernel event is durability-critical — the next instant may
+        // be a panic that takes the box down.
+        if (self.file != null) self.writeFile(payload, true);
         if (self.webhook_sender) |send| {
             for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
         }
@@ -152,8 +158,12 @@ pub const Dispatcher = struct {
         var buf: [2048]u8 = undefined;
         const payload = formatAlert(&buf, fired, now_ms) catch return;
 
+        // Rule alerts (error_rate, regex, first_seen, silence) don't earn
+        // an fsync — they're statistical, not crash forensics. Skipping
+        // the sync keeps the watcher thread unblocked under bursty match
+        // rates on slow filesystems (NFS, etc.).
         if (self.sinks.stderr) self.writeStderr(payload);
-        if (self.file != null) self.writeFile(payload);
+        if (self.file != null) self.writeFile(payload, false);
         if (self.webhook_sender) |send| {
             for (self.sinks.webhooks) |url| {
                 send(self.webhook_ctx, url, payload);
@@ -169,19 +179,28 @@ pub const Dispatcher = struct {
         stderr.writeStreamingAll(self.io, "\n") catch return;
     }
 
-    fn writeFile(self: *Dispatcher, payload: []const u8) void {
+    fn writeFile(self: *Dispatcher, payload: []const u8, sync_to_disk: bool) void {
         const f = self.file orelse return;
+
+        // Combine payload + newline into a single buffer so the write is one
+        // syscall. The previous version did payload-then-newline; a transient
+        // error between the two left a 1-byte gap that broke downstream
+        // JSONL readers. 16 KiB is comfortably larger than every render
+        // buffer the dispatchers use (8 KiB max for service events).
+        var combined: [16 * 1024]u8 = undefined;
+        if (payload.len + 1 > combined.len) return;
+        @memcpy(combined[0..payload.len], payload);
+        combined[payload.len] = '\n';
+        const record = combined[0 .. payload.len + 1];
+
         self.file_mutex.lockUncancelable(self.io);
         defer self.file_mutex.unlock(self.io);
-        f.writePositionalAll(self.io, payload, self.file_offset) catch return;
-        self.file_offset += payload.len;
-        f.writePositionalAll(self.io, "\n", self.file_offset) catch return;
-        self.file_offset += 1;
-        // Force the record to disk before returning. Without this an alert
-        // about a crash can race a power loss or kernel panic — exactly the
-        // failure modes this file is meant to outlive. Cost: ~1 ms per
-        // alert on local disk; well below human-interactive rates.
-        f.sync(self.io) catch {};
+        f.writePositionalAll(self.io, record, self.file_offset) catch return;
+        self.file_offset += record.len;
+        // Only fsync when the caller asked — crash + kernel events. Rule
+        // alerts skip the sync to keep the dispatcher thread unblocked on
+        // slow filesystems (NFS measured ~50 ms per fsync).
+        if (sync_to_disk) f.sync(self.io) catch {};
     }
 };
 

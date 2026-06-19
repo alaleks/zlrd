@@ -112,7 +112,6 @@ pub const RuleSet = struct {
     seen_enabled: bool,
     seen: std.AutoHashMapUnmanaged(u64, void),
     silence_window_ms: ?u64,
-    last_fire_silence_epoch: ?u64 = null,
 
     /// Constructs a RuleSet from a parsed AgentConfig. Owns the `regexes`
     /// slice and `seen` map; takes a borrowed slice of regex specs.
@@ -233,12 +232,18 @@ pub const RuleSet = struct {
 
     /// Called periodically by the watcher. If no line has been observed for a
     /// given file in the silence window, fires once per window period.
+    ///
+    /// `latch` is per-file state owned by the caller (typically a field on
+    /// the watcher's `FileState`). Each file needs its own latch so one
+    /// file's silence alert doesn't suppress alerts for every other silent
+    /// file in the same window.
     pub fn checkSilence(
         self: *RuleSet,
         io: std.Io,
         file_path: []const u8,
         last_line_ms: i64,
         now_ms: i64,
+        latch: *?u64,
         out: []Fired,
     ) usize {
         const window = self.silence_window_ms orelse return 0;
@@ -250,10 +255,10 @@ pub const RuleSet = struct {
         if (now_ms - last_line_ms < @as(i64, @intCast(window))) return 0;
 
         const epoch = epochOf(now_ms, window);
-        if (self.last_fire_silence_epoch) |prev| {
+        if (latch.*) |prev| {
             if (prev == epoch) return 0;
         }
-        self.last_fire_silence_epoch = epoch;
+        latch.* = epoch;
 
         out[0] = .{
             .kind = .silence,
@@ -419,14 +424,40 @@ test "RuleSet: checkSilence fires after window elapses, latches per epoch" {
 
     const io = std.Options.debug_io;
     var out: [4]Fired = undefined;
+    var latch: ?u64 = null;
 
     // last_line at t=0, now=500ms -> within window, no fire.
-    try testing.expectEqual(@as(usize, 0), rs.checkSilence(io, "a.log", 0, 500, &out));
+    try testing.expectEqual(@as(usize, 0), rs.checkSilence(io, "a.log", 0, 500, &latch, &out));
 
     // last_line at t=0, now=2000ms -> >= 1s, fires once.
-    try testing.expectEqual(@as(usize, 1), rs.checkSilence(io, "a.log", 0, 2_000, &out));
+    try testing.expectEqual(@as(usize, 1), rs.checkSilence(io, "a.log", 0, 2_000, &latch, &out));
     try testing.expectEqual(metrics.RuleKind.silence, out[0].kind);
 
     // Same epoch -> latched, no fire.
-    try testing.expectEqual(@as(usize, 0), rs.checkSilence(io, "a.log", 0, 2_500, &out));
+    try testing.expectEqual(@as(usize, 0), rs.checkSilence(io, "a.log", 0, 2_500, &latch, &out));
+}
+
+test "RuleSet.checkSilence: per-file latch lets other files fire in the same epoch" {
+    const allocator = testing.allocator;
+
+    var args = flags.Args{};
+    args.metrics_token = "t";
+    args.alert_silence = "1s";
+
+    var cfg = try config.AgentConfig.fromArgs(allocator, args);
+    defer cfg.deinit(allocator);
+
+    var rs = try RuleSet.init(allocator, cfg);
+    defer rs.deinit();
+
+    const io = std.Options.debug_io;
+    var out: [4]Fired = undefined;
+    var latch_a: ?u64 = null;
+    var latch_b: ?u64 = null;
+
+    // Both files silent past the window; both must fire even though they
+    // hit the same epoch. The previous implementation used a single shared
+    // latch on the RuleSet so the second file was silently suppressed.
+    try testing.expectEqual(@as(usize, 1), rs.checkSilence(io, "a.log", 0, 2_000, &latch_a, &out));
+    try testing.expectEqual(@as(usize, 1), rs.checkSilence(io, "b.log", 0, 2_000, &latch_b, &out));
 }

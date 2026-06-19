@@ -37,7 +37,14 @@ pub const Sender = struct {
     extra_headers: []std.http.Header,
 
     mutex: std.Io.Mutex = .init,
+    /// Backing storage for the queue. Items are produced at the tail and
+    /// consumed at `head`; we never shift the array. When the head catches
+    /// the tail we reset both to 0 and `clearRetainingCapacity` the
+    /// ArrayList so it doesn't grow without bound. This makes `takeOne`
+    /// amortized O(1) — the previous `orderedRemove(0)` was O(n) and on
+    /// burst-drain became O(n²) under the mutex.
     queue: std.ArrayList(QueuedPost),
+    head: usize = 0,
 
     shutdown: std.atomic.Value(bool) = .init(false),
     /// Number of webhook events dropped since startup (queue full or
@@ -77,8 +84,10 @@ pub const Sender = struct {
     pub fn deinit(self: *Sender) void {
         self.stop();
         // Anything still queued at shutdown is dropped — the worker had
-        // its chance during the drain phase of `stop`.
-        for (self.queue.items) |*q| q.deinit(self.allocator);
+        // its chance during the drain phase of `stop`. Only items at
+        // index `head..len` are live; the head-skipped slots have
+        // already been consumed and freed.
+        for (self.queue.items[self.head..]) |*q| q.deinit(self.allocator);
         self.queue.deinit(self.allocator);
         self.client.deinit();
         self.allocator.free(self.extra_headers);
@@ -105,7 +114,8 @@ pub const Sender = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.queue.items.len >= max_pending) {
+        const pending = self.queue.items.len - self.head;
+        if (pending >= max_pending) {
             _ = self.dropped_total.fetchAdd(1, .monotonic);
             return;
         }
@@ -150,11 +160,21 @@ pub const Sender = struct {
         }
     }
 
+    /// Pops the oldest queued item in amortized O(1). We advance `head`
+    /// instead of shifting the array; once everything in the current
+    /// batch has been drained the ArrayList is cleared so it doesn't
+    /// keep growing across bursts.
     fn takeOne(self: *Sender) ?QueuedPost {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.queue.items.len == 0) return null;
-        return self.queue.orderedRemove(0);
+        if (self.head >= self.queue.items.len) return null;
+        const item = self.queue.items[self.head];
+        self.head += 1;
+        if (self.head == self.queue.items.len) {
+            self.head = 0;
+            self.queue.clearRetainingCapacity();
+        }
+        return item;
     }
 
     fn postOne(self: *Sender, url: []const u8, payload: []const u8) void {
@@ -197,12 +217,39 @@ test "Sender: drops events past max_pending" {
     while (i < max_pending) : (i += 1) {
         sender.send("https://example.test/hook", "{}");
     }
-    try testing.expectEqual(max_pending, sender.queue.items.len);
+    try testing.expectEqual(max_pending, sender.queue.items.len - sender.head);
     try testing.expectEqual(@as(u64, 0), sender.dropped_total.load(.monotonic));
 
     sender.send("https://example.test/hook", "{}");
-    try testing.expectEqual(max_pending, sender.queue.items.len);
+    try testing.expectEqual(max_pending, sender.queue.items.len - sender.head);
     try testing.expectEqual(@as(u64, 1), sender.dropped_total.load(.monotonic));
+}
+
+test "Sender: takeOne returns items FIFO and resets when drained" {
+    const io = std.Options.debug_io;
+    var sender = try Sender.init(testing.allocator, io, &.{});
+    defer sender.deinit();
+
+    sender.send("https://x/1", "{\"i\":1}");
+    sender.send("https://x/2", "{\"i\":2}");
+    sender.send("https://x/3", "{\"i\":3}");
+
+    var first = sender.takeOne().?;
+    try testing.expectEqualStrings("https://x/1", first.url);
+    first.deinit(sender.allocator);
+
+    var second = sender.takeOne().?;
+    try testing.expectEqualStrings("https://x/2", second.url);
+    second.deinit(sender.allocator);
+
+    var third = sender.takeOne().?;
+    try testing.expectEqualStrings("https://x/3", third.url);
+    third.deinit(sender.allocator);
+
+    // Fully drained — head must have been reset to 0 and storage cleared.
+    try testing.expectEqual(@as(usize, 0), sender.head);
+    try testing.expectEqual(@as(usize, 0), sender.queue.items.len);
+    try testing.expect(sender.takeOne() == null);
 }
 
 test "Sender: stop is idempotent and safe before start" {
