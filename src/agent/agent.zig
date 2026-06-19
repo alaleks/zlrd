@@ -57,6 +57,7 @@ pub fn run(
     defer if (sender_storage) |*s| s.deinit();
     if (cfg.sinks.webhooks.len > 0) {
         sender_storage = try webhook.Sender.init(allocator, io, cfg.sinks.webhook_headers);
+        try sender_storage.?.start();
         dispatcher.setWebhookSender(webhook.sendThunk, &sender_storage.?);
     }
 
@@ -162,8 +163,14 @@ pub fn run(
         log.info("journal source '{s}' tracking unit pattern '{s}'", .{ spec.name, spec.pattern });
     }
 
+    // Track whether the watcher's main loop died on us. We still want all
+    // the defers below to run (server shutdown, kernel monitor join, etc.),
+    // so we can't `return err` straight away — instead we record the
+    // failure and surface it via the exit code after cleanup completes.
+    var watcher_failed = false;
     w.run() catch |err| {
-        log.warn("watcher exited: {t}", .{err});
+        log.err("watcher exited unexpectedly: {t}", .{err});
+        watcher_failed = true;
     };
 
     srv.requestShutdown();
@@ -172,7 +179,9 @@ pub fn run(
     nudgeListener(io, cfg.listen_addr);
     server_thread.join();
 
-    return if (dispatcher.shouldExit()) 1 else 0;
+    if (dispatcher.shouldExit()) return 1;
+    if (watcher_failed) return 2;
+    return 0;
 }
 
 fn runServer(srv: *server.Server) void {

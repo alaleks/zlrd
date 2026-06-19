@@ -70,7 +70,10 @@ pub const Server = struct {
     fn serve(self: *Server, stream: std.Io.net.Stream) void {
         defer stream.close(self.io);
 
-        var recv_buffer: [4096]u8 = undefined;
+        // 8 KiB recv buffer matches HTTP/1.1 typical limits — Bearer tokens
+        // with JWT payloads can run 1-2 KiB on their own, plus standard
+        // request headers. 4 KiB rejected those requests with parse errors.
+        var recv_buffer: [8 * 1024]u8 = undefined;
         var send_buffer: [8192]u8 = undefined;
         var conn_reader = stream.reader(self.io, &recv_buffer);
         var conn_writer = stream.writer(self.io, &send_buffer);

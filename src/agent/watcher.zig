@@ -22,9 +22,14 @@ const read_buf_size = 64 * 1024;
 const poll_interval_ms = 100;
 const silence_check_interval_ms = 1_000;
 /// Cap on a single line. Anything longer is truncated; the truncated portion
-/// is dropped (and the next byte after the cap starts a new line). Matches the
-/// JSON payload buffer we use for alerts.
-const max_line_bytes = 1_536;
+/// is dropped (and the next byte after the cap starts a new line).
+///
+/// Sized at 8 KiB so realistic structured log lines (multi-KB JSON, java
+/// stack frames) fit without truncation. The previous 1.5 KiB cap was too
+/// aggressive — it broke first-seen signature computation and crash-marker
+/// detection for any line where the marker sat past the cap. The signature
+/// buffer in `signature.zig` is sized to match.
+const max_line_bytes = 8 * 1024;
 
 const FileState = struct {
     path: []const u8,
@@ -98,10 +103,19 @@ pub const Watcher = struct {
 
         // Compile user-supplied crash markers once. Pure-Zig regex engine
         // borrows the pattern slice; cfg outlives the watcher.
+        //
+        // Track `built` so a mid-loop compile failure cleans up the regexes
+        // we already allocated — otherwise an InvalidCrashMarker after the
+        // first successful pattern leaked all the compiled regex internals.
         const regexes = try allocator.alloc(regex.Regex, cfg.crash_markers.len);
-        errdefer allocator.free(regexes);
+        var built: usize = 0;
+        errdefer {
+            for (regexes[0..built]) |*r| r.deinit();
+            allocator.free(regexes);
+        }
         for (cfg.crash_markers, 0..) |pattern, i| {
             regexes[i] = regex.Regex.compile(pattern) orelse return error.InvalidCrashMarker;
+            built += 1;
         }
 
         m.setFilesWatched(files.len);
@@ -179,6 +193,12 @@ pub const Watcher = struct {
         }
     }
 
+    /// Reads at most one `read_buf_size` chunk per call so the outer loop
+    /// in `run()` round-robins fairly across all watched files. The previous
+    /// implementation drained one file to EOF before moving on — a busy file
+    /// could starve all the others. The outer loop sets `any_read=true`
+    /// whenever any file produced bytes, so fast files still get back-to-back
+    /// iterations and aren't throttled by the no-data sleep.
     fn drainFile(self: *Watcher, f: *FileState) !usize {
         // Path-level stat catches the "logrotate / restart created a new
         // file at this path" case — the open fd still points at the old
@@ -202,16 +222,11 @@ pub const Watcher = struct {
         }
         if (stat.size == f.position) return 0;
 
-        var consumed: usize = 0;
-        while (true) {
-            const n = try f.fd.readPositional(self.io, &.{self.read_buf}, f.position);
-            if (n == 0) break;
-            consumed += n;
-            f.position += n;
-            try self.processChunk(f, self.read_buf[0..n]);
-            if (n < self.read_buf.len) break;
-        }
-        return consumed;
+        const n = try f.fd.readPositional(self.io, &.{self.read_buf}, f.position);
+        if (n == 0) return 0;
+        f.position += n;
+        try self.processChunk(f, self.read_buf[0..n]);
+        return n;
     }
 
     fn handleRotation(self: *Watcher, f: *FileState, new_inode: u64) !void {

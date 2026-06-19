@@ -30,6 +30,7 @@ pub const ParseError = error{
     InvalidRegexSpec,
     InvalidHeaderSpec,
     InvalidServiceSpec,
+    InvalidJournalSpec,
     MissingMetricsToken,
     InvalidBatchSize,
     InvalidSidecarUrl,
@@ -204,8 +205,8 @@ pub fn parseServiceSpec(s: []const u8) ParseError!ServiceSpec {
 /// Parses `NAME=UNIT_PATTERN`. Pattern is opaque — passed through to
 /// `journalctl -u`, which natively supports `*` and `?` globs.
 pub fn parseJournalSpec(s: []const u8) ParseError!JournalSpec {
-    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidServiceSpec;
-    if (eq == 0 or eq == s.len - 1) return error.InvalidServiceSpec;
+    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidJournalSpec;
+    if (eq == 0 or eq == s.len - 1) return error.InvalidJournalSpec;
     return .{ .name = s[0..eq], .pattern = s[eq + 1 ..] };
 }
 
@@ -377,9 +378,9 @@ test "parseJournalSpec: splits NAME=UNIT_PATTERN" {
 }
 
 test "parseJournalSpec: rejects malformed input" {
-    try testing.expectError(error.InvalidServiceSpec, parseJournalSpec("noequals"));
-    try testing.expectError(error.InvalidServiceSpec, parseJournalSpec("=onlypath"));
-    try testing.expectError(error.InvalidServiceSpec, parseJournalSpec("onlyname="));
+    try testing.expectError(error.InvalidJournalSpec, parseJournalSpec("noequals"));
+    try testing.expectError(error.InvalidJournalSpec, parseJournalSpec("=onlypath"));
+    try testing.expectError(error.InvalidJournalSpec, parseJournalSpec("onlyname="));
 }
 
 test "AgentConfig: services parsed and serviceForPath lookup works" {

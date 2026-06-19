@@ -50,8 +50,12 @@ pub fn isErrorLevel(level: flags.Level) bool {
 ///   - Other bytes are passed through verbatim.
 ///
 /// Returns the SipHash64 digest of the normalized buffer.
+///
+/// The buffer is sized to match `watcher.max_line_bytes` so the first-seen
+/// hash is computed over the same byte range the watcher actually surfaces
+/// — if the watcher's cap rises, this needs to track it.
 pub fn errorSignature(line: []const u8) u64 {
-    var buf: [4096]u8 = undefined;
+    var buf: [8 * 1024]u8 = undefined;
     const n = normalizeInto(&buf, line);
     return std.hash.Wyhash.hash(0, buf[0..n]);
 }

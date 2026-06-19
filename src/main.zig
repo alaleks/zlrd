@@ -267,6 +267,8 @@ fn agentErrorMessage(err: anyerror) []const u8 {
         error.InvalidRegexSpec => "invalid --alert-regex spec (expected <pattern>:N/Ws)",
         error.InvalidRegexPattern => "invalid regex pattern in --alert-regex",
         error.InvalidHeaderSpec => "invalid --webhook-header spec (expected 'Name: Value')",
+        error.InvalidServiceSpec => "invalid --service spec (expected NAME=PATH)",
+        error.InvalidJournalSpec => "invalid --journal-unit spec (expected NAME=UNIT_PATTERN)",
         error.InvalidBatchSize => "invalid --sidecar-batch-size (expected positive integer)",
         error.InvalidSidecarUrl => "invalid --sidecar URL (must start with https://)",
         error.TlsRequired => "sidecar requires an https:// URL",

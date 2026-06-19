@@ -2,9 +2,18 @@
 //! Uses `std.http.Client` so both `http://` and `https://` work via the
 //! standard library — no third-party deps.
 //!
-//! Delivery is best-effort: HTTP failures are logged via `std.log` and the
-//! watcher loop continues. The shared `Client` is reused across calls so the
-//! connection pool can keep keep-alive connections warm.
+//! Concurrency model: producers (watcher thread, journal threads, kernel
+//! monitor threads) call `send` from any thread. `send` clones the URL and
+//! payload, pushes onto a bounded queue, and returns immediately. A single
+//! worker thread drains the queue and performs the actual HTTP POSTs.
+//!
+//! This makes the producer side non-blocking (a wedged collector cannot
+//! stall log processing) and keeps `std.http.Client` confined to one
+//! thread (avoids races on the shared connection pool).
+//!
+//! Delivery is still best-effort: HTTP failures are logged via `std.log`
+//! and the queue moves on. Backpressure: when the queue is full new events
+//! are dropped and `dropped_total` increments.
 
 const std = @import("std");
 
@@ -12,43 +21,143 @@ const config = @import("config.zig");
 
 const log = std.log.scoped(.zlrd_webhook);
 
+/// Bounded queue cap. Sized so a brief burst (1–2 seconds of high-rate
+/// alerts) fits without dropping, but a wedged collector can't grow it
+/// without bound.
+pub const max_pending: usize = 256;
+
+/// Polling cadence when the queue is empty. The worker also responds to
+/// shutdown promptly because it checks the flag on every iteration.
+const idle_sleep_ms: u32 = 50;
+
 pub const Sender = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     client: std.http.Client,
-    headers: []const config.HeaderSpec,
     extra_headers: []std.http.Header,
+
+    mutex: std.Io.Mutex = .init,
+    queue: std.ArrayList(QueuedPost),
+
+    shutdown: std.atomic.Value(bool) = .init(false),
+    /// Number of webhook events dropped since startup (queue full or
+    /// allocation failure). Exposed for diagnostics.
+    dropped_total: std.atomic.Value(u64) = .init(0),
+
+    thread: ?std.Thread = null,
+
+    const QueuedPost = struct {
+        url: []u8,
+        payload: []u8,
+
+        fn deinit(self: *QueuedPost, allocator: std.mem.Allocator) void {
+            allocator.free(self.url);
+            allocator.free(self.payload);
+        }
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         headers: []const config.HeaderSpec,
     ) !Sender {
-        // Pre-build the std.http.Header array once — same shape every call.
         const extra = try allocator.alloc(std.http.Header, headers.len);
         for (headers, 0..) |h, i| {
             extra[i] = .{ .name = h.name, .value = h.value };
         }
-        // Always attach a content-type for the JSON payload.
-        // (Caller may override via --webhook-header.)
         return .{
             .allocator = allocator,
             .io = io,
             .client = .{ .allocator = allocator, .io = io },
-            .headers = headers,
             .extra_headers = extra,
+            .queue = .empty,
         };
     }
 
     pub fn deinit(self: *Sender) void {
+        self.stop();
+        // Anything still queued at shutdown is dropped — the worker had
+        // its chance during the drain phase of `stop`.
+        for (self.queue.items) |*q| q.deinit(self.allocator);
+        self.queue.deinit(self.allocator);
         self.client.deinit();
         self.allocator.free(self.extra_headers);
         self.* = undefined;
     }
 
-    /// Posts `payload` to `url`. Returns void: any error is logged. Designed
-    /// to plug into `alert.Dispatcher.setWebhookSender` via `sendThunk`.
+    pub fn start(self: *Sender) !void {
+        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+    }
+
+    /// Signals shutdown and joins the worker. Idempotent.
+    pub fn stop(self: *Sender) void {
+        self.shutdown.store(true, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    /// Enqueues a webhook POST. Returns immediately — the actual HTTP call
+    /// happens on the worker thread. Drops the event if the queue is full
+    /// or allocation fails; `dropped_total` is incremented in either case.
     pub fn send(self: *Sender, url: []const u8, payload: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.queue.items.len >= max_pending) {
+            _ = self.dropped_total.fetchAdd(1, .monotonic);
+            return;
+        }
+
+        const url_copy = self.allocator.dupe(u8, url) catch {
+            _ = self.dropped_total.fetchAdd(1, .monotonic);
+            return;
+        };
+        errdefer self.allocator.free(url_copy);
+
+        const payload_copy = self.allocator.dupe(u8, payload) catch {
+            _ = self.dropped_total.fetchAdd(1, .monotonic);
+            return;
+        };
+        errdefer self.allocator.free(payload_copy);
+
+        self.queue.append(self.allocator, .{
+            .url = url_copy,
+            .payload = payload_copy,
+        }) catch {
+            _ = self.dropped_total.fetchAdd(1, .monotonic);
+        };
+    }
+
+    fn runLoop(self: *Sender) void {
+        while (!self.shutdown.load(.acquire)) {
+            const work = self.takeOne() orelse {
+                std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(idle_sleep_ms), .awake) catch break;
+                continue;
+            };
+            self.postOne(work.url, work.payload);
+            self.allocator.free(work.url);
+            self.allocator.free(work.payload);
+        }
+
+        // Drain whatever remained at shutdown. Best-effort — we still want
+        // alerts that producers enqueued moments before stop to land.
+        while (self.takeOne()) |work| {
+            self.postOne(work.url, work.payload);
+            self.allocator.free(work.url);
+            self.allocator.free(work.payload);
+        }
+    }
+
+    fn takeOne(self: *Sender) ?QueuedPost {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.queue.items.len == 0) return null;
+        return self.queue.orderedRemove(0);
+    }
+
+    fn postOne(self: *Sender, url: []const u8, payload: []const u8) void {
         const result = self.client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
@@ -72,4 +181,34 @@ pub const Sender = struct {
 pub fn sendThunk(ctx: ?*anyopaque, url: []const u8, payload: []const u8) void {
     const sender: *Sender = @ptrCast(@alignCast(ctx orelse return));
     sender.send(url, payload);
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "Sender: drops events past max_pending" {
+    const io = std.Options.debug_io;
+    var sender = try Sender.init(testing.allocator, io, &.{});
+    defer sender.deinit();
+    // Don't start the worker — we just want to verify the bounded enqueue.
+
+    var i: usize = 0;
+    while (i < max_pending) : (i += 1) {
+        sender.send("https://example.test/hook", "{}");
+    }
+    try testing.expectEqual(max_pending, sender.queue.items.len);
+    try testing.expectEqual(@as(u64, 0), sender.dropped_total.load(.monotonic));
+
+    sender.send("https://example.test/hook", "{}");
+    try testing.expectEqual(max_pending, sender.queue.items.len);
+    try testing.expectEqual(@as(u64, 1), sender.dropped_total.load(.monotonic));
+}
+
+test "Sender: stop is idempotent and safe before start" {
+    const io = std.Options.debug_io;
+    var sender = try Sender.init(testing.allocator, io, &.{});
+    defer sender.deinit();
+    sender.stop();
+    sender.stop(); // second call is a no-op
 }

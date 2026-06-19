@@ -177,6 +177,11 @@ pub const Dispatcher = struct {
         self.file_offset += payload.len;
         f.writePositionalAll(self.io, "\n", self.file_offset) catch return;
         self.file_offset += 1;
+        // Force the record to disk before returning. Without this an alert
+        // about a crash can race a power loss or kernel panic — exactly the
+        // failure modes this file is meant to outlive. Cost: ~1 ms per
+        // alert on local disk; well below human-interactive rates.
+        f.sync(self.io) catch {};
     }
 };
 
@@ -245,8 +250,15 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
             '\n' => try w.writeAll("\\n"),
             '\r' => try w.writeAll("\\r"),
             '\t' => try w.writeAll("\\t"),
-            0...0x07, 0x0b, 0x0e...0x1f => try w.print("\\u{x:0>4}", .{c}),
-            else => try w.writeByte(c),
+            0x08 => try w.writeAll("\\b"),
+            0x0c => try w.writeAll("\\f"),
+            // ASCII printable excluding `"` (0x22) and `\\` (0x5c) which
+            // are handled above as explicit escape arms.
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try w.writeByte(c),
+            // Remaining controls + DEL + high bytes. Log payloads may
+            // contain UTF-8 or stray control bytes; emit them as `\uXX` so
+            // the JSON is always parseable downstream.
+            else => try w.print("\\u{x:0>4}", .{c}),
         }
     }
     try w.writeByte('"');

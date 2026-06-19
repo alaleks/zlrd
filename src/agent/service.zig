@@ -354,8 +354,6 @@ pub const Tracker = struct {
     pub fn observeInodeChange(self: *Tracker, now_ms: i64) ServiceEvent {
         self.last_log_ms = now_ms;
         self.restart_count += 1;
-        const prev = self.state;
-        _ = prev;
         self.state = .running;
         // Drop any in-flight crash collection — the restart supersedes it.
         self.trace.reset();
