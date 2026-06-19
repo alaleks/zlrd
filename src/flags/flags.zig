@@ -108,7 +108,12 @@ pub const Args = struct {
     sidecar_flush_interval: ?[]const u8 = null,
     sidecar_batch_size: ?[]const u8 = null,
 
-    pub fn deinit(self: Args, allocator: std.mem.Allocator) void {
+    /// Frees all owned slices and invalidates `self` via `undefined`. Taking
+    /// `*Args` (rather than `Args`) means a debug build will trip
+    /// immediately if a caller accidentally touches a field after deinit —
+    /// the previous by-value form left dangling pointers in the caller's
+    /// local with no diagnostic.
+    pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         for (self.files) |f| allocator.free(f);
         allocator.free(self.files);
         if (self.search) |s| allocator.free(s);
@@ -138,6 +143,8 @@ pub const Args = struct {
         if (self.sidecar_batch_size) |s| allocator.free(s);
         for (self.sidecar_headers) |s| allocator.free(s);
         allocator.free(self.sidecar_headers);
+
+        self.* = undefined;
     }
 
     pub fn isLevelEnabled(self: Args, lvl: Level) bool {
@@ -291,25 +298,6 @@ pub fn printHelp() void {
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, text) catch {};
 }
 
-pub const Options = struct {
-    short: u8,
-    long: []const u8,
-};
-
-pub const OptionFile = Options{ .short = 'f', .long = "file" };
-pub const OptionSearch = Options{ .short = 's', .long = "search" };
-pub const OptionLevel = Options{ .short = 'l', .long = "level" };
-pub const OptionDate = Options{ .short = 'd', .long = "date" };
-pub const OptionTail = Options{ .short = 't', .long = "tail" };
-pub const OptionNumLines = Options{ .short = 'n', .long = "num-lines" };
-pub const OptionVersion = Options{ .short = 'v', .long = "version" };
-pub const OptionHelp = Options{ .short = 'h', .long = "help" };
-pub const OptionAggregate = Options{ .short = 'a', .long = "aggregate" };
-pub const OptionAggregateMode = Options{ .short = 'm', .long = "aggregate-mode" };
-pub const OptionFromTime = Options{ .short = 0, .long = "from" };
-pub const OptionToTime = Options{ .short = 0, .long = "to" };
-pub const OptionOutput = Options{ .short = 0, .long = "output" };
-
 /// Mutable buffers for repeatable string-list flags (--file, agent-mode repeatables).
 /// Held outside Args during parsing; converted to owned slices on success.
 const ParseBuffers = struct {
@@ -372,7 +360,22 @@ fn parseArgsFromIter(
     };
     errdefer parsed.deinit(allocator);
 
+    // After `--`, every remaining argument is treated as a positional file
+    // path even if it starts with a dash. Standard getopt convention; lets
+    // users pass files whose names look like flags.
+    var positional_only = false;
+
     while (it.next()) |arg| {
+        if (positional_only) {
+            try appendFile(allocator, &bufs.files, arg);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+            continue;
+        }
+
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             parsed.help = true;
             try bufs.transferInto(allocator, &parsed);
@@ -441,6 +444,110 @@ fn replaceOwnedString(
     slot.* = owned;
 }
 
+/// Catalogue of every long flag that takes a value. The single table is
+/// the source of truth for name → kind → missing-value-error mapping; the
+/// previous implementation kept three parallel if-chains (`isValuedLongFlag`,
+/// `applyValuedLongFlag`, `missingValueError`) that had to be edited in
+/// lockstep whenever a new flag was added.
+const ValuedFlag = enum {
+    file,
+    search,
+    level,
+    date,
+    num_lines,
+    aggregate_mode,
+    from_time,
+    to_time,
+    output,
+    listen,
+    metrics_token,
+    alert_error_rate,
+    alert_regex,
+    alert_silence,
+    alert_file,
+    alert_webhook,
+    webhook_header,
+    service,
+    crash_marker,
+    journal_unit,
+    sidecar_url,
+    sidecar_header,
+    sidecar_flush_interval,
+    sidecar_batch_size,
+
+    fn lookup(name: []const u8) ?ValuedFlag {
+        const table = comptime [_]struct { name: []const u8, kind: ValuedFlag }{
+            .{ .name = "file", .kind = .file },
+            .{ .name = "search", .kind = .search },
+            .{ .name = "level", .kind = .level },
+            .{ .name = "date", .kind = .date },
+            .{ .name = "num-lines", .kind = .num_lines },
+            .{ .name = "aggregate-mode", .kind = .aggregate_mode },
+            .{ .name = "from", .kind = .from_time },
+            .{ .name = "to", .kind = .to_time },
+            .{ .name = "output", .kind = .output },
+            .{ .name = "listen", .kind = .listen },
+            .{ .name = "metrics-token", .kind = .metrics_token },
+            .{ .name = "alert-error-rate", .kind = .alert_error_rate },
+            .{ .name = "alert-regex", .kind = .alert_regex },
+            .{ .name = "alert-silence", .kind = .alert_silence },
+            .{ .name = "alert-file", .kind = .alert_file },
+            .{ .name = "alert-webhook", .kind = .alert_webhook },
+            .{ .name = "webhook-header", .kind = .webhook_header },
+            .{ .name = "service", .kind = .service },
+            .{ .name = "crash-marker", .kind = .crash_marker },
+            .{ .name = "journal-unit", .kind = .journal_unit },
+            .{ .name = "sidecar", .kind = .sidecar_url },
+            .{ .name = "sidecar-header", .kind = .sidecar_header },
+            .{ .name = "sidecar-flush-interval", .kind = .sidecar_flush_interval },
+            .{ .name = "sidecar-batch-size", .kind = .sidecar_batch_size },
+        };
+        for (table) |e| if (std.mem.eql(u8, e.name, name)) return e.kind;
+        return null;
+    }
+
+    fn missingError(self: ValuedFlag) ParseError {
+        return switch (self) {
+            .file => error.MissingFile,
+            .search => error.MissingSearch,
+            .level => error.MissingLevel,
+            .date => error.MissingDate,
+            .num_lines => error.MissingNumLines,
+            .aggregate_mode => error.MissingAggregateMode,
+            .from_time => error.MissingFromTime,
+            .to_time => error.MissingToTime,
+            .output => error.MissingOutput,
+            .listen => error.MissingListen,
+            .metrics_token => error.MissingMetricsToken,
+            .alert_error_rate => error.MissingAlertErrorRate,
+            .alert_regex => error.MissingAlertRegex,
+            .alert_silence => error.MissingAlertSilence,
+            .alert_file => error.MissingAlertFile,
+            .alert_webhook => error.MissingAlertWebhook,
+            .webhook_header => error.MissingWebhookHeader,
+            .service => error.MissingService,
+            .crash_marker => error.MissingCrashMarker,
+            .journal_unit => error.MissingJournalUnit,
+            .sidecar_url => error.MissingSidecarUrl,
+            .sidecar_header => error.MissingSidecarHeader,
+            .sidecar_flush_interval => error.MissingSidecarFlushInterval,
+            .sidecar_batch_size => error.MissingSidecarBatchSize,
+        };
+    }
+};
+
+/// Returns true if `flag` is one of the long bool flags that never accepts
+/// a value. Used to surface `--bool=val` as `InvalidArgument` instead of
+/// silently dropping the value.
+fn isBoolLongFlag(flag: []const u8) bool {
+    const names = [_][]const u8{
+        "tail",         "aggregate",    "agent",         "alert-first-seen",
+        "alert-stderr", "alert-exit",   "kernel-probes",
+    };
+    for (names) |n| if (std.mem.eql(u8, flag, n)) return true;
+    return false;
+}
+
 fn parseLongFlag(
     parsed: *Args,
     bufs: *ParseBuffers,
@@ -448,14 +555,22 @@ fn parseLongFlag(
     it: anytype,
     allocator: std.mem.Allocator,
 ) ParseError!void {
-    const flag = if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| blk: {
-        const val = arg[eq_pos + 1 ..];
-        const f = arg[2..eq_pos];
-        if (applyValuedLongFlag(parsed, bufs, f, val, allocator)) |applied| {
-            if (applied) return;
-        } else |err| return err;
-        break :blk f;
-    } else arg[2..];
+    const eq_pos = std.mem.indexOfScalar(u8, arg, '=');
+    const flag = if (eq_pos) |p| arg[2..p] else arg[2..];
+    const inline_val: ?[]const u8 = if (eq_pos) |p| arg[p + 1 ..] else null;
+
+    if (ValuedFlag.lookup(flag)) |kind| {
+        const val = inline_val orelse it.next() orelse return kind.missingError();
+        return applyValuedFlag(parsed, bufs, kind, val, allocator);
+    }
+
+    // `--bool-flag=value` is meaningless — previously we silently dropped
+    // the value and toggled the flag, producing surprising configuration
+    // when users wrote `--alert-first-seen=true` etc. Now we reject it.
+    if (inline_val != null) {
+        if (isBoolLongFlag(flag)) return error.InvalidArgument;
+        return error.UnknownArgument;
+    }
 
     if (std.mem.eql(u8, flag, "tail")) {
         parsed.tail_mode = true;
@@ -485,172 +600,43 @@ fn parseLongFlag(
         parsed.kernel_probes = true;
         return;
     }
-    if (std.mem.eql(u8, flag, "output")) {
-        const val = valueOrNext(it, flag) orelse return error.MissingOutput;
-        try parseOutputMode(parsed, val);
-        return;
-    }
-    if (isValuedLongFlag(flag)) {
-        const val = valueOrNext(it, flag) orelse return missingValueError(flag);
-        const applied = try applyValuedLongFlag(parsed, bufs, flag, val, allocator);
-        if (!applied) return error.UnknownArgument;
-        return;
-    }
 
     return error.UnknownArgument;
 }
 
-fn isValuedLongFlag(flag: []const u8) bool {
-    const names = [_][]const u8{
-        "file",           "search",                 "level",              "date",
-        "num-lines",      "aggregate-mode",         "from",               "to",
-        "listen",         "metrics-token",          "alert-error-rate",   "alert-regex",
-        "alert-silence",  "alert-file",             "alert-webhook",      "webhook-header",
-        "service",        "crash-marker",           "journal-unit",       "sidecar",
-        "sidecar-header", "sidecar-flush-interval", "sidecar-batch-size",
-    };
-    for (names) |n| {
-        if (std.mem.eql(u8, flag, n)) return true;
-    }
-    return false;
-}
-
-/// Applies a `<flag>=<val>` style assignment, or the second-arg form once the
-/// caller has resolved the value via `valueOrNext`. Returns true if the flag
-/// was a known valued flag and was applied; false if the name is unknown
-/// (caller may surface as `error.UnknownArgument`).
-fn applyValuedLongFlag(
+fn applyValuedFlag(
     parsed: *Args,
     bufs: *ParseBuffers,
-    flag: []const u8,
+    kind: ValuedFlag,
     val: []const u8,
     allocator: std.mem.Allocator,
-) ParseError!bool {
-    if (std.mem.eql(u8, flag, "file")) {
-        try appendFile(allocator, &bufs.files, val);
-        return true;
+) ParseError!void {
+    switch (kind) {
+        .file => try appendFile(allocator, &bufs.files, val),
+        .search => try replaceOwnedString(allocator, &parsed.search, val),
+        .level => try addLevels(parsed, val),
+        .date => try replaceOwnedString(allocator, &parsed.date, val),
+        .num_lines => parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines,
+        .aggregate_mode => parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode,
+        .from_time => try replaceOwnedString(allocator, &parsed.from_time, val),
+        .to_time => try replaceOwnedString(allocator, &parsed.to_time, val),
+        .output => try parseOutputMode(parsed, val),
+        .listen => try replaceOwnedString(allocator, &parsed.listen, val),
+        .metrics_token => try replaceOwnedString(allocator, &parsed.metrics_token, val),
+        .alert_error_rate => try replaceOwnedString(allocator, &parsed.alert_error_rate, val),
+        .alert_regex => try appendString(allocator, &bufs.alert_regexes, val),
+        .alert_silence => try replaceOwnedString(allocator, &parsed.alert_silence, val),
+        .alert_file => try replaceOwnedString(allocator, &parsed.alert_file, val),
+        .alert_webhook => try appendString(allocator, &bufs.alert_webhooks, val),
+        .webhook_header => try appendString(allocator, &bufs.webhook_headers, val),
+        .service => try appendString(allocator, &bufs.services, val),
+        .crash_marker => try appendString(allocator, &bufs.crash_markers, val),
+        .journal_unit => try appendString(allocator, &bufs.journal_units, val),
+        .sidecar_url => try replaceOwnedString(allocator, &parsed.sidecar_url, val),
+        .sidecar_header => try appendString(allocator, &bufs.sidecar_headers, val),
+        .sidecar_flush_interval => try replaceOwnedString(allocator, &parsed.sidecar_flush_interval, val),
+        .sidecar_batch_size => try replaceOwnedString(allocator, &parsed.sidecar_batch_size, val),
     }
-    if (std.mem.eql(u8, flag, "search")) {
-        try replaceOwnedString(allocator, &parsed.search, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "level")) {
-        try addLevels(parsed, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "date")) {
-        try replaceOwnedString(allocator, &parsed.date, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "num-lines")) {
-        parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "aggregate-mode")) {
-        parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "from")) {
-        try replaceOwnedString(allocator, &parsed.from_time, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "to")) {
-        try replaceOwnedString(allocator, &parsed.to_time, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "output")) {
-        try parseOutputMode(parsed, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "listen")) {
-        try replaceOwnedString(allocator, &parsed.listen, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "metrics-token")) {
-        try replaceOwnedString(allocator, &parsed.metrics_token, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "alert-error-rate")) {
-        try replaceOwnedString(allocator, &parsed.alert_error_rate, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "alert-silence")) {
-        try replaceOwnedString(allocator, &parsed.alert_silence, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "alert-file")) {
-        try replaceOwnedString(allocator, &parsed.alert_file, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "alert-regex")) {
-        try appendString(allocator, &bufs.alert_regexes, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "alert-webhook")) {
-        try appendString(allocator, &bufs.alert_webhooks, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "webhook-header")) {
-        try appendString(allocator, &bufs.webhook_headers, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "service")) {
-        try appendString(allocator, &bufs.services, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "crash-marker")) {
-        try appendString(allocator, &bufs.crash_markers, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "journal-unit")) {
-        try appendString(allocator, &bufs.journal_units, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "sidecar")) {
-        try replaceOwnedString(allocator, &parsed.sidecar_url, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "sidecar-header")) {
-        try appendString(allocator, &bufs.sidecar_headers, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "sidecar-flush-interval")) {
-        try replaceOwnedString(allocator, &parsed.sidecar_flush_interval, val);
-        return true;
-    }
-    if (std.mem.eql(u8, flag, "sidecar-batch-size")) {
-        try replaceOwnedString(allocator, &parsed.sidecar_batch_size, val);
-        return true;
-    }
-    return false;
-}
-
-fn missingValueError(flag: []const u8) ParseError {
-    if (std.mem.eql(u8, flag, "file")) return error.MissingFile;
-    if (std.mem.eql(u8, flag, "search")) return error.MissingSearch;
-    if (std.mem.eql(u8, flag, "level")) return error.MissingLevel;
-    if (std.mem.eql(u8, flag, "date")) return error.MissingDate;
-    if (std.mem.eql(u8, flag, "num-lines")) return error.MissingNumLines;
-    if (std.mem.eql(u8, flag, "aggregate-mode")) return error.MissingAggregateMode;
-    if (std.mem.eql(u8, flag, "from")) return error.MissingFromTime;
-    if (std.mem.eql(u8, flag, "to")) return error.MissingToTime;
-    if (std.mem.eql(u8, flag, "output")) return error.MissingOutput;
-    if (std.mem.eql(u8, flag, "listen")) return error.MissingListen;
-    if (std.mem.eql(u8, flag, "metrics-token")) return error.MissingMetricsToken;
-    if (std.mem.eql(u8, flag, "alert-error-rate")) return error.MissingAlertErrorRate;
-    if (std.mem.eql(u8, flag, "alert-regex")) return error.MissingAlertRegex;
-    if (std.mem.eql(u8, flag, "alert-silence")) return error.MissingAlertSilence;
-    if (std.mem.eql(u8, flag, "alert-file")) return error.MissingAlertFile;
-    if (std.mem.eql(u8, flag, "alert-webhook")) return error.MissingAlertWebhook;
-    if (std.mem.eql(u8, flag, "webhook-header")) return error.MissingWebhookHeader;
-    if (std.mem.eql(u8, flag, "service")) return error.MissingService;
-    if (std.mem.eql(u8, flag, "crash-marker")) return error.MissingCrashMarker;
-    if (std.mem.eql(u8, flag, "journal-unit")) return error.MissingJournalUnit;
-    if (std.mem.eql(u8, flag, "sidecar")) return error.MissingSidecarUrl;
-    if (std.mem.eql(u8, flag, "sidecar-header")) return error.MissingSidecarHeader;
-    if (std.mem.eql(u8, flag, "sidecar-flush-interval")) return error.MissingSidecarFlushInterval;
-    if (std.mem.eql(u8, flag, "sidecar-batch-size")) return error.MissingSidecarBatchSize;
-    return error.InvalidArgument;
 }
 
 fn parseOutputMode(parsed: *Args, value: []const u8) ParseError!void {
@@ -674,7 +660,7 @@ fn parseShortFlags(
                     try appendFile(allocator, files, rest);
                     return;
                 }
-                const val = valueOrNext(it, "file") orelse return error.MissingFile;
+                const val = it.next() orelse return error.MissingFile;
                 try appendFile(allocator, files, val);
                 return;
             },
@@ -684,7 +670,7 @@ fn parseShortFlags(
                     try replaceOwnedString(allocator, &parsed.search, rest);
                     return;
                 }
-                const val = valueOrNext(it, "search") orelse return error.MissingSearch;
+                const val = it.next() orelse return error.MissingSearch;
                 try replaceOwnedString(allocator, &parsed.search, val);
                 return;
             },
@@ -694,7 +680,7 @@ fn parseShortFlags(
                     try addLevels(parsed, rest);
                     return;
                 }
-                const val = valueOrNext(it, "level") orelse return error.MissingLevel;
+                const val = it.next() orelse return error.MissingLevel;
                 try addLevels(parsed, val);
                 return;
             },
@@ -704,7 +690,7 @@ fn parseShortFlags(
                     try replaceOwnedString(allocator, &parsed.date, rest);
                     return;
                 }
-                const val = valueOrNext(it, "date") orelse return error.MissingDate;
+                const val = it.next() orelse return error.MissingDate;
                 try replaceOwnedString(allocator, &parsed.date, val);
                 return;
             },
@@ -715,7 +701,7 @@ fn parseShortFlags(
                     parsed.num_lines = parseNumLines(rest) catch return error.InvalidNumLines;
                     return;
                 }
-                const val = valueOrNext(it, "num-lines") orelse return error.MissingNumLines;
+                const val = it.next() orelse return error.MissingNumLines;
                 parsed.num_lines = parseNumLines(val) catch return error.InvalidNumLines;
                 return;
             },
@@ -726,7 +712,7 @@ fn parseShortFlags(
                     parsed.aggregate_mode = parseAggregateMode(rest) orelse return error.InvalidAggregateMode;
                     return;
                 }
-                const val = valueOrNext(it, "aggregate-mode") orelse return error.MissingAggregateMode;
+                const val = it.next() orelse return error.MissingAggregateMode;
                 parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode;
                 return;
             },
@@ -741,10 +727,6 @@ fn parseShortFlags(
             else => return error.UnknownArgument,
         }
     }
-}
-
-inline fn valueOrNext(it: anytype, _: []const u8) ?[]const u8 {
-    return it.next();
 }
 
 fn parseNumLines(s: []const u8) !usize {
@@ -784,7 +766,7 @@ test "single file via -f" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-f", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("app.log", parsed.files[0]);
     try testing.expect(!parsed.tail_mode);
@@ -794,7 +776,7 @@ test "multiple files mixed positional and -f" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "a.log", "-f", "b.log", "c.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 3), parsed.files.len);
 }
@@ -803,7 +785,7 @@ test "multiple long flags" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--search", "err", "--level", "error", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("err", parsed.search.?);
     try testing.expect(parsed.levels.? & levelBit(.Error) != 0);
@@ -814,7 +796,7 @@ test "mixed flags" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-t", "--search", "err", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.tail_mode);
     try testing.expectEqualStrings("err", parsed.search.?);
@@ -825,7 +807,7 @@ test "mixed flags with grouping" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-t", "-lerror", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.tail_mode);
     try testing.expect(parsed.levels.? & levelBit(.Error) != 0);
@@ -842,7 +824,7 @@ test "gnu short flags grouping" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-taserror", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.tail_mode);
     try testing.expect(parsed.aggregate);
@@ -854,7 +836,7 @@ test "short option with inline value works" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-serror", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("error", parsed.search.?);
     try testing.expectEqual(@as(usize, 1), parsed.files.len);
@@ -864,7 +846,7 @@ test "aggregate short flag does not stop grouped parsing" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-talerror", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.tail_mode);
     try testing.expect(parsed.aggregate);
@@ -876,7 +858,7 @@ test "aggregate mode via long flag" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--aggregate-mode", "normalized", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(AggregateMode.normalized, parsed.aggregate_mode);
 }
@@ -885,7 +867,7 @@ test "aggregate mode via long flag with equals" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--aggregate-mode=json-message", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(AggregateMode.json_message, parsed.aggregate_mode);
 }
@@ -894,7 +876,7 @@ test "aggregate mode via short flag" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-m", "level-message", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(AggregateMode.level_message, parsed.aggregate_mode);
 }
@@ -903,7 +885,7 @@ test "aggregate mode via short flag inline" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-mexact", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(AggregateMode.exact, parsed.aggregate_mode);
 }
@@ -912,7 +894,7 @@ test "aggregate mode in grouped short flags" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-amnormalized", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.aggregate);
     try testing.expectEqual(AggregateMode.normalized, parsed.aggregate_mode);
@@ -936,7 +918,7 @@ test "help flag stops parsing" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--help", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.help);
     try testing.expect(!parsed.tail_mode);
@@ -952,7 +934,7 @@ test "empty file list is allowed" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{"zlrd"} };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), parsed.files.len);
 }
@@ -961,7 +943,7 @@ test "levels with whitespace" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-l", "error, warn , info" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     const mask = parsed.levels.?;
     try testing.expect(mask & levelBit(.Error) != 0);
@@ -1031,13 +1013,13 @@ test "level flag case-insensitive via CLI" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-l", "ERROR" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.levels.? & levelBit(.Error) != 0);
 
     const fake2 = FakeIter{ .argv = &.{ "zlrd", "--level", "error,warn" } };
     var it2 = fake2;
-    const parsed2 = try parseArgsFromIter(allocator, &it2);
+    var parsed2 = try parseArgsFromIter(allocator, &it2);
     defer parsed2.deinit(allocator);
     const mask2 = parsed2.levels.?;
     try testing.expect(mask2 & levelBit(.Error) != 0);
@@ -1045,7 +1027,7 @@ test "level flag case-insensitive via CLI" {
 
     const fake3 = FakeIter{ .argv = &.{ "zlrd", "-lerror" } };
     var it3 = fake3;
-    const parsed3 = try parseArgsFromIter(allocator, &it3);
+    var parsed3 = try parseArgsFromIter(allocator, &it3);
     defer parsed3.deinit(allocator);
     try testing.expect(parsed3.levels.? & levelBit(.Error) != 0);
 }
@@ -1068,7 +1050,7 @@ test "version flag returns early" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--version", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.version);
 }
@@ -1077,7 +1059,7 @@ test "version flag via -v" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-v" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.version);
 }
@@ -1086,7 +1068,7 @@ test "version flag in grouped short flags stops parsing" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-tv", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.tail_mode);
     try testing.expect(parsed.version);
@@ -1097,7 +1079,7 @@ test "date filter via -d" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-d", "2023-10-01..2023-10-31", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("2023-10-01..2023-10-31", parsed.date.?);
 }
@@ -1106,7 +1088,7 @@ test "date filter via inline -d" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-d2023-10-15", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("2023-10-15", parsed.date.?);
 }
@@ -1115,7 +1097,7 @@ test "date filter via --date equals" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--date=2023-10-01" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("2023-10-01", parsed.date.?);
 }
@@ -1124,7 +1106,7 @@ test "num lines via -n" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-n", "50", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 50), parsed.num_lines);
 }
@@ -1133,7 +1115,7 @@ test "num lines via inline -n" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "-n100", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 100), parsed.num_lines);
 }
@@ -1142,7 +1124,7 @@ test "num lines via --num-lines equals" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--num-lines=25", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 25), parsed.num_lines);
 }
@@ -1165,7 +1147,7 @@ test "search via --search equals" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--search=error" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("error", parsed.search.?);
 }
@@ -1174,7 +1156,7 @@ test "level via --level equals" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--level=error,warn" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     const mask = parsed.levels.?;
     try testing.expect(mask & levelBit(.Error) != 0);
@@ -1185,7 +1167,7 @@ test "file via --file equals" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--file=app.log", "--file=err.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 2), parsed.files.len);
 }
@@ -1303,13 +1285,13 @@ test "output json via long flag and equals" {
 
     const fake = FakeIter{ .argv = &.{ "zlrd", "--output", "json" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.output_json);
 
     const fake2 = FakeIter{ .argv = &.{ "zlrd", "--output=json" } };
     var it2 = fake2;
-    const parsed2 = try parseArgsFromIter(allocator, &it2);
+    var parsed2 = try parseArgsFromIter(allocator, &it2);
     defer parsed2.deinit(allocator);
     try testing.expect(parsed2.output_json);
 }
@@ -1346,7 +1328,7 @@ test "agent: flag toggles agent_mode" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{ "zlrd", "--agent", "app.log" } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.agent_mode);
     try testing.expectEqual(@as(usize, 1), parsed.files.len);
@@ -1363,7 +1345,7 @@ test "agent: listen + metrics-token parsed and owned" {
         "app.log",
     } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("0.0.0.0:9100", parsed.listen.?);
     try testing.expectEqualStrings("secret123", parsed.metrics_token.?);
@@ -1386,7 +1368,7 @@ test "agent: repeatable alert-regex collects all values" {
         "app.log",
     } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 2), parsed.alert_regexes.len);
     try testing.expectEqualStrings("panic:5/30s", parsed.alert_regexes[0]);
@@ -1405,7 +1387,7 @@ test "agent: webhook + headers collected" {
         "app.log",
     } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 1), parsed.alert_webhooks.len);
     try testing.expectEqual(@as(usize, 2), parsed.webhook_headers.len);
@@ -1425,7 +1407,7 @@ test "agent: service binding and crash markers collect" {
         "app.log",
     } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 2), parsed.services.len);
     try testing.expectEqualStrings("api=/var/log/api.log", parsed.services[0]);
@@ -1450,7 +1432,7 @@ test "agent: --journal-unit collects with NAME=pattern" {
         "--journal-unit=worker=myapp@*.service",
     } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 2), parsed.journal_units.len);
     try testing.expectEqualStrings("api=myapp.service", parsed.journal_units[0]);
@@ -1474,9 +1456,56 @@ test "agent: bool flags parse" {
         "app.log",
     } };
     var it = fake;
-    const parsed = try parseArgsFromIter(allocator, &it);
+    var parsed = try parseArgsFromIter(allocator, &it);
     defer parsed.deinit(allocator);
     try testing.expect(parsed.alert_first_seen);
     try testing.expect(parsed.alert_stderr);
     try testing.expect(parsed.alert_exit_on_alert);
+}
+
+test "--bool=value is rejected, not silently dropped" {
+    const allocator = testing.allocator;
+
+    // Previously, `--tail=anything` set tail_mode=true and silently dropped
+    // the value. The same bug bit `--alert-first-seen=true`-style copy/paste
+    // from documentation; the value was thrown away with no diagnostic.
+    inline for (.{
+        "--tail=true",
+        "--aggregate=on",
+        "--agent=enable",
+        "--alert-first-seen=true",
+        "--alert-stderr=stderr",
+        "--alert-exit=yes",
+        "--kernel-probes=on",
+    }) |arg| {
+        const fake = FakeIter{ .argv = &.{ "zlrd", arg } };
+        var it = fake;
+        try testing.expectError(error.InvalidArgument, parseArgsFromIter(allocator, &it));
+    }
+}
+
+test "-- ends option parsing; remaining args are positional files" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",                  "-t",
+        "--",                    "--looks-like-a-flag.log",
+        "-also-not-an-option",
+    } };
+    var it = fake;
+    var parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.tail_mode);
+    try testing.expectEqual(@as(usize, 2), parsed.files.len);
+    try testing.expectEqualStrings("--looks-like-a-flag.log", parsed.files[0]);
+    try testing.expectEqualStrings("-also-not-an-option", parsed.files[1]);
+}
+
+test "ValuedFlag.lookup resolves every long valued flag" {
+    // Smoke test: every known name resolves; an obviously-bogus name does not.
+    try testing.expect(ValuedFlag.lookup("file") != null);
+    try testing.expect(ValuedFlag.lookup("sidecar-batch-size") != null);
+    try testing.expect(ValuedFlag.lookup("sidecar-header") != null);
+    try testing.expect(ValuedFlag.lookup("journal-unit") != null);
+    try testing.expect(ValuedFlag.lookup("nope") == null);
+    try testing.expect(ValuedFlag.lookup("") == null);
 }
