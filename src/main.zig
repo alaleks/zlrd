@@ -115,10 +115,6 @@ pub fn main(opts: struct {
     };
 }
 
-fn writeStderr(io: std.Io, msg: []const u8) void {
-    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
-}
-
 /// Styled fatal error. `hint` is optional follow-up line shown in muted colour.
 fn fatal(io: std.Io, msg: []const u8, hint: ?[]const u8) void {
     const e = std.Io.File.stderr();
@@ -271,6 +267,7 @@ fn agentErrorMessage(err: anyerror) []const u8 {
         error.InvalidJournalSpec => "invalid --journal-unit spec (expected NAME=UNIT_PATTERN)",
         error.InvalidBatchSize => "invalid --sidecar-batch-size (expected positive integer)",
         error.InvalidSidecarUrl => "invalid --sidecar URL (must start with https://)",
+        error.InvalidUrl => "invalid URL",
         error.TlsRequired => "sidecar requires an https:// URL",
         else => runtimeErrorMessage(err),
     };
@@ -281,7 +278,12 @@ fn agentErrorHint(err: anyerror) ?[]const u8 {
         error.NoFiles => "pass at least one file: zlrd --agent --metrics-token secret app.log",
         error.MissingMetricsToken => "generate one and export it: --metrics-token=$(openssl rand -hex 16)",
         error.InvalidThresholdSpec => "example: --alert-error-rate 10/60s",
+        error.InvalidDuration => "example: --alert-silence 60s  (suffixes: ms, s, m, h)",
         error.InvalidRegexSpec => "example: --alert-regex 'panic:5/30s'",
+        error.InvalidServiceSpec => "example: --service api=/var/log/api.log",
+        error.InvalidJournalSpec => "example: --journal-unit api='nginx.service'",
+        error.InvalidHeaderSpec => "example: --webhook-header 'Authorization: Bearer xyz'",
+        error.InvalidBatchSize => "example: --sidecar-batch-size 1024",
         error.InvalidSidecarUrl, error.TlsRequired => "example: --sidecar https://collector.example.com:4318",
         else => null,
     };

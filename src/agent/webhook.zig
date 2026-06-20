@@ -259,3 +259,4 @@ test "Sender: stop is idempotent and safe before start" {
     sender.stop();
     sender.stop(); // second call is a no-op
 }
+
