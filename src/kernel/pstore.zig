@@ -47,7 +47,7 @@ pub fn scan(io: std.Io, sink: kernel.Sink, ctx: ?*anyopaque) !void {
     // TAINT_DIE wasn't set.
     if (has_taint_die) {
         if (detail_w.buffered().len > 0) detail_w.writeAll("; ") catch {};
-        std.fmt.format(&detail_w, "tainted=0x{x}", .{tainted_value}) catch {};
+        detail_w.print("tainted=0x{x}", .{tainted_value}) catch {};
     }
 
     sink(ctx, kernel.makeEvent(
@@ -103,7 +103,7 @@ fn countPstoreDumps(out_count: *usize, detail_w: *std.Io.Writer) !void {
         var off: usize = 0;
         while (off < n) {
             const d: *align(1) const linux.dirent64 = @ptrCast(&dirent_buf[off]);
-            const name_ptr: [*:0]const u8 = @ptrCast(&dirent_buf[off + @offsetOf(linux.dirent64, "d_name")]);
+            const name_ptr: [*:0]const u8 = @ptrCast(&dirent_buf[off + @offsetOf(linux.dirent64, "name")]);
             const name = std.mem.span(name_ptr);
             off += d.reclen;
 

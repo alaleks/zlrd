@@ -47,8 +47,9 @@ const FileState = struct {
     carry: std.ArrayList(u8),
     last_line_ms: i64,
     /// Inode of the file currently open under this path. Compared against a
-    /// path-level stat each iteration to detect rotation / restart.
-    inode: u64,
+    /// path-level stat each iteration to detect rotation / restart. Typed as
+    /// `std.Io.File.INode` so Windows (signed file id) compiles too.
+    inode: std.Io.File.INode,
     /// Per-file lifecycle tracker. Non-null only when the file's path is
     /// bound to a `--service NAME=PATH` mapping.
     tracker: ?service.Tracker,
@@ -248,7 +249,7 @@ pub const Watcher = struct {
         return consumed;
     }
 
-    fn handleRotation(self: *Watcher, f: *FileState, new_inode: u64) !void {
+    fn handleRotation(self: *Watcher, f: *FileState, new_inode: std.Io.File.INode) !void {
         f.fd.close(self.io);
         f.fd = try std.Io.Dir.cwd().openFile(self.io, f.path, .{});
         f.inode = new_inode;
