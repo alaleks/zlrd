@@ -89,8 +89,10 @@ fn readMachineId(io: std.Io, buf: []u8) DiscoveryError![]const u8 {
     const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
     if (trimmed.len < 8 or trimmed.len > 32) return error.MachineIdInvalid;
     // The trimmed slice may not point at the start of `buf` (no leading WS in
-    // /etc/machine-id, but be safe).
-    @memcpy(buf[0..trimmed.len], trimmed);
+    // /etc/machine-id, but be safe). `@memcpy` requires non-overlapping
+    // source/dest; when there was no leading whitespace `trimmed.ptr ==
+    // buf.ptr` and the two overlap. `copyForwards` handles that correctly.
+    std.mem.copyForwards(u8, buf[0..trimmed.len], trimmed);
     return buf[0..trimmed.len];
 }
 

@@ -72,33 +72,44 @@ fn findLastNLinesStart(f: *OpenFile, file_size: u64, n: usize, scan_buf: []u8) !
 
 /// Batch-local aggregator used by tail reads.
 /// Keeps first-seen order within one read batch and prints once per key.
-/// Caches the `LineInfo` produced by `FilterState.checkLine` so `printAll`
-/// can reuse it via `printChecked` instead of re-parsing every line.
+/// Uses `reader.Aggregator`'s Entry shape — single map instead of three.
 const BatchAggregator = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    counts: std.StringHashMapUnmanaged(usize),
-    sample_lines: std.StringHashMapUnmanaged([]const u8),
-    sample_infos: std.StringHashMapUnmanaged(formats.LineInfo),
+    entries: std.StringHashMapUnmanaged(reader.AggregateEntry),
     order: std.ArrayList([]const u8),
+    /// Reused per-line scratch space for building non-.exact keys; owned here
+    /// so callers don't have to thread an extra parameter through.
+    key_scratch: std.ArrayList(u8),
 
     fn init(allocator: std.mem.Allocator) !BatchAggregator {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .counts = .{},
-            .sample_lines = .{},
-            .sample_infos = .{},
+            .entries = .{},
             .order = try std.ArrayList([]const u8).initCapacity(allocator, 32),
+            .key_scratch = .empty,
         };
     }
 
     fn deinit(self: *BatchAggregator) void {
-        self.counts.deinit(self.allocator);
-        self.sample_lines.deinit(self.allocator);
-        self.sample_infos.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
         self.order.deinit(self.allocator);
+        self.key_scratch.deinit(self.allocator);
         self.arena.deinit();
+    }
+
+    /// Build the aggregation key for `line` using the aggregator's own
+    /// scratch, then delegate to `add`. Removes the per-line malloc/free
+    /// pair from the caller.
+    fn observe(
+        self: *BatchAggregator,
+        mode: flags.AggregateMode,
+        line: []const u8,
+        info: formats.LineInfo,
+    ) !void {
+        const key = try formats.buildAggregateKey(self.allocator, &self.key_scratch, mode, line, info);
+        try self.add(key, line, info);
     }
 
     fn add(
@@ -107,41 +118,40 @@ const BatchAggregator = struct {
         sample_line: []const u8,
         info: formats.LineInfo,
     ) !void {
-        if (self.counts.getPtr(key)) |count| {
-            count.* += 1;
+        if (self.entries.getPtr(key)) |entry| {
+            entry.count += 1;
             return;
         }
+
+        // Reserve capacity before spending arena bytes so an OOM in the
+        // hash-map put can't leak the key/line dupes.
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.order.ensureUnusedCapacity(self.allocator, 1);
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
 
-        try self.counts.putNoClobber(self.allocator, owned_key, 1);
-        errdefer _ = self.counts.remove(owned_key);
-
-        try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
-        errdefer _ = self.sample_lines.remove(owned_key);
-
-        try self.sample_infos.putNoClobber(self.allocator, owned_key, info);
-        errdefer _ = self.sample_infos.remove(owned_key);
-
-        try self.order.append(self.allocator, owned_key);
+        self.entries.putAssumeCapacityNoClobber(owned_key, .{
+            .count = 1,
+            .sample_line = owned_line,
+            .sample_info = info,
+        });
+        self.order.appendAssumeCapacity(owned_key);
     }
 
     fn printAll(self: *BatchAggregator, filter_state: *const formats.FilterState) void {
         for (self.order.items) |key| {
-            const count = self.counts.get(key).?;
-            const line = self.sample_lines.get(key).?;
-            const info = self.sample_infos.get(key).?;
+            const entry = self.entries.get(key).?;
 
-            if (count > 1 and !filter_state.output_json) {
+            if (entry.count > 1 and !filter_state.output_json) {
                 var buf: [128]u8 = undefined;
-                const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{count}) catch "[x?] ";
+                const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{entry.count}) catch "[x?] ";
                 std.Io.File.stdout().writeStreamingAll(tail_io, prefix) catch {};
             }
 
             // Line + info were already validated by checkLine in processLine;
             // print directly to avoid a redundant second parse.
-            filter_state.printChecked(line, info);
+            filter_state.printChecked(entry.sample_line, entry.sample_info);
         }
     }
 };
@@ -393,14 +403,12 @@ fn processLine(
         return;
     }
 
+    _ = allocator;
     // Reuse LineInfo produced by checkLine — buildAggregateKey accepts it
     // directly, avoiding a second parse of the line for key construction,
     // and the aggregator caches it so printAll skips a third one.
     if (filter_state.checkLine(line)) |info| {
-        const key = try formats.buildAggregateKey(allocator, args.aggregate_mode, line, info);
-        defer allocator.free(key);
-
-        try aggregator.?.add(key, line, info);
+        try aggregator.?.observe(args.aggregate_mode, line, info);
     }
 }
 
@@ -641,9 +649,9 @@ test "batch aggregator counts identical keys and keeps first line" {
     try agg.add("warn\x1fslow", "[WARN] slow", empty_info);
 
     try testing.expectEqual(@as(usize, 2), agg.order.items.len);
-    try testing.expectEqual(@as(usize, 2), agg.counts.get("error\x1ffailed").?);
-    try testing.expectEqual(@as(usize, 1), agg.counts.get("warn\x1fslow").?);
-    try testing.expectEqualStrings("[ERROR] failed", agg.sample_lines.get("error\x1ffailed").?);
+    try testing.expectEqual(@as(usize, 2), agg.entries.get("error\x1ffailed").?.count);
+    try testing.expectEqual(@as(usize, 1), agg.entries.get("warn\x1fslow").?.count);
+    try testing.expectEqualStrings("[ERROR] failed", agg.entries.get("error\x1ffailed").?.sample_line);
 }
 
 test "readToEOF with aggregate exact advances position and preserves carry" {

@@ -12,12 +12,22 @@ const debug_io = std.Options.debug_io;
 /// Protects against corrupted input or unexpectedly huge records.
 pub const MaxLineLen = 4 * 1024 * 1024;
 
-/// Callback used to build aggregation keys without importing reader/formats code here.
+/// Callback used to build aggregation keys without importing reader/formats
+/// code here. Returns a borrowed slice — either into `line` or into
+/// `scratch`. Do not free the return value.
 pub const AggregateKeyBuilder = *const fn (
     allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
     mode: flags.AggregateMode,
     line: []const u8,
-) anyerror![]u8;
+) anyerror![]const u8;
+
+/// Per-key state kept by `BatchAggregator`. Mirrors `reader.AggregateEntry`
+/// but is kept local so gzip.zig stays leaf (no import cycle with reader).
+const Entry = struct {
+    count: usize,
+    sample_line: []const u8,
+};
 
 /// Errors specific to gzip line streaming.
 pub const GzipReadError = error{
@@ -30,57 +40,60 @@ pub const GzipReadError = error{
 const BatchAggregator = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    counts: std.StringHashMapUnmanaged(usize),
-    sample_lines: std.StringHashMapUnmanaged([]const u8),
+    entries: std.StringHashMapUnmanaged(Entry),
     order: std.ArrayList([]const u8),
+    /// Reused per-line scratch space for building non-.exact keys.
+    key_scratch: std.ArrayList(u8),
 
     fn init(allocator: std.mem.Allocator) !BatchAggregator {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .counts = .{},
-            .sample_lines = .{},
+            .entries = .{},
             .order = try std.ArrayList([]const u8).initCapacity(allocator, 32),
+            .key_scratch = .empty,
         };
     }
 
     fn deinit(self: *BatchAggregator) void {
-        self.counts.deinit(self.allocator);
-        self.sample_lines.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
         self.order.deinit(self.allocator);
+        self.key_scratch.deinit(self.allocator);
         self.arena.deinit();
     }
 
     fn add(self: *BatchAggregator, key: []const u8, sample_line: []const u8) !void {
-        if (self.counts.getPtr(key)) |count| {
-            count.* += 1;
+        if (self.entries.getPtr(key)) |entry| {
+            entry.count += 1;
             return;
         }
+
+        // Reserve capacity before spending arena bytes so an OOM in the
+        // hash-map put can't leak the key/line dupes.
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.order.ensureUnusedCapacity(self.allocator, 1);
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
 
-        try self.counts.putNoClobber(self.allocator, owned_key, 1);
-        errdefer _ = self.counts.remove(owned_key);
-
-        try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
-        errdefer _ = self.sample_lines.remove(owned_key);
-
-        try self.order.append(self.allocator, owned_key);
+        self.entries.putAssumeCapacityNoClobber(owned_key, .{
+            .count = 1,
+            .sample_line = owned_line,
+        });
+        self.order.appendAssumeCapacity(owned_key);
     }
 
     fn printAll(self: *BatchAggregator, filter_state: anytype) void {
         for (self.order.items) |key| {
-            const count = self.counts.get(key).?;
-            const line = self.sample_lines.get(key).?;
+            const entry = self.entries.get(key).?;
 
-            if (count > 1 and !outputJsonEnabled(filter_state)) {
+            if (entry.count > 1 and !outputJsonEnabled(filter_state)) {
                 var buf: [128]u8 = undefined;
-                const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{count}) catch "[x?] ";
+                const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{entry.count}) catch "[x?] ";
                 std.Io.File.stdout().writeStreamingAll(debug_io, prefix) catch {};
             }
 
-            filter_state.printIfMatch(line);
+            filter_state.printIfMatch(entry.sample_line);
         }
     }
 };
@@ -279,13 +292,12 @@ fn processLine(
         return;
     }
 
+    _ = allocator;
     if (filter_state.checkLine(line) != null) {
         const builder = key_builder orelse return GzipReadError.MissingAggregateKeyBuilder;
         const agg = aggregator orelse return GzipReadError.MissingAggregator;
 
-        const key = try builder(allocator, args.aggregate_mode, line);
-        defer allocator.free(key);
-
+        const key = try builder(agg.allocator, &agg.key_scratch, args.aggregate_mode, line);
         try agg.add(key, line);
     }
 }
@@ -354,14 +366,27 @@ fn makeArgs(
 
 fn testKeyBuilder(
     allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
     mode: flags.AggregateMode,
     line: []const u8,
-) ![]u8 {
+) ![]const u8 {
     return switch (mode) {
-        .exact => allocator.dupe(u8, line),
-        .normalized => allocator.dupe(u8, "normalized"),
-        .level_message => allocator.dupe(u8, "level-message"),
-        .json_message => allocator.dupe(u8, "json-message"),
+        .exact => line,
+        .normalized => blk: {
+            scratch.clearRetainingCapacity();
+            try scratch.appendSlice(allocator, "normalized");
+            break :blk scratch.items;
+        },
+        .level_message => blk: {
+            scratch.clearRetainingCapacity();
+            try scratch.appendSlice(allocator, "level-message");
+            break :blk scratch.items;
+        },
+        .json_message => blk: {
+            scratch.clearRetainingCapacity();
+            try scratch.appendSlice(allocator, "json-message");
+            break :blk scratch.items;
+        },
     };
 }
 
@@ -596,8 +621,8 @@ test "processChunk: aggregate exact groups identical lines" {
     );
 
     try testing.expectEqual(@as(usize, 2), agg.order.items.len);
-    try testing.expectEqual(@as(usize, 2), agg.counts.get("same").?);
-    try testing.expectEqual(@as(usize, 1), agg.counts.get("other").?);
+    try testing.expectEqual(@as(usize, 2), agg.entries.get("same").?.count);
+    try testing.expectEqual(@as(usize, 1), agg.entries.get("other").?.count);
     try testing.expectEqual(@as(usize, 0), sink.printed_lines.items.len);
 }
 
@@ -628,7 +653,7 @@ test "processChunk: aggregate normalized uses aggregate mode for keys" {
     );
 
     try testing.expectEqual(@as(usize, 1), agg.order.items.len);
-    try testing.expectEqual(@as(usize, 2), agg.counts.get("normalized").?);
+    try testing.expectEqual(@as(usize, 2), agg.entries.get("normalized").?.count);
 }
 
 test "flushFinalCarry: aggregate final unterminated line" {
@@ -656,7 +681,7 @@ test "flushFinalCarry: aggregate final unterminated line" {
     );
 
     try testing.expectEqual(@as(usize, 1), agg.order.items.len);
-    try testing.expectEqual(@as(usize, 1), agg.counts.get("tail-line").?);
+    try testing.expectEqual(@as(usize, 1), agg.entries.get("tail-line").?.count);
 }
 
 test "processLine: aggregate requires key builder" {
@@ -804,7 +829,7 @@ test "processLine: aggregate mode with key builder" {
     );
 
     try testing.expectEqual(@as(usize, 1), agg.order.items.len);
-    try testing.expectEqualStrings("hello", agg.sample_lines.get("hello").?);
+    try testing.expectEqualStrings("hello", agg.entries.get("hello").?.sample_line);
 }
 
 test "processLine: aggregate requires aggregator" {

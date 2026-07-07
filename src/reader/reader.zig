@@ -154,7 +154,12 @@ fn analyzeJsonInPlace(line: []const u8, info: *LineInfo) void {
             .none => unreachable,
         }
 
-        if (info.level != null and info.date != null) return;
+        // Exit only when every slot we care about is filled. Requiring `time`
+        // too avoids missing it when a JSON puts `date` and `timestamp` in
+        // separate fields (e.g. `{"date":"…","level":"…","timestamp":"…"}`);
+        // otherwise the two earlier fields would trip the exit and the later
+        // `timestamp` would never be walked → `--from-time` silently drops.
+        if (info.level != null and info.date != null and info.time != null) return;
     }
 }
 
@@ -366,62 +371,65 @@ pub const LevelCounter = struct {
     }
 };
 
+/// Per-key state kept by `Aggregator`. One entry replaces the three parallel
+/// hash-maps of the previous design (counts / sample_lines / sample_infos).
+pub const AggregateEntry = struct {
+    count: usize,
+    sample_line: []const u8,
+    sample_info: LineInfo,
+};
+
 /// Aggregates identical matched lines.
 /// Keeps first-seen order and stores each unique line only once.
-const Aggregator = struct {
+pub const Aggregator = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    counts: std.StringHashMapUnmanaged(usize),
-    sample_lines: std.StringHashMapUnmanaged([]const u8),
-    sample_infos: std.StringHashMapUnmanaged(LineInfo),
+    entries: std.StringHashMapUnmanaged(AggregateEntry),
     order: std.ArrayList([]const u8),
 
-    fn init(allocator: std.mem.Allocator) !Aggregator {
+    pub fn init(allocator: std.mem.Allocator) !Aggregator {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .counts = .{},
-            .sample_lines = .{},
-            .sample_infos = .{},
+            .entries = .{},
             .order = try std.ArrayList([]const u8).initCapacity(allocator, 128),
         };
     }
 
-    fn deinit(self: *Aggregator) void {
-        self.counts.deinit(self.allocator);
-        self.sample_lines.deinit(self.allocator);
-        self.sample_infos.deinit(self.allocator);
+    pub fn deinit(self: *Aggregator) void {
+        self.entries.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.arena.deinit();
     }
 
-    /// Add one matched line under a precomputed aggregation key.
-    /// The first line seen for a key is kept as the sample line for display
-    /// together with its precomputed `LineInfo` to avoid re-analysis during output.
+    /// Add one matched line under a borrowed aggregation key. On the
+    /// existing-key path we only bump the counter — no allocation. On the
+    /// new-key path we reserve hash-table capacity first, so the arena
+    /// dupes can't leak if the put OOMs.
     ///
-    /// Silently drops new keys once `max_aggregate_keys` is hit so a file with
-    /// pathologically high key cardinality can't exhaust memory. Existing keys
-    /// continue to accumulate their counts.
-    fn add(self: *Aggregator, key: []const u8, sample_line: []const u8, info: LineInfo) !void {
-        if (self.counts.getPtr(key)) |count| {
-            count.* += 1;
+    /// Silently drops new keys once `max_aggregate_keys` is hit so a file
+    /// with pathologically high key cardinality can't exhaust memory.
+    pub fn add(self: *Aggregator, key: []const u8, sample_line: []const u8, info: LineInfo) !void {
+        if (self.entries.getPtr(key)) |entry| {
+            entry.count += 1;
             return;
         }
-        if (self.counts.count() >= max_aggregate_keys) return;
+        if (self.entries.count() >= max_aggregate_keys) return;
+
+        // Reserve first so the hash-map puts below cannot OOM after we've
+        // already burned arena bytes on the key/line dupes.
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.order.ensureUnusedCapacity(self.allocator, 1);
 
         const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
 
-        try self.counts.putNoClobber(self.allocator, owned_key, 1);
-        errdefer _ = self.counts.remove(owned_key);
-
-        try self.sample_lines.putNoClobber(self.allocator, owned_key, owned_line);
-        errdefer _ = self.sample_lines.remove(owned_key);
-
-        try self.sample_infos.putNoClobber(self.allocator, owned_key, info);
-        errdefer _ = self.sample_infos.remove(owned_key);
-
-        try self.order.append(self.allocator, owned_key);
+        self.entries.putAssumeCapacityNoClobber(owned_key, .{
+            .count = 1,
+            .sample_line = owned_line,
+            .sample_info = info,
+        });
+        self.order.appendAssumeCapacity(owned_key);
     }
 
     /// Print all aggregated entries in first-seen order.
@@ -431,14 +439,12 @@ const Aggregator = struct {
         var page: usize = 1;
 
         for (self.order.items) |key| {
-            const count = self.counts.get(key).?;
-            const line = self.sample_lines.get(key).?;
-            const info = self.sample_infos.get(key).?;
+            const entry = self.entries.get(key).?;
             if (output_json) {
-                try printJsonOutputLineBuffered(output, line, info);
+                try printJsonOutputLineBuffered(output, entry.sample_line, entry.sample_info);
             } else {
-                try printAggregatePrefix(output, count);
-                try printStyledLineBuffered(output, line, info, &.{});
+                try printAggregatePrefix(output, entry.count);
+                try printStyledLineBuffered(output, entry.sample_line, entry.sample_info, &.{});
             }
 
             if (page_size > 0) {
@@ -791,6 +797,11 @@ fn readAggregated(
     var aggregator = try Aggregator.init(allocator);
     defer aggregator.deinit();
 
+    // Reusable scratch buffer for non-.exact key building — one allocation
+    // for the whole file instead of one per matched line.
+    var key_scratch: std.ArrayList(u8) = .empty;
+    defer key_scratch.deinit(allocator);
+
     var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
     defer output.deinit();
 
@@ -819,9 +830,7 @@ fn readAggregated(
             // Reuse LineInfo from checkLine to avoid re-parsing in buildAggregateKey.
             if (filter_state.checkLine(line)) |info| {
                 if (info.level) |lvl| counter.add(lvl);
-                const key = try buildAggregateKey(allocator, args.aggregate_mode, line, info);
-                defer allocator.free(key);
-
+                const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, line, info);
                 try aggregator.add(key, line, info);
             }
 
@@ -835,9 +844,7 @@ fn readAggregated(
     if (carry.items.len > 0) {
         if (filter_state.checkLine(carry.items)) |info| {
             if (info.level) |lvl| counter.add(lvl);
-            const key = try buildAggregateKey(allocator, args.aggregate_mode, carry.items, info);
-            defer allocator.free(key);
-
+            const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, carry.items, info);
             try aggregator.add(key, carry.items, info);
         }
     }
@@ -1046,20 +1053,27 @@ fn extractLevel(line: []const u8) ?flags.Level {
     return null;
 }
 
-/// Build an aggregation key for a matched line according to `mode`.
-/// The returned slice is allocator-owned and must be freed by the caller.
-/// Accepts a pre-computed `LineInfo` to avoid re-parsing the line.
+/// Build an aggregation key into `scratch`. Returns a borrowed slice — either
+/// pointing into `line` (`.exact`) or into `scratch` (all other modes). The
+/// caller must not free the return value and must not touch `scratch` until
+/// it is done using the key.
+///
+/// The previous version dup'd a fresh key per line and the caller freed it
+/// after the hash lookup — on a hot aggregation path (existing key, just
+/// bump a counter) that's an allocation pair per line for zero ownership.
+/// Borrowed keys eliminate all of it.
 pub fn buildAggregateKey(
     allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
     mode: flags.AggregateMode,
     line: []const u8,
     info: LineInfo,
-) ![]u8 {
+) ![]const u8 {
     return switch (mode) {
-        .exact => allocator.dupe(u8, line),
-        .level_message => buildLevelMessageKey(allocator, line, info),
-        .json_message => buildJsonMessageKey(allocator, line),
-        .normalized => buildNormalizedKey(allocator, line, info),
+        .exact => line,
+        .level_message => try buildLevelMessageKey(allocator, scratch, line, info),
+        .json_message => try buildJsonMessageKey(allocator, scratch, line),
+        .normalized => try buildNormalizedKey(allocator, scratch, line),
     };
 }
 
@@ -1067,77 +1081,79 @@ pub fn buildAggregateKey(
 /// Prefer `buildAggregateKey` with a cached `LineInfo` when available.
 pub fn buildAggregateKeyForLine(
     allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
     mode: flags.AggregateMode,
     line: []const u8,
-) ![]u8 {
-    return buildAggregateKey(allocator, mode, line, analyzeLine(line));
+) ![]const u8 {
+    return buildAggregateKey(allocator, scratch, mode, line, analyzeLine(line));
 }
 
-/// Build a key from `level + message`.
-/// The level is normalized via enum tag name; message extraction depends on format.
+/// Build a key from `level + message` into `scratch`.
 fn buildLevelMessageKey(
     allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
     line: []const u8,
     info: LineInfo,
-) ![]u8 {
-    var buf = try std.ArrayList(u8).initCapacity(allocator, 128);
-    errdefer buf.deinit(allocator);
+) ![]const u8 {
+    scratch.clearRetainingCapacity();
 
     if (info.level) |lvl| {
-        try buf.appendSlice(allocator, @tagName(lvl));
+        try scratch.appendSlice(allocator, @tagName(lvl));
     } else {
-        try buf.appendSlice(allocator, "unknown");
+        try scratch.appendSlice(allocator, "unknown");
     }
-
     // Unit Separator to avoid accidental ambiguity.
-    try buf.append(allocator, 0x1f);
+    try scratch.append(allocator, 0x1f);
 
     const msg = extractMessage(line, info) orelse line;
     const trimmed = std.mem.trim(u8, msg, &std.ascii.whitespace);
-    try buf.appendSlice(allocator, trimmed);
+    try scratch.appendSlice(allocator, trimmed);
 
-    return buf.toOwnedSlice(allocator);
+    return scratch.items;
 }
 
-/// Build a key from the JSON `message`/`msg` field only.
+/// Build a key from the JSON `message`/`msg` field into `scratch`.
 /// Falls back to the whole line if the field is absent.
-fn buildJsonMessageKey(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+fn buildJsonMessageKey(
+    allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
+    line: []const u8,
+) ![]const u8 {
+    scratch.clearRetainingCapacity();
     const msg =
         simd.extractJsonField(line, "message", 4096) orelse
         simd.extractJsonField(line, "msg", 4096) orelse
         line;
-
-    return allocator.dupe(u8, std.mem.trim(u8, msg, &std.ascii.whitespace));
+    try scratch.appendSlice(allocator, std.mem.trim(u8, msg, &std.ascii.whitespace));
+    return scratch.items;
 }
 
-/// Build a normalized key that removes common high-cardinality noise:
+/// Build a normalized key into `scratch`:
 /// - lowercases ASCII
 /// - collapses whitespace
 /// - replaces ISO dates with `<date>`
 /// - replaces decimal runs with `#`
 fn buildNormalizedKey(
     allocator: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
     line: []const u8,
-    info: LineInfo,
-) ![]u8 {
-    _ = info;
-
-    var buf = try std.ArrayList(u8).initCapacity(allocator, line.len);
-    errdefer buf.deinit(allocator);
+) ![]const u8 {
+    scratch.clearRetainingCapacity();
+    try scratch.ensureUnusedCapacity(allocator, line.len);
 
     var i: usize = 0;
     var prev_space = false;
 
     while (i < line.len) {
         if (i + 10 <= line.len and isValidDateString(line[i .. i + 10])) {
-            try buf.appendSlice(allocator, "<date>");
+            try scratch.appendSlice(allocator, "<date>");
             i += 10;
             prev_space = false;
             continue;
         }
 
         if (isDigit(line[i])) {
-            try buf.append(allocator, '#');
+            try scratch.append(allocator, '#');
             i += 1;
             while (i < line.len and isDigit(line[i])) : (i += 1) {}
             prev_space = false;
@@ -1147,21 +1163,23 @@ fn buildNormalizedKey(
         const c = std.ascii.toLower(line[i]);
         if (std.ascii.isWhitespace(c)) {
             if (!prev_space) {
-                try buf.append(allocator, ' ');
+                try scratch.append(allocator, ' ');
                 prev_space = true;
             }
         } else {
-            try buf.append(allocator, c);
+            try scratch.append(allocator, c);
             prev_space = false;
         }
 
         i += 1;
     }
 
-    const trimmed = std.mem.trim(u8, buf.items, " ");
-    std.mem.copyForwards(u8, buf.items[0..trimmed.len], trimmed);
-    buf.items.len = trimmed.len;
-    return buf.toOwnedSlice(allocator);
+    const trimmed = std.mem.trim(u8, scratch.items, " ");
+    if (trimmed.len < scratch.items.len) {
+        std.mem.copyForwards(u8, scratch.items[0..trimmed.len], trimmed);
+        scratch.items.len = trimmed.len;
+    }
+    return scratch.items;
 }
 
 /// Extract a human-meaningful message slice from a line.
@@ -1267,39 +1285,6 @@ fn matchWord(line: []const u8, pos: usize, comptime word: []const u8) bool {
         std.mem.eql(u8, line[pos .. pos + word.len], word);
 }
 
-/// Locates the `"level"` value inside a JSON log line and returns its byte range.
-/// Used by the printer to colorize only the level token, not the surrounding JSON.
-/// Continues searching after `"level"` tokens that are not followed by `: "`.
-fn extractJsonLevelPos(line: []const u8) ?LevelPos {
-    var i: usize = 0;
-
-    while (i < line.len) {
-        const q = simd.findByte(line, i, '"') orelse return null;
-        const key_start = q + 1;
-        const key_end = simd.scanJsonStringEnd(line, key_start) orelse return null;
-        const key = line[key_start..key_end];
-        i = key_end + 1;
-
-        while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
-        if (i >= line.len or line[i] != ':') continue;
-        i += 1;
-        while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\n' or line[i] == '\r')) : (i += 1) {}
-
-        if (!std.mem.eql(u8, key, "level")) {
-            i = skipJsonValue(line, i);
-            continue;
-        }
-
-        if (i >= line.len or line[i] != '"') return null;
-
-        const value_start = i + 1;
-        const value_end = simd.scanJsonStringEnd(line, value_start) orelse return null;
-        return .{ .start = value_start, .end = value_end };
-    }
-
-    return null;
-}
-
 fn skipJsonValue(line: []const u8, start: usize) usize {
     var i = start;
     if (i >= line.len) return i;
@@ -1335,30 +1320,22 @@ fn skipJsonValue(line: []const u8, start: usize) usize {
     return i;
 }
 
-/// Writes bytes to stdout in uppercase.
+/// Writes bytes to stdout in uppercase. Anything past the stack buffer is
+/// truncated — log levels are always short, and a malformed 100-char level
+/// field mustn't cause 100 syscalls to stdout.
 fn writeUpper(bytes: []const u8) void {
-    var buf: [16]u8 = undefined;
+    var buf: [256]u8 = undefined;
     const n = @min(bytes.len, buf.len);
     for (bytes[0..n], 0..) |b, j| buf[j] = std.ascii.toUpper(b);
     writeOut(buf[0..n]);
-    for (bytes[n..]) |b| {
-        var tmp: [1]u8 = undefined;
-        tmp[0] = std.ascii.toUpper(b);
-        writeOut(&tmp);
-    }
 }
 
-/// Writes bytes to an OutputBuffer in uppercase.
+/// Buffered version of `writeUpper`.
 fn writeUpperBuffered(output: *OutputBuffer, bytes: []const u8) !void {
-    var buf: [16]u8 = undefined;
+    var buf: [256]u8 = undefined;
     const n = @min(bytes.len, buf.len);
     for (bytes[0..n], 0..) |b, j| buf[j] = std.ascii.toUpper(b);
     try output.write(buf[0..n]);
-    for (bytes[n..]) |b| {
-        var tmp: [1]u8 = undefined;
-        tmp[0] = std.ascii.toUpper(b);
-        try output.write(&tmp);
-    }
 }
 
 /// Writes a log level label in uppercase, right-padded to 5 characters
@@ -2019,22 +1996,6 @@ fn containsIgnoreCaseScalar(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Backward-compatible wrapper for tail.zig.
-/// Constructs a `FilterState` on every call — do not use in tight loops.
-/// In loops, build `FilterState` once with `FilterState.init` and call `checkLine` directly.
-pub fn handleLine(line: []const u8, args: flags.Args) void {
-    var filter_state = FilterState.init(args);
-    defer filter_state.deinit();
-    if (filter_state.checkLine(line)) |info| {
-        var match_buf: [max_search_matches]MatchRange = undefined;
-        const matches: []const MatchRange = if (filter_state.has_search_filter)
-            findSearchMatches(line, filter_state.search_expr.?, &match_buf)
-        else
-            &.{};
-        printStyledLine(line, info, matches);
-    }
-}
-
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -2118,19 +2079,24 @@ test "extractDate should extract ISO date from bracketed prefix" {
     try std.testing.expectEqualStrings("2023-10-18", result.?);
 }
 
-test "buildAggregateKey exact duplicates the full line" {
+test "buildAggregateKey exact returns borrowed slice into line" {
     const line = "[ERROR] Connection failed";
     const info = analyzeLine(line);
-    const key = try buildAggregateKey(std.testing.allocator, .exact, line, info);
-    defer std.testing.allocator.free(key);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const key = try buildAggregateKey(std.testing.allocator, &scratch, .exact, line, info);
     try std.testing.expectEqualStrings("[ERROR] Connection failed", key);
+    // .exact must not allocate — key points into `line`, scratch stays empty.
+    try std.testing.expectEqual(@as(usize, 0), scratch.items.len);
+    try std.testing.expect(key.ptr == line.ptr);
 }
 
 test "buildAggregateKey level_message uses level + message" {
     const line = "[ERROR] Connection failed";
     const info = analyzeLine(line);
-    const key = try buildAggregateKey(std.testing.allocator, .level_message, line, info);
-    defer std.testing.allocator.free(key);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const key = try buildAggregateKey(std.testing.allocator, &scratch, .level_message, line, info);
     try std.testing.expect(std.mem.indexOfScalar(u8, key, 0x1f) != null);
 }
 
@@ -2314,22 +2280,6 @@ test "levelStyle should return correct bg+fg codes" {
     try std.testing.expectEqualStrings("\x1b[48;2;48;54;61m", levelStyle(.Trace).bg);
 }
 
-test "handleLine should not crash on various inputs" {
-    var file = [_][]const u8{"test.log"};
-    const args = flags.Args{
-        .files = &file,
-        .tail_mode = false,
-        .date = null,
-        .levels = flags.levelBit(.Error),
-        .search = null,
-        .num_lines = 0,
-    };
-    var state = FilterState.init(args);
-    defer state.deinit();
-    _ = state.checkLine("[ERROR] Test");
-    _ = state.checkLine("");
-}
-
 // --- isUnescapedQuote ---
 
 test "isUnescapedQuote: plain quote" {
@@ -2366,10 +2316,10 @@ test "Aggregator counts identical lines and preserves first-seen order" {
     try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
     try std.testing.expectEqualStrings("[ERROR] one", agg.order.items[0]);
     try std.testing.expectEqualStrings("[WARN] two", agg.order.items[1]);
-    try std.testing.expectEqual(@as(usize, 3), agg.counts.get("[ERROR] one").?);
-    try std.testing.expectEqual(@as(usize, 2), agg.counts.get("[WARN] two").?);
-    try std.testing.expectEqualStrings("[ERROR] one", agg.sample_lines.get("[ERROR] one").?);
-    try std.testing.expectEqualStrings("[WARN] two", agg.sample_lines.get("[WARN] two").?);
+    try std.testing.expectEqual(@as(usize, 3), agg.entries.get("[ERROR] one").?.count);
+    try std.testing.expectEqual(@as(usize, 2), agg.entries.get("[WARN] two").?.count);
+    try std.testing.expectEqualStrings("[ERROR] one", agg.entries.get("[ERROR] one").?.sample_line);
+    try std.testing.expectEqualStrings("[WARN] two", agg.entries.get("[WARN] two").?.sample_line);
 }
 
 test "FilterState with aggregation semantics still filters before counting" {
@@ -2394,22 +2344,23 @@ test "FilterState with aggregation semantics still filters before counting" {
 
 test "buildAggregateKey exact uses full line" {
     const line = "[ERROR] Connection failed";
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
 
-    const key = try buildAggregateKeyForLine(std.testing.allocator, .exact, line);
-    defer std.testing.allocator.free(key);
-
+    const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .exact, line);
     try std.testing.expectEqualStrings("[ERROR] Connection failed", key);
 }
 
 test "buildAggregateKey level_message for bracketed line" {
     const line1 = "[ERROR] Connection failed";
     const line2 = "[ERROR] Connection failed";
+    var s1: std.ArrayList(u8) = .empty;
+    defer s1.deinit(std.testing.allocator);
+    var s2: std.ArrayList(u8) = .empty;
+    defer s2.deinit(std.testing.allocator);
 
-    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
-    defer std.testing.allocator.free(key1);
-
-    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
-    defer std.testing.allocator.free(key2);
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, &s1, .level_message, line1);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, &s2, .level_message, line2);
 
     try std.testing.expectEqualStrings(key1, key2);
     try std.testing.expect(std.mem.indexOfScalar(u8, key1, 0x1f) != null);
@@ -2418,25 +2369,26 @@ test "buildAggregateKey level_message for bracketed line" {
 test "buildAggregateKey level_message uses JSON message field" {
     const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
     const line2 = "{\"time\":\"2023-10-18T12:00:01Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
+    var s1: std.ArrayList(u8) = .empty;
+    defer s1.deinit(std.testing.allocator);
+    var s2: std.ArrayList(u8) = .empty;
+    defer s2.deinit(std.testing.allocator);
 
-    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
-    defer std.testing.allocator.free(key1);
-
-    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
-    defer std.testing.allocator.free(key2);
-
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, &s1, .level_message, line1);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, &s2, .level_message, line2);
     try std.testing.expectEqualStrings(key1, key2);
 }
 
 test "buildAggregateKey json_message ignores level and timestamp differences" {
     const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
     const line2 = "{\"time\":\"2023-10-18T12:00:01Z\",\"level\":\"warn\",\"message\":\"Connection failed\"}";
+    var s1: std.ArrayList(u8) = .empty;
+    defer s1.deinit(std.testing.allocator);
+    var s2: std.ArrayList(u8) = .empty;
+    defer s2.deinit(std.testing.allocator);
 
-    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
-    defer std.testing.allocator.free(key1);
-
-    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
-    defer std.testing.allocator.free(key2);
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, &s1, .json_message, line1);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, &s2, .json_message, line2);
 
     try std.testing.expectEqualStrings("Connection failed", key1);
     try std.testing.expectEqualStrings(key1, key2);
@@ -2445,13 +2397,13 @@ test "buildAggregateKey json_message ignores level and timestamp differences" {
 test "buildAggregateKey normalized collapses dates digits case and whitespace" {
     const line1 = "2023-10-18T12:00:00Z [ERROR] Request 123 failed";
     const line2 = "2023-10-19T12:00:01Z   [error]   Request 987 failed";
+    var s1: std.ArrayList(u8) = .empty;
+    defer s1.deinit(std.testing.allocator);
+    var s2: std.ArrayList(u8) = .empty;
+    defer s2.deinit(std.testing.allocator);
 
-    const key1 = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
-    defer std.testing.allocator.free(key1);
-
-    const key2 = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
-    defer std.testing.allocator.free(key2);
-
+    const key1 = try buildAggregateKeyForLine(std.testing.allocator, &s1, .normalized, line1);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, &s2, .normalized, line2);
     try std.testing.expectEqualStrings(key1, key2);
 }
 
@@ -2466,48 +2418,48 @@ test "Aggregator groups by key and keeps first sample line" {
     try agg.add(key, "[ERROR] Connection failed at retry", analyzeLine("[ERROR] Connection failed at retry"));
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
-    try std.testing.expectEqual(@as(usize, 3), agg.counts.get(key).?);
-    try std.testing.expectEqualStrings("[ERROR] Connection failed", agg.sample_lines.get(key).?);
+    try std.testing.expectEqual(@as(usize, 3), agg.entries.get(key).?.count);
+    try std.testing.expectEqualStrings("[ERROR] Connection failed", agg.entries.get(key).?.sample_line);
 }
 
 test "level_message aggregation groups same message with different timestamps" {
     var agg = try Aggregator.init(std.testing.allocator);
     defer agg.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
 
     const line1 = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
     const line2 = "{\"time\":\"2023-10-18T12:00:05Z\",\"level\":\"error\",\"message\":\"Connection failed\"}";
 
     {
-        const key = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line1);
-        defer std.testing.allocator.free(key);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .level_message, line1);
         try agg.add(key, line1, analyzeLine(line1));
     }
     {
-        const key = try buildAggregateKeyForLine(std.testing.allocator, .level_message, line2);
-        defer std.testing.allocator.free(key);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .level_message, line2);
         try agg.add(key, line2, analyzeLine(line2));
     }
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
-    try std.testing.expectEqual(@as(usize, 2), agg.counts.get(agg.order.items[0]).?);
-    try std.testing.expectEqualStrings(line1, agg.sample_lines.get(agg.order.items[0]).?);
+    try std.testing.expectEqual(@as(usize, 2), agg.entries.get(agg.order.items[0]).?.count);
+    try std.testing.expectEqualStrings(line1, agg.entries.get(agg.order.items[0]).?.sample_line);
 }
 
 test "json_message aggregation separates different messages" {
     var agg = try Aggregator.init(std.testing.allocator);
     defer agg.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
 
     const line1 = "{\"level\":\"error\",\"message\":\"Connection failed\"}";
     const line2 = "{\"level\":\"error\",\"message\":\"Timeout\"}";
 
     {
-        const key = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line1);
-        defer std.testing.allocator.free(key);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .json_message, line1);
         try agg.add(key, line1, analyzeLine(line1));
     }
     {
-        const key = try buildAggregateKeyForLine(std.testing.allocator, .json_message, line2);
-        defer std.testing.allocator.free(key);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .json_message, line2);
         try agg.add(key, line2, analyzeLine(line2));
     }
 
@@ -2517,23 +2469,23 @@ test "json_message aggregation separates different messages" {
 test "normalized aggregation groups noisy numeric variants" {
     var agg = try Aggregator.init(std.testing.allocator);
     defer agg.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
 
     const line1 = "2023-10-18 [ERROR] Request 123 failed";
     const line2 = "2023-10-19 [ERROR] Request 999 failed";
 
     {
-        const key = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line1);
-        defer std.testing.allocator.free(key);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .normalized, line1);
         try agg.add(key, line1, analyzeLine(line1));
     }
     {
-        const key = try buildAggregateKeyForLine(std.testing.allocator, .normalized, line2);
-        defer std.testing.allocator.free(key);
+        const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .normalized, line2);
         try agg.add(key, line2, analyzeLine(line2));
     }
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
-    try std.testing.expectEqual(@as(usize, 2), agg.counts.get(agg.order.items[0]).?);
+    try std.testing.expectEqual(@as(usize, 2), agg.entries.get(agg.order.items[0]).?.count);
 }
 
 test "extractLogfmtField extracts quoted and unquoted values" {
@@ -2558,34 +2510,6 @@ test "extractMessage uses plain tail after bracketed level" {
 
     const msg = extractMessage(line, info).?;
     try std.testing.expectEqualStrings("connection failed", msg);
-}
-
-test "extractJsonLevelPos: finds level value" {
-    const line = "{\"time\":\"...\",\"level\":\"error\",\"msg\":\"test\"}";
-    const pos = extractJsonLevelPos(line).?;
-    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
-}
-
-test "extractJsonLevelPos: returns null without level" {
-    try std.testing.expect(extractJsonLevelPos("{\"time\":\"...\",\"msg\":\"test\"}") == null);
-}
-
-test "extractJsonLevelPos: skips level-as-value before real key" {
-    const line = "{\"msg\":\"level\",\"level\":\"error\"}";
-    const pos = extractJsonLevelPos(line).?;
-    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
-}
-
-test "extractJsonLevelPos: ignores escaped key-like text inside values" {
-    const line = "{\"msg\":\"text with \\\"level\\\":\\\"warn\\\" inside\",\"level\":\"error\"}";
-    const pos = extractJsonLevelPos(line).?;
-    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
-}
-
-test "extractJsonLevelPos: skips nested level before sibling level" {
-    const line = "{\"ctx\":{\"level\":\"debug\"},\"level\":\"error\"}";
-    const pos = extractJsonLevelPos(line).?;
-    try std.testing.expectEqualStrings("error", line[pos.start..pos.end]);
 }
 
 test "findSearchMatches: single term" {
@@ -2697,25 +2621,28 @@ test "extractPlainMessage: bracket-only line" {
 
 test "buildNormalizedKey: collapses digits and spaces" {
     const line = "error code 12345 at line 99";
-    const info = analyzeLine(line);
-    const key = try buildNormalizedKey(std.testing.allocator, line, info);
-    defer std.testing.allocator.free(key);
+    _ = analyzeLine(line);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const key = try buildNormalizedKey(std.testing.allocator, &scratch, line);
     try std.testing.expectEqualStrings("error code # at line #", key);
 }
 
 test "buildNormalizedKey: replaces ISO date" {
     const line = "request 2023-10-18 failed";
-    const info = analyzeLine(line);
-    const key = try buildNormalizedKey(std.testing.allocator, line, info);
-    defer std.testing.allocator.free(key);
+    _ = analyzeLine(line);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const key = try buildNormalizedKey(std.testing.allocator, &scratch, line);
     try std.testing.expect(std.mem.indexOf(u8, key, "<date>") != null);
 }
 
 test "buildNormalizedKey: collapses multiple spaces" {
     const line = "error    multiple    spaces";
-    const info = analyzeLine(line);
-    const key = try buildNormalizedKey(std.testing.allocator, line, info);
-    defer std.testing.allocator.free(key);
+    _ = analyzeLine(line);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const key = try buildNormalizedKey(std.testing.allocator, &scratch, line);
     try std.testing.expectEqualStrings("error multiple spaces", key);
 }
 
@@ -2848,24 +2775,28 @@ test "Aggregator drops new keys past max_aggregate_keys cap" {
     // cap value via a parallel scalar test.
     const empty_info = std.mem.zeroes(LineInfo);
 
-    // Fill near the boundary via a low-level shortcut: stuff `counts` to
+    // Fill near the boundary via a low-level shortcut: stuff `entries` to
     // the cap with sentinel entries so the gate fires on the next `add`.
     var i: usize = 0;
     while (i < max_aggregate_keys) : (i += 1) {
         var key_buf: [16]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "k{d}", .{i}) catch return;
         const owned = try agg.arena.allocator().dupe(u8, key);
-        try agg.counts.putNoClobber(agg.allocator, owned, 1);
+        try agg.entries.putNoClobber(agg.allocator, owned, .{
+            .count = 1,
+            .sample_line = "",
+            .sample_info = empty_info,
+        });
     }
-    try std.testing.expectEqual(max_aggregate_keys, agg.counts.count());
+    try std.testing.expectEqual(max_aggregate_keys, agg.entries.count());
 
     // Now a fresh key gets silently dropped.
     try agg.add("overflow-key", "sample", empty_info);
-    try std.testing.expectEqual(max_aggregate_keys, agg.counts.count());
+    try std.testing.expectEqual(max_aggregate_keys, agg.entries.count());
 
     // But an existing key still increments its count.
     try agg.add("k0", "sample-2", empty_info);
-    try std.testing.expectEqual(@as(usize, 2), agg.counts.get("k0").?);
+    try std.testing.expectEqual(@as(usize, 2), agg.entries.get("k0").?.count);
 }
 
 test "keepUnprocessedTail compacts carry without self-copy append" {

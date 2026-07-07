@@ -24,6 +24,11 @@ const debug_io = std.Options.debug_io;
 /// would happily try to allocate gigabytes or recurse millions of times.
 pub const max_entry_fields: usize = 4096;
 pub const max_data_payload_bytes: usize = 16 * 1024 * 1024;
+/// Upper bound on the number of entry-arrays the iterator will walk in
+/// its lifetime. Guards against a crafted (or corrupted) file whose
+/// `next_entry_array_offset` chain forms a cycle — without a bound the
+/// iterator would spin forever on a self-referencing array.
+pub const max_entry_arrays: usize = 1_000_000;
 
 pub const Error = error{
     InvalidMagic,
@@ -36,6 +41,9 @@ pub const Error = error{
     InvalidField,
     EntryTooLarge,
     PayloadTooLarge,
+    /// The entry-array chain visited more than `max_entry_arrays` heads,
+    /// almost certainly a cycle in a malformed file.
+    ChainLoop,
 } || std.mem.Allocator.Error || error{
     /// Underlying I/O failed. We collapse the std.Io.File errors into a
     /// single variant so the public API stays small.
@@ -162,9 +170,13 @@ pub const Reader = struct {
     }
 
     /// Reads `len` bytes at `pos` into `dst`. Errors if the read is short
-    /// (truncated file) or runs past `file_size`.
+    /// (truncated file) or runs past `file_size`. The bounds check is done
+    /// via subtraction (`file_size - pos`) rather than addition — a crafted
+    /// file with `pos` near `u64` max would wrap `pos + dst.len` and slip
+    /// past a naïve check, letting the caller read at attacker-controlled
+    /// offsets.
     fn readAt(self: *Reader, pos: u64, dst: []u8) Error!void {
-        if (pos + dst.len > self.file_size) return error.InvalidOffset;
+        if (pos > self.file_size or dst.len > self.file_size - pos) return error.InvalidOffset;
         const n = self.file.readPositional(self.io, &.{dst}, pos) catch return error.IoError;
         if (n != dst.len) return error.IoError;
     }
@@ -200,6 +212,12 @@ pub const Iterator = struct {
     /// DATA payload is referenced by every entry of that unit. Without a
     /// cache we re-read (and re-LZ4-decode) it once per entry.
     cache: ?*DataCache = null,
+    /// Running count of entry-array heads we've walked. Bumps in
+    /// `advanceArray` and `seekToEnd`; both bail with `error.ChainLoop`
+    /// when the count crosses `max_entry_arrays`. Doesn't reset on
+    /// `refresh` (fresh chain head repositions us but keeps the counter,
+    /// which is fine — a healthy file will never approach the cap).
+    arrays_visited: usize = 0,
 
     /// Advances to the next entry. Returns null at EOF. Caller owns the
     /// returned `Entry` and must call `deinit`.
@@ -285,6 +303,12 @@ pub const Iterator = struct {
     /// `next_entry_array_offset`. Advances `array_offset` to next array when
     /// the current is exhausted.
     fn advanceArray(self: *Iterator) Error!void {
+        // Cycle guard: a crafted file with `A.next = A` (or any longer
+        // cycle) would otherwise spin here forever. `arrays_visited`
+        // covers every head we read across `next` / `refresh` / `seekToEnd`.
+        if (self.arrays_visited >= max_entry_arrays) return error.ChainLoop;
+        self.arrays_visited += 1;
+
         var head_buf: [@sizeOf(fmt.EntryArrayHead)]u8 = undefined;
         try self.reader.readAt(self.array_offset, &head_buf);
         const head = std.mem.bytesAsValue(fmt.EntryArrayHead, &head_buf).*;
@@ -334,6 +358,11 @@ pub const Iterator = struct {
     /// journal into a tens-of-milliseconds bookkeeping pass.
     pub fn seekToEnd(self: *Iterator) Error!void {
         while (self.array_offset != 0) {
+            // Same cycle guard as `advanceArray`. Without it, a crafted
+            // `A.next = A` file would loop until the process was killed.
+            if (self.arrays_visited >= max_entry_arrays) return error.ChainLoop;
+            self.arrays_visited += 1;
+
             var head_buf: [@sizeOf(fmt.EntryArrayHead)]u8 = undefined;
             try self.reader.readAt(self.array_offset, &head_buf);
             const head = std.mem.bytesAsValue(fmt.EntryArrayHead, &head_buf).*;
@@ -935,4 +964,53 @@ test "Iterator follows next_entry_array_offset chain" {
     }
     try testing.expectEqual(@as(usize, 3), i);
     try testing.expectEqual([_]u64{ 1, 2, 3 }, got_seq);
+}
+
+test "Iterator rejects a self-referencing entry-array cycle" {
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    // Empty array (capacity 0) that points at itself. Without the cycle
+    // guard, both `next` and `seekToEnd` would spin forever advancing
+    // `array_offset` to the same head over and over.
+    const arr = try b.writeEntryArray(&.{});
+    const arr_head: *fmt.EntryArrayHead = @alignCast(@ptrCast(b.bytes.items[arr..].ptr));
+    arr_head.next_entry_array_offset = arr;
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{ .sub_path = "loop.journal", .data = b.bytes.items });
+
+    var r = try Reader.open(tio, tmp.dir, "loop.journal");
+    defer r.deinit();
+
+    var it = r.iterator();
+    try testing.expectError(error.ChainLoop, it.next(testing.allocator));
+
+    var it2 = r.iterator();
+    try testing.expectError(error.ChainLoop, it2.seekToEnd());
+}
+
+test "Reader.readAt bounds check resists integer overflow" {
+    const tio = debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+    try tmp.dir.writeFile(tio, .{ .sub_path = "overflow.journal", .data = b.bytes.items });
+
+    var r = try Reader.open(tio, tmp.dir, "overflow.journal");
+    defer r.deinit();
+
+    // A crafted `pos` near u64 max would wrap `pos + dst.len` past `file_size`
+    // and slip through a naïve additive check. The subtractive check must
+    // reject it.
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.InvalidOffset, r.readAt(std.math.maxInt(u64) - 4, &buf));
+    try testing.expectError(error.InvalidOffset, r.readAt(std.math.maxInt(u64), &buf));
 }
