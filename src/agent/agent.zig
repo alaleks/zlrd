@@ -173,10 +173,11 @@ pub fn run(
         watcher_failed = true;
     };
 
+    // `requestShutdown` closes the listener under a swap-guard so any
+    // pending `accept()` returns immediately — no separate wake-up
+    // connection needed (the previous nudge had no timeout and could
+    // itself stall the shutdown path).
     srv.requestShutdown();
-    // The listener.accept() call is blocking; opening a no-op local connection
-    // is the simplest way to wake it so the thread can observe shutdown_flag.
-    nudgeListener(io, cfg.listen_addr);
     server_thread.join();
 
     if (dispatcher.shouldExit()) return 1;
@@ -198,13 +199,4 @@ fn runJournal(src: *journal.JournalSource) void {
 /// stay backend-agnostic.
 pub fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
-}
-
-/// Wakes the listener by opening a local connection and immediately closing.
-/// Best-effort: if the connection can't be made (port closed, race), the
-/// listener will eventually be killed when the process exits.
-fn nudgeListener(io: std.Io, addr_str: []const u8) void {
-    const addr = std.Io.net.IpAddress.parseLiteral(addr_str) catch return;
-    const stream = addr.connect(io, .{ .mode = .stream }) catch return;
-    stream.close(io);
 }

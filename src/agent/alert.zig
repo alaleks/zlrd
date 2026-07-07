@@ -188,7 +188,17 @@ pub const Dispatcher = struct {
         // JSONL readers. 16 KiB is comfortably larger than every render
         // buffer the dispatchers use (8 KiB max for service events).
         var combined: [16 * 1024]u8 = undefined;
-        if (payload.len + 1 > combined.len) return;
+        if (payload.len + 1 > combined.len) {
+            // Should never fire in practice — the biggest renderer (service
+            // events) writes into an 8 KiB buffer, well under this cap. But
+            // silently dropping the alert is worse than logging the fact:
+            // an operator has no other signal that an event was lost.
+            std.log.scoped(.zlrd_alert).warn(
+                "alert file: payload {d}B exceeds writeFile cap {d}B; dropping",
+                .{ payload.len, combined.len },
+            );
+            return;
+        }
         @memcpy(combined[0..payload.len], payload);
         combined[payload.len] = '\n';
         const record = combined[0 .. payload.len + 1];
@@ -271,12 +281,13 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
             '\t' => try w.writeAll("\\t"),
             0x08 => try w.writeAll("\\b"),
             0x0c => try w.writeAll("\\f"),
-            // ASCII printable excluding `"` (0x22) and `\\` (0x5c) which
-            // are handled above as explicit escape arms.
-            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try w.writeByte(c),
-            // Remaining controls + DEL + high bytes. Log payloads may
-            // contain UTF-8 or stray control bytes; emit them as `\uXX` so
-            // the JSON is always parseable downstream.
+            // ASCII printable (excluding `"` 0x22 and `\` 0x5c handled above)
+            // and every byte with the high bit set — the latter are valid
+            // UTF-8 continuation bytes and must NOT be escaped as `\u00XX`
+            // (that would decode as U+00XX and mangle multi-byte characters,
+            // turning "é" (C3 A9) into "Ã©" in the downstream parser).
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e, 0x80...0xff => try w.writeByte(c),
+            // Remaining controls + DEL: not representable as raw JSON, escape.
             else => try w.print("\\u{x:0>4}", .{c}),
         }
     }
@@ -403,4 +414,25 @@ test "formatAlert: escapes quotes, backslashes, and control bytes in line" {
     // The parser does the reverse-escape — round-tripping is the strongest
     // check that the encoder was correct.
     try testing.expectEqualStrings("weird: \"q\" \\ \n \t end", parsed.value.object.get("line").?.string);
+}
+
+test "formatAlert: passes multi-byte UTF-8 through verbatim (no mojibake)" {
+    var buf: [1024]u8 = undefined;
+    const fired: rules.Fired = .{
+        .kind = .regex,
+        .rule_id = "p",
+        // Mixed Latin, Cyrillic, CJK, emoji — every one of these has bytes
+        // ≥ 0x80. The previous encoder escaped them as `\u00XX` which the
+        // parser would decode as U+00XX, turning them into mojibake.
+        .line = "café / привет / 你好 / 🚀",
+        .file_path = "a.log",
+        .threshold_count = 1,
+        .threshold_window_ms = 1_000,
+        .observed_count = 1,
+    };
+    const out = try formatAlert(&buf, fired, 0);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("café / привет / 你好 / 🚀", parsed.value.object.get("line").?.string);
 }

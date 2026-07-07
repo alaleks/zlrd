@@ -479,14 +479,24 @@ pub const JournalSource = struct {
         const message = unescapeJsonString(&msg_buf, raw_message);
 
         const unit_raw = findJsonStringField(json_line, "_SYSTEMD_UNIT");
-        var unit_buf: [256]u8 = undefined;
+        // Systemd unit names are usually ≤ 100 bytes, but template instances
+        // (e.g. `system-getty.slice/getty-tty@tty1.service`) can push past
+        // 256. `unescapeJsonString` truncates silently on overflow, and a
+        // truncated unit name misses its glob match → the entry gets
+        // dropped without diagnostic.
+        var unit_buf: [512]u8 = undefined;
         const unit = if (unit_raw) |u|
             unescapeJsonString(&unit_buf, u)
         else
             self.pattern;
 
         const syslog_id_raw = findJsonStringField(json_line, "SYSLOG_IDENTIFIER");
-        var sid_buf: [64]u8 = undefined;
+        // 64 was tight — `SYSLOG_IDENTIFIER` mirrors the executable name and
+        // some binaries have long ones. Truncation here breaks the
+        // `eql(syslog_id, "systemd")` classifier for edge cases where the
+        // 64th byte happens to fall inside "systemd" (won't happen for the
+        // literal, but does for identifiers like `systemd-userdbd`).
+        var sid_buf: [128]u8 = undefined;
         const syslog_id = if (syslog_id_raw) |s| unescapeJsonString(&sid_buf, s) else "";
 
         const priority = findJsonStringField(json_line, "PRIORITY") orelse "";
@@ -527,8 +537,10 @@ pub const JournalSource = struct {
             });
             return null;
         }
+        // Note: this function returns `?*Tracker` (not `!*Tracker`), so
+        // `errdefer` would never fire. Every failure arm below cleans up
+        // explicitly.
         const key = self.allocator.dupe(u8, unit) catch return null;
-        errdefer self.allocator.free(key);
         const ptr = self.allocator.create(service.Tracker) catch {
             self.allocator.free(key);
             return null;

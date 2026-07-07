@@ -22,6 +22,11 @@ pub const Server = struct {
     token: []const u8,
     listener: std.Io.net.Server,
     shutdown_flag: std.atomic.Value(bool),
+    /// Guards `listener.deinit` so it only ever runs once. Both
+    /// `requestShutdown` (called from the main thread on stop) and
+    /// `deinit` (called from the main thread after join) race to close
+    /// the listener, and double-close would be UB.
+    listener_closed: std.atomic.Value(bool),
 
     pub fn listen(
         allocator: std.mem.Allocator,
@@ -38,16 +43,31 @@ pub const Server = struct {
             .token = opts.metrics_token,
             .listener = listener,
             .shutdown_flag = .init(false),
+            .listener_closed = .init(false),
         };
     }
 
     pub fn deinit(self: *Server) void {
-        self.listener.deinit(self.io);
+        if (!self.listener_closed.swap(true, .acq_rel)) {
+            self.listener.deinit(self.io);
+        }
         self.* = undefined;
     }
 
+    /// Signals the accept loop to exit AND cancels the current
+    /// `accept()` call by closing the listener socket. The accept then
+    /// returns `error.SocketNotListening` / `.Canceled` and the run loop
+    /// bails on its next iteration.
+    ///
+    /// Previously the caller had to poke the listener from another
+    /// socket to wake accept(), but that connect had no timeout — a
+    /// hostile firewall or a busy localhost stack could stall the whole
+    /// shutdown. Closing directly is reliable.
     pub fn requestShutdown(self: *Server) void {
         self.shutdown_flag.store(true, .monotonic);
+        if (!self.listener_closed.swap(true, .acq_rel)) {
+            self.listener.deinit(self.io);
+        }
     }
 
     /// Blocks until shutdown is requested. Accepts connections sequentially —
