@@ -79,6 +79,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Reader-only executable (`zlrd-lite`). Shares the flags / simd / regex /
+    // reader source with the full binary but does not link agent, journal,
+    // kernel, or sidecar code — smaller footprint for users who only need
+    // filtering + tailing.
+    const lite_root_mod = b.createModule(.{
+        .root_source_file = b.path("src/main_lite.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_root_mod.addImport("build_options", build_options_mod);
+    lite_root_mod.addImport("flags", flags_mod);
+    lite_root_mod.addImport("simd", simd_mod);
+    lite_root_mod.addImport("regex", regex_mod);
+
+    const exe_lite = b.addExecutable(.{
+        .name = "zlrd-lite",
+        .root_module = lite_root_mod,
+    });
+    b.installArtifact(exe_lite);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -86,6 +106,14 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run zlrd");
     run_step.dependOn(&run_cmd.step);
+
+    const run_lite_cmd = b.addRunArtifact(exe_lite);
+    run_lite_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_lite_cmd.addArgs(args);
+    }
+    const run_lite_step = b.step("run-lite", "Run zlrd-lite");
+    run_lite_step.dependOn(&run_lite_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
 
@@ -200,4 +228,5 @@ pub fn build(b: *std.Build) void {
 
     const check = b.step("check", "Check if code compiles");
     check.dependOn(&exe.step);
+    check.dependOn(&exe_lite.step);
 }

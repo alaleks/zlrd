@@ -90,10 +90,25 @@ stderr, files, or HTTP webhooks.
 
 ## Installation
 
+Two flavours are published for every release:
+
+| Binary        | Size (rel.) | Includes                                            | For you if…                                                              |
+| ------------- | ----------- | --------------------------------------------------- | ------------------------------------------------------------------------ |
+| **`zlrd`**    | full        | reader **+ agent + sidecar + journal + kernel**     | You want `/metrics`, alerts, webhooks, journal sources, kernel probes    |
+| **`zlrd-lite`** | ~60 % smaller | reader only (filter, tail, colorize, aggregate) | You only need a fast `tail`/`grep` replacement in the terminal           |
+
+Both binaries share the reader, so `zlrd-lite app.log` and `zlrd app.log`
+behave identically. `zlrd-lite --agent` prints an error pointing at the full
+binary instead of silently doing nothing.
+
 ### macOS — Homebrew
 
 ```bash
+# Full binary (reader + agent + sidecar)
 brew install alaleks/tap/zlrd
+
+# Lightweight reader-only build
+brew install alaleks/tap/zlrd-lite
 ```
 
 ### Linux — apt (Debian, Ubuntu)
@@ -110,35 +125,45 @@ curl -fsSL "https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/gpgkey" \
 echo "deb [signed-by=/etc/apt/keyrings/aleksandr-aleksandrov_zlrd-archive-keyring.gpg] https://packages.buildkite.com/aleksandr-aleksandrov/zlrd/any/ any main" \
   | sudo tee /etc/apt/sources.list.d/buildkite-aleksandr-aleksandrov-zlrd.list > /dev/null
 
-# 4. Install
-sudo apt update && sudo apt install zlrd
+# 4. Install one (or both — they don't conflict, different binary names)
+sudo apt update && sudo apt install zlrd          # full
+sudo apt install zlrd-lite                        # reader-only
 ```
 
 ### Pre-built binaries
 
 Download the archive for your platform from
-[Releases](https://github.com/alaleks/zlrd/releases/latest) and put `zlrd`
-on your `PATH`.
+[Releases](https://github.com/alaleks/zlrd/releases/latest) and put the
+binary on your `PATH`.
 
-| Platform              | Archive                          |
-| --------------------- | -------------------------------- |
-| macOS Apple Silicon   | `zlrd-aarch64-macos.tar.gz`      |
-| macOS Intel           | `zlrd-x86_64-macos.tar.gz`       |
-| Linux x86_64          | `zlrd-x86_64-linux.tar.gz`       |
-| Windows x86_64        | `zlrd-x86_64-windows.zip`        |
+| Platform              | Full (`zlrd`)                     | Lite (`zlrd-lite`)                     |
+| --------------------- | --------------------------------- | -------------------------------------- |
+| macOS Apple Silicon   | `zlrd-aarch64-macos.tar.gz`       | `zlrd-lite-aarch64-macos.tar.gz`       |
+| macOS Intel           | `zlrd-x86_64-macos.tar.gz`        | `zlrd-lite-x86_64-macos.tar.gz`        |
+| Linux x86_64          | `zlrd-x86_64-linux.tar.gz`        | `zlrd-lite-x86_64-linux.tar.gz`        |
+| Windows x86_64        | `zlrd-x86_64-windows.zip`         | `zlrd-lite-x86_64-windows.zip`         |
 
-Every release also ships `checksums.txt` with SHA-256 hashes.
+Every release also ships `checksums.txt` with SHA-256 hashes for all
+archives and `.deb` packages.
 
 One-liner install on Unix-like systems:
 
 ```bash
-# macOS Apple Silicon
+# macOS Apple Silicon — full
 curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-aarch64-macos.tar.gz \
   | tar xz && sudo mv zlrd /usr/local/bin/
 
-# Linux x86_64
+# macOS Apple Silicon — lite
+curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-lite-aarch64-macos.tar.gz \
+  | tar xz && sudo mv zlrd-lite /usr/local/bin/
+
+# Linux x86_64 — full
 curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-x86_64-linux.tar.gz \
   | tar xz && sudo mv zlrd /usr/local/bin/
+
+# Linux x86_64 — lite
+curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-lite-x86_64-linux.tar.gz \
+  | tar xz && sudo mv zlrd-lite /usr/local/bin/
 ```
 
 ### From source
@@ -149,7 +174,10 @@ Requires Zig **0.16.0** or later.
 git clone https://github.com/alaleks/zlrd.git
 cd zlrd
 zig build -Doptimize=ReleaseFast
-sudo install zig-out/bin/zlrd /usr/local/bin/
+
+# Both binaries land in zig-out/bin
+sudo install zig-out/bin/zlrd      /usr/local/bin/
+sudo install zig-out/bin/zlrd-lite /usr/local/bin/
 ```
 
 ---

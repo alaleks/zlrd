@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -18,23 +18,23 @@ jobs:
         include:
           - target: x86_64-linux-musl
             os: ubuntu-latest
-            bin: zlrd
-            archive: zlrd-x86_64-linux.tar.gz
+            ext: tar.gz
+            platform: x86_64-linux
 
           - target: x86_64-windows-gnu
             os: ubuntu-latest
-            bin: zlrd.exe
-            archive: zlrd-x86_64-windows.zip
+            ext: zip
+            platform: x86_64-windows
 
           - target: x86_64-macos
             os: macos-latest
-            bin: zlrd
-            archive: zlrd-x86_64-macos.tar.gz
+            ext: tar.gz
+            platform: x86_64-macos
 
           - target: aarch64-macos
             os: macos-latest
-            bin: zlrd
-            archive: zlrd-aarch64-macos.tar.gz
+            ext: tar.gz
+            platform: aarch64-macos
 
     steps:
       - uses: actions/checkout@v4
@@ -50,23 +50,34 @@ jobs:
             -Dtarget=${{ matrix.target }} \
             -Dversion="${{ github.ref_name }}"
 
+      # Two artifacts per platform: the full `zlrd` binary and the reader-only
+      # `zlrd-lite`. Named consistently so the release / homebrew / apt jobs
+      # can locate them by predictable pattern.
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
+          plat="${{ matrix.platform }}"
+          ext="${{ matrix.ext }}"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp zig-out/bin/zlrd.exe dist/zlrd.exe
-            cd dist && zip ${{ matrix.archive }} zlrd.exe
+            cp zig-out/bin/zlrd.exe      dist/zlrd.exe
+            cp zig-out/bin/zlrd-lite.exe dist/zlrd-lite.exe
+            (cd dist && zip "zlrd-${plat}.${ext}"      zlrd.exe)
+            (cd dist && zip "zlrd-lite-${plat}.${ext}" zlrd-lite.exe)
+            rm dist/zlrd.exe dist/zlrd-lite.exe
           else
-            cp zig-out/bin/zlrd dist/zlrd
-            cd dist && tar czf ${{ matrix.archive }} zlrd
+            cp zig-out/bin/zlrd      dist/zlrd
+            cp zig-out/bin/zlrd-lite dist/zlrd-lite
+            (cd dist && tar czf "zlrd-${plat}.${ext}"      zlrd)
+            (cd dist && tar czf "zlrd-lite-${plat}.${ext}" zlrd-lite)
+            rm dist/zlrd dist/zlrd-lite
           fi
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: dist/${{ matrix.archive }}
+          name: bundle-${{ matrix.platform }}
+          path: dist/*
 
   release:
     name: Create GitHub Release
@@ -79,28 +90,53 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Build .deb package
+      - name: Build .deb packages
         run: |
           VERSION="${{ github.ref_name }}"
           VER="${VERSION#v}"
 
-          tar xzf dist/zlrd-x86_64-linux.tar.gz -C dist
+          build_deb() {
+            local pkg_name="$1"     # zlrd | zlrd-lite
+            local bin_name="$2"     # zlrd | zlrd-lite
+            local archive="$3"      # dist/<archive>.tar.gz
+            local desc_short="$4"
+            local desc_long="$5"
 
-          mkdir -p pkg/DEBIAN pkg/usr/local/bin
-          cp dist/zlrd pkg/usr/local/bin/zlrd
-          chmod 755 pkg/usr/local/bin/zlrd
+            local work="pkg-${pkg_name}"
+            rm -rf "${work}"
+            mkdir -p "${work}/DEBIAN" "${work}/usr/local/bin"
 
-          echo "Package: zlrd"                                      > pkg/DEBIAN/control
-          echo "Version: ${VER}"                                   >> pkg/DEBIAN/control
-          echo "Architecture: amd64"                               >> pkg/DEBIAN/control
-          echo "Maintainer: alaleks <alaleksandrov30@gmail.com>"   >> pkg/DEBIAN/control
-          echo "Section: utils"                                    >> pkg/DEBIAN/control
-          echo "Priority: optional"                                >> pkg/DEBIAN/control
-          echo "Homepage: https://github.com/alaleks/zlrd"        >> pkg/DEBIAN/control
-          echo "Description: Fast log viewer CLI"                  >> pkg/DEBIAN/control
-          echo " High-performance log reader and analyzer."        >> pkg/DEBIAN/control
+            local extract="extract-${pkg_name}"
+            rm -rf "${extract}"
+            mkdir -p "${extract}"
+            tar xzf "${archive}" -C "${extract}"
+            cp "${extract}/${bin_name}" "${work}/usr/local/bin/${bin_name}"
+            chmod 755 "${work}/usr/local/bin/${bin_name}"
 
-          dpkg-deb --build pkg dist/zlrd_${VER}_amd64.deb
+            {
+              echo "Package: ${pkg_name}"
+              echo "Version: ${VER}"
+              echo "Architecture: amd64"
+              echo "Maintainer: alaleks <alaleksandrov30@gmail.com>"
+              echo "Section: utils"
+              echo "Priority: optional"
+              echo "Homepage: https://github.com/alaleks/zlrd"
+              echo "Description: ${desc_short}"
+              echo " ${desc_long}"
+            } > "${work}/DEBIAN/control"
+
+            dpkg-deb --build "${work}" "dist/${pkg_name}_${VER}_amd64.deb"
+          }
+
+          build_deb \
+            "zlrd" "zlrd" "dist/zlrd-x86_64-linux.tar.gz" \
+            "Fast log viewer CLI (full: reader + agent + sidecar)" \
+            "High-performance log reader, filter, tailer, and observability agent."
+
+          build_deb \
+            "zlrd-lite" "zlrd-lite" "dist/zlrd-lite-x86_64-linux.tar.gz" \
+            "Fast log viewer CLI (reader-only lightweight build)" \
+            "Reader-only build of zlrd: filter, tail, colorize. No agent, no metrics."
 
       - name: Generate checksums
         working-directory: dist
@@ -126,9 +162,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-          pattern: "zlrd-*-macos.tar.gz"
+          pattern: "bundle-*-macos"
 
-      - name: Update formula
+      - name: Update formulae
         env:
           TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
@@ -141,8 +177,10 @@ jobs:
           VER="${VERSION#v}"
           BASE="https://github.com/alaleks/zlrd/releases/download/${VERSION}"
 
-          SHA_ARM=$(sha256sum dist/zlrd-aarch64-macos.tar.gz | awk '{print $1}')
-          SHA_X86=$(sha256sum dist/zlrd-x86_64-macos.tar.gz  | awk '{print $1}')
+          SHA_FULL_ARM=$(sha256sum dist/zlrd-aarch64-macos.tar.gz      | awk '{print $1}')
+          SHA_FULL_X86=$(sha256sum dist/zlrd-x86_64-macos.tar.gz       | awk '{print $1}')
+          SHA_LITE_ARM=$(sha256sum dist/zlrd-lite-aarch64-macos.tar.gz | awk '{print $1}')
+          SHA_LITE_X86=$(sha256sum dist/zlrd-lite-x86_64-macos.tar.gz  | awk '{print $1}')
 
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/alaleks/homebrew-tap.git" tap
           mkdir -p tap/Formula
@@ -157,11 +195,11 @@ jobs:
             on_macos do
               on_arm do
                 url "${BASE}/zlrd-aarch64-macos.tar.gz"
-                sha256 "${SHA_ARM}"
+                sha256 "${SHA_FULL_ARM}"
               end
               on_intel do
                 url "${BASE}/zlrd-x86_64-macos.tar.gz"
-                sha256 "${SHA_X86}"
+                sha256 "${SHA_FULL_X86}"
               end
             end
 
@@ -175,49 +213,104 @@ jobs:
           end
           EOF
 
+          cat > tap/Formula/zlrd-lite.rb << EOF
+          class ZlrdLite < Formula
+            desc "Fast log viewer (reader-only, lightweight build)"
+            homepage "https://github.com/alaleks/zlrd"
+            version "${VER}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/zlrd-lite-aarch64-macos.tar.gz"
+                sha256 "${SHA_LITE_ARM}"
+              end
+              on_intel do
+                url "${BASE}/zlrd-lite-x86_64-macos.tar.gz"
+                sha256 "${SHA_LITE_X86}"
+              end
+            end
+
+            def install
+              bin.install "zlrd-lite"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/zlrd-lite --version")
+            end
+          end
+          EOF
+
           cd tap
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/zlrd.rb
-          git diff --staged --quiet || git commit -m "chore: bump zlrd to ${VERSION}"
+          git add Formula/zlrd.rb Formula/zlrd-lite.rb
+          git diff --staged --quiet || git commit -m "chore: bump zlrd + zlrd-lite to ${VERSION}"
           git push
 
   publish-apt:
-    name: Publish apt package (Buildkite Package Registries)
+    name: Publish apt packages (Buildkite Package Registries)
     needs: release
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}
     continue-on-error: true
     steps:
-      - name: Download Linux artifact
+      - name: Download Linux artifacts
         uses: actions/download-artifact@v4
         with:
-          name: zlrd-x86_64-linux.tar.gz
+          name: bundle-x86_64-linux
           path: incoming
 
-      - name: Build .deb
+      - name: Build .debs
         run: |
           VERSION="${{ github.ref_name }}"
           VER="${VERSION#v}"
 
-          tar xzf incoming/zlrd-x86_64-linux.tar.gz -C incoming
+          build_deb() {
+            local pkg_name="$1"
+            local bin_name="$2"
+            local archive="$3"
+            local desc_short="$4"
+            local desc_long="$5"
 
-          mkdir -p pkg/DEBIAN pkg/usr/local/bin
-          cp incoming/zlrd pkg/usr/local/bin/zlrd
-          chmod 755 pkg/usr/local/bin/zlrd
+            local work="pkg-${pkg_name}"
+            rm -rf "${work}"
+            mkdir -p "${work}/DEBIAN" "${work}/usr/local/bin"
 
-          echo "Package: zlrd"                                      > pkg/DEBIAN/control
-          echo "Version: ${VER}"                                   >> pkg/DEBIAN/control
-          echo "Architecture: amd64"                               >> pkg/DEBIAN/control
-          echo "Maintainer: alaleks <alaleksandrov30@gmail.com>"   >> pkg/DEBIAN/control
-          echo "Section: utils"                                    >> pkg/DEBIAN/control
-          echo "Priority: optional"                                >> pkg/DEBIAN/control
-          echo "Homepage: https://github.com/alaleks/zlrd"        >> pkg/DEBIAN/control
-          echo "Description: Fast log viewer CLI"                  >> pkg/DEBIAN/control
-          echo " High-performance log reader and analyzer."        >> pkg/DEBIAN/control
+            local extract="extract-${pkg_name}"
+            rm -rf "${extract}"
+            mkdir -p "${extract}"
+            tar xzf "${archive}" -C "${extract}"
+            cp "${extract}/${bin_name}" "${work}/usr/local/bin/${bin_name}"
+            chmod 755 "${work}/usr/local/bin/${bin_name}"
 
-          dpkg-deb --build pkg zlrd_${VER}_amd64.deb
-          echo "DEB=zlrd_${VER}_amd64.deb" >> "$GITHUB_ENV"
+            {
+              echo "Package: ${pkg_name}"
+              echo "Version: ${VER}"
+              echo "Architecture: amd64"
+              echo "Maintainer: alaleks <alaleksandrov30@gmail.com>"
+              echo "Section: utils"
+              echo "Priority: optional"
+              echo "Homepage: https://github.com/alaleks/zlrd"
+              echo "Description: ${desc_short}"
+              echo " ${desc_long}"
+            } > "${work}/DEBIAN/control"
+
+            dpkg-deb --build "${work}" "${pkg_name}_${VER}_amd64.deb"
+          }
+
+          build_deb \
+            "zlrd" "zlrd" "incoming/zlrd-x86_64-linux.tar.gz" \
+            "Fast log viewer CLI (full: reader + agent + sidecar)" \
+            "High-performance log reader, filter, tailer, and observability agent."
+
+          build_deb \
+            "zlrd-lite" "zlrd-lite" "incoming/zlrd-lite-x86_64-linux.tar.gz" \
+            "Fast log viewer CLI (reader-only lightweight build)" \
+            "Reader-only build of zlrd: filter, tail, colorize. No agent, no metrics."
+
+          echo "DEB_FULL=zlrd_${VER}_amd64.deb"      >> "$GITHUB_ENV"
+          echo "DEB_LITE=zlrd-lite_${VER}_amd64.deb" >> "$GITHUB_ENV"
 
       - name: Push to Buildkite Package Registries
         env:
@@ -232,16 +325,23 @@ jobs:
           #   POST https://api.buildkite.com/v2/packages/organizations/<org>/registries/<registry>/packages
           # Bearer token must be a Buildkite API Access Token with the
           # "write_packages" REST API scope.
-          HTTP_CODE=$(curl -sS -o response.txt -w "%{http_code}" \
-            -X POST \
-            -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" \
-            -F "file=@${DEB}" \
-            "https://api.buildkite.com/v2/packages/organizations/aleksandr-aleksandrov/registries/zlrd/packages")
+          push_deb() {
+            local file="$1"
+            local http_code
+            http_code=$(curl -sS -o "response-${file}.txt" -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer ${PACKAGECLOUD_TOKEN}" \
+              -F "file=@${file}" \
+              "https://api.buildkite.com/v2/packages/organizations/aleksandr-aleksandrov/registries/zlrd/packages")
 
-          echo "HTTP ${HTTP_CODE}"
-          cat response.txt
-          echo
+            echo "→ ${file}: HTTP ${http_code}"
+            cat "response-${file}.txt"
+            echo
 
-          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
-            exit 1
-          fi
+            if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+              return 1
+            fi
+          }
+
+          push_deb "${DEB_FULL}"
+          push_deb "${DEB_LITE}"

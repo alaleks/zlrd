@@ -319,6 +319,69 @@ pub fn printHelp() void {
     std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, text) catch {};
 }
 
+/// Reader-only help. Used by `zlrd-lite`, which is built without agent /
+/// sidecar / journal / kernel code. Agent-mode flags are omitted from the
+/// listing; if the user still passes them, `main_lite.zig` prints an error
+/// pointing to the full `zlrd` binary.
+pub fn printHelpLite() void {
+    const b = "\x1b[1m";
+    const sh = "\x1b[38;2;227;179;65m";
+    const lo = "\x1b[38;2;88;166;255m";
+    const ar = "\x1b[38;2;139;148;158m";
+    const gr = "\x1b[38;2;63;185;80m";
+    const r = "\x1b[0m";
+
+    const text =
+        "\n" ++
+        b ++ "Usage" ++ r ++ "\n" ++
+        "  zlrd-lite " ++ ar ++ "[options]" ++ r ++ " " ++ ar ++ "<file...>" ++ r ++ "\n\n" ++
+        b ++ "Options" ++ r ++ "\n" ++
+        "  " ++ sh ++ "-f" ++ r ++ ", " ++ lo ++ "--file" ++ r ++
+        "             " ++ ar ++ "<path>   " ++ r ++ "  Add log file (repeatable)\n" ++
+        "  " ++ sh ++ "-s" ++ r ++ ", " ++ lo ++ "--search" ++ r ++
+        "           " ++ ar ++ "<text>   " ++ r ++ "  Search string  " ++
+        ar ++ "·  | = OR   & = AND" ++ r ++ "\n" ++
+        "  " ++ sh ++ "-l" ++ r ++ ", " ++ lo ++ "--level" ++ r ++
+        "            " ++ ar ++ "<levels> " ++ r ++ "  Filter by level (comma-separated, repeatable)\n" ++
+        "                                     " ++
+        ar ++ "trace · debug · info · warn · error · fatal · panic" ++ r ++ "\n" ++
+        "  " ++ sh ++ "-d" ++ r ++ ", " ++ lo ++ "--date" ++ r ++
+        "             " ++ ar ++ "<date>   " ++ r ++ "  Date: YYYY-MM-DD  or  YYYY-MM-DD..YYYY-MM-DD\n" ++
+        "      " ++ lo ++ "--from" ++ r ++
+        "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
+        "      " ++ lo ++ "--to" ++ r ++
+        "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
+        "      " ++ lo ++ "--output" ++ r ++
+        "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
+        ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
+        "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
+        "                          Follow file in real time\n" ++
+        "  " ++ sh ++ "-n" ++ r ++ ", " ++ lo ++ "--num-lines" ++ r ++
+        "        " ++ ar ++ "<num>    " ++ r ++ "  Paginate: show N lines per page\n" ++
+        "  " ++ sh ++ "-a" ++ r ++ ", " ++ lo ++ "--aggregate" ++ r ++
+        "                     Group identical matched lines\n" ++
+        "  " ++ sh ++ "-m" ++ r ++ ", " ++ lo ++ "--aggregate-mode" ++ r ++
+        "   " ++ ar ++ "<mode>   " ++ r ++ "  " ++
+        ar ++ "exact · level-message · json-message · normalized" ++ r ++ "\n" ++
+        "  " ++ sh ++ "-v" ++ r ++ ", " ++ lo ++ "--version" ++ r ++
+        "                     Print version and exit\n" ++
+        "  " ++ sh ++ "-h" ++ r ++ ", " ++ lo ++ "--help" ++ r ++
+        "                          Show this help\n" ++
+        "\n" ++
+        b ++ "Examples" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd-lite app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd-lite -l error,warn app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd-lite -s \"connection|timeout\" app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd-lite -t -l error app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd-lite --output json app.log | jq ." ++ r ++ "\n" ++
+        "\n" ++
+        ar ++ "Note: zlrd-lite is the reader-only build. For --agent (metrics, alerts," ++ r ++ "\n" ++
+        ar ++ "webhooks, journal, sidecar, kernel probes), install the full `zlrd` binary." ++ r ++ "\n" ++
+        "\n";
+
+    std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, text) catch {};
+}
+
 /// Mutable buffers for repeatable string-list flags (--file, agent-mode repeatables).
 /// Held outside Args during parsing; converted to owned slices on success.
 const ParseBuffers = struct {

@@ -1,0 +1,276 @@
+//! Reader-only entry point (`zlrd-lite`). Same argument parser as the full
+//! `zlrd`, but does not link agent / journal / kernel / sidecar code.
+//! If the user passes `--agent`, we print a clear error pointing to the full
+//! binary rather than silently ignoring the flag.
+
+const std = @import("std");
+const flags = @import("flags");
+const reader = @import("reader/reader.zig");
+const gzip = @import("reader/gzip.zig");
+const build_options = @import("build_options");
+
+pub fn main(opts: struct {
+    minimal: struct {
+        args: std.process.Args,
+        environ: std.process.Environ,
+    },
+    arena: *std.heap.ArenaAllocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    preopens: std.process.Preopens,
+}) !void {
+    _ = opts.arena;
+    _ = opts.environ_map;
+    _ = opts.preopens;
+    const allocator = opts.gpa;
+    const io = opts.io;
+
+    var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
+        fatal(io, parseErrorMessage(err), "run zlrd-lite --help for usage");
+        std.process.exit(1);
+    };
+    defer parsed_args.deinit(allocator);
+
+    if (parsed_args.version) {
+        const ver_name = "\x1b[2m\x1b[38;2;88;166;255mz\x1b[38;2;63;185;80ml\x1b[38;2;227;179;65mr\x1b[38;2;248;81;73md\x1b[0m\x1b[2m-lite\x1b[0m";
+        std.Io.File.stdout().writeStreamingAll(io, ver_name ++ " " ++ build_options.version ++ "\n\n") catch {};
+        std.Io.File.stdout().writeStreamingAll(io, "\x1b[4mhttps://github.com/alaleks/zlrd\x1b[0m\n\n") catch {};
+        std.Io.File.stdout().writeStreamingAll(io, "\x1b[2m⭐ Star if you like it · PRs welcome!\x1b[0m\n") catch {};
+        return;
+    }
+
+    if (parsed_args.help) {
+        flags.printHelpLite();
+        return;
+    }
+
+    // zlrd-lite is the reader-only build. Fail fast if the user asked for
+    // features that only exist in the full binary.
+    if (isAgentModeRequested(parsed_args)) {
+        fatal(
+            io,
+            "agent mode is not available in zlrd-lite",
+            "install the full binary: brew install alaleks/tap/zlrd  (or apt install zlrd)",
+        );
+        std.process.exit(1);
+    }
+
+    var discovered_files: [][]const u8 = &.{};
+    defer {
+        if (discovered_files.len > 0) {
+            parsed_args.files = &.{};
+            for (discovered_files) |p| allocator.free(p);
+            allocator.free(discovered_files);
+        }
+    }
+
+    if (parsed_args.files.len == 0) {
+        discovered_files = findLogFiles(allocator, io) catch {
+            fatal(io, "could not read current directory", "check read permissions: ls -la .");
+            std.process.exit(1);
+        };
+        if (discovered_files.len == 0) {
+            fatal(io, "no *.log or *.log.gz files found in current directory", "specify a file: zlrd-lite app.log");
+            std.process.exit(1);
+        }
+        parsed_args.files = discovered_files;
+    } else {
+        var all_ok = true;
+        for (parsed_args.files) |path| {
+            if (parsed_args.tail_mode and gzip.isGzip(path)) {
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "{s}: tail mode is not supported for .gz files", .{path}) catch
+                    "tail mode is not supported for .gz files";
+                fatal(io, msg, "decompress first: gunzip file.log.gz");
+                all_ok = false;
+                continue;
+            }
+
+            std.Io.Dir.cwd().access(io, path, .{}) catch |err| {
+                var buf: [512]u8 = undefined;
+                const msg = switch (err) {
+                    error.FileNotFound => std.fmt.bufPrint(&buf, "{s}: no such file", .{path}) catch "no such file",
+                    error.AccessDenied => std.fmt.bufPrint(&buf, "{s}: permission denied", .{path}) catch "permission denied",
+                    else => std.fmt.bufPrint(&buf, "{s}: {s}", .{ path, @errorName(err) }) catch "unexpected error",
+                };
+                const hint: ?[]const u8 = switch (err) {
+                    error.AccessDenied => "check permissions or try with sudo",
+                    else => null,
+                };
+                fatal(io, msg, hint);
+                all_ok = false;
+            };
+        }
+        if (!all_ok) std.process.exit(1);
+    }
+
+    if (!parsed_args.output_json and !parsed_args.tail_mode) {
+        if (std.Io.File.stdout().isTty(io) catch false) printBanner(io);
+    }
+    processFiles(allocator, parsed_args) catch |err| {
+        fatal(io, runtimeErrorMessage(err), null);
+        std.process.exit(1);
+    };
+}
+
+/// Returns true if any agent-only flag was set. `agent_mode` alone catches the
+/// common case; we also check the auxiliary flags so `--metrics-token foo`
+/// without `--agent` fails loudly instead of being silently discarded.
+fn isAgentModeRequested(args: flags.Args) bool {
+    if (args.agent_mode) return true;
+    if (args.metrics_token != null) return true;
+    if (args.listen != null) return true;
+    if (args.alert_error_rate != null) return true;
+    if (args.alert_regexes.len > 0) return true;
+    if (args.alert_first_seen) return true;
+    if (args.alert_silence != null) return true;
+    if (args.alert_stderr) return true;
+    if (args.alert_file != null) return true;
+    if (args.alert_webhooks.len > 0) return true;
+    if (args.webhook_headers.len > 0) return true;
+    if (args.alert_exit_on_alert) return true;
+    if (args.kernel_probes) return true;
+    if (args.services.len > 0) return true;
+    if (args.crash_markers.len > 0) return true;
+    if (args.journal_units.len > 0) return true;
+    if (args.sidecar_url != null) return true;
+    if (args.sidecar_headers.len > 0) return true;
+    return false;
+}
+
+fn fatal(io: std.Io, msg: []const u8, hint: ?[]const u8) void {
+    const e = std.Io.File.stderr();
+    e.writeStreamingAll(io, "\n\x1b[1;38;2;248;81;73m✗\x1b[0m  ") catch {};
+    e.writeStreamingAll(io, msg) catch {};
+    e.writeStreamingAll(io, "\n") catch {};
+    if (hint) |h| {
+        e.writeStreamingAll(io, "\x1b[38;2;139;148;158m   → ") catch {};
+        e.writeStreamingAll(io, h) catch {};
+        e.writeStreamingAll(io, "\x1b[0m\n") catch {};
+    }
+    e.writeStreamingAll(io, "\n") catch {};
+}
+
+fn printBanner(io: std.Io) void {
+    const w = std.Io.File.stdout();
+    const dim = "\x1b[2m";
+    const rst = "\x1b[0m";
+    const ul = "\x1b[4m";
+    const ver = build_options.version;
+
+    const name = "\x1b[2m\x1b[38;2;88;166;255mz\x1b[38;2;63;185;80ml\x1b[38;2;227;179;65mr\x1b[38;2;248;81;73md\x1b[0m\x1b[2m-lite";
+
+    var buf: [256]u8 = undefined;
+    const header = std.fmt.bufPrint(&buf, "{s} {s}\n", .{ name, ver }) catch return;
+    w.writeStreamingAll(io, header) catch {};
+    w.writeStreamingAll(io, rst) catch {};
+    w.writeStreamingAll(io, "\n") catch {};
+    w.writeStreamingAll(io, ul) catch {};
+    w.writeStreamingAll(io, "https://github.com/alaleks/zlrd") catch {};
+    w.writeStreamingAll(io, rst) catch {};
+    w.writeStreamingAll(io, "\n\n") catch {};
+    w.writeStreamingAll(io, dim) catch {};
+    w.writeStreamingAll(io, "⭐ Star if you like it · PRs welcome!") catch {};
+    w.writeStreamingAll(io, rst) catch {};
+    w.writeStreamingAll(io, "\n") catch {};
+}
+
+fn findLogFiles(allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+
+    var list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    errdefer {
+        for (list.items) |p| allocator.free(p);
+        list.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".log") and
+            !std.mem.endsWith(u8, entry.name, ".log.gz")) continue;
+
+        try list.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    return list.toOwnedSlice(allocator);
+}
+
+fn processFiles(
+    allocator: std.mem.Allocator,
+    parsed_args: flags.Args,
+) !void {
+    if (parsed_args.tail_mode) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try reader.readLogs(arena.allocator(), parsed_args);
+        return;
+    }
+
+    if (parsed_args.files.len == 1) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try reader.readLogs(arena.allocator(), parsed_args);
+        return;
+    }
+
+    for (parsed_args.files) |file_path| {
+        try processFileWithArena(allocator, file_path, parsed_args);
+    }
+}
+
+fn processFileWithArena(
+    base_allocator: std.mem.Allocator,
+    file_path: []const u8,
+    parsed_args: flags.Args,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(base_allocator);
+    defer arena.deinit();
+
+    var single_file = [_][]const u8{file_path};
+    var single_file_args = parsed_args;
+    single_file_args.files = single_file[0..];
+
+    try reader.readLogs(arena.allocator(), single_file_args);
+}
+
+fn parseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.UnknownArgument => "unknown argument",
+        error.InvalidArgument => "invalid argument",
+        error.InvalidNumLines => "invalid value for --num-lines (must be a positive integer)",
+        error.InvalidLevel => "invalid log level (valid: trace debug info warn error fatal panic)",
+        error.InvalidAggregateMode => "invalid aggregate mode (valid: exact level-message json-message normalized)",
+        error.InvalidOutputMode => "invalid output mode (valid: json)",
+        error.MissingFile => "missing value for --file",
+        error.MissingSearch => "missing value for --search",
+        error.MissingLevel => "missing value for --level",
+        error.MissingDate => "missing value for --date",
+        error.MissingNumLines => "missing value for --num-lines",
+        error.MissingAggregateMode => "missing value for --aggregate-mode",
+        error.MissingFromTime => "missing value for --from",
+        error.MissingToTime => "missing value for --to",
+        error.MissingOutput => "missing value for --output",
+        else => @errorName(err),
+    };
+}
+
+fn runtimeErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "file not found",
+        error.AccessDenied => "permission denied",
+        error.IsDir => "path is a directory, not a file",
+        error.NotOpenForReading => "file is not open for reading",
+        error.OutOfMemory => "out of memory",
+        error.LineTooLong => "log line exceeds 4 MiB limit (likely a binary file or corrupted input)",
+        else => @errorName(err),
+    };
+}
