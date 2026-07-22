@@ -28,6 +28,12 @@ pub const LineInfo = struct {
     level: ?flags.Level,
     /// Byte range of the level value within the line, used for selective coloring.
     level_pos: ?LevelPos,
+    /// When set, the printer runs in "rewrite" mode instead of replacing
+    /// `level_pos`: the level block is INSERTED at `insert_at` and the tail
+    /// past `truncate_at` is dropped. Currently populated only by the gRPC
+    /// error heuristic ("rpc error: code = X" → surface as Error, hide the
+    /// noisy tail).
+    rewrite: ?Rewrite = null,
     /// Extracted YYYY-MM-DD date prefix, or null if absent.
     date: ?[]const u8,
     /// Extracted HH:MM or HH:MM:SS time, or null if absent.
@@ -48,6 +54,7 @@ fn analyzeLine(line: []const u8) LineInfo {
         .format = .plain_unknown,
         .level = null,
         .level_pos = null,
+        .rewrite = null,
         .date = null,
         .time = null,
         .is_json = false,
@@ -90,11 +97,24 @@ fn analyzeLine(line: []const u8) LineInfo {
 }
 
 /// Fallback level detector for lines whose level is a bare word somewhere in
-/// the middle (e.g. zerolog-formatted `... 9:32AM DBG message ...`). Scans
-/// contiguous ASCII-alpha tokens and keeps the first one that
-/// `parseLevelInsensitive` recognises. Also handles the gRPC status pattern
-/// `code = <NAME>` — non-`OK` names promote the line to `Error`.
+/// the middle (e.g. zerolog-formatted `... 9:32AM DBG message ...`), or a
+/// gRPC status line with `code = <NAME>` where `<NAME>` ≠ `OK`.
+///
+/// gRPC is checked FIRST because the word "error" in "rpc error:" would
+/// otherwise get picked up by the alpha-token scan and produce a misleading
+/// `ERROR` block right in the middle of the message body. In gRPC mode we
+/// switch to `Rewrite` — insert the level block right after the last
+/// timestamp and drop the trailing "rpc error: code = X desc = ..." noise.
 fn inferMidLineLevel(line: []const u8, info: *LineInfo) void {
+    if (simd.findGrpcCode(line)) |r| {
+        const name = line[r.start..r.end];
+        if (!std.mem.eql(u8, name, "OK")) {
+            info.level = .Error;
+            info.rewrite = computeGrpcRewrite(line);
+            return;
+        }
+    }
+
     var scan_from: usize = 0;
     while (simd.nextAlphaToken(line, scan_from)) |tok| {
         scan_from = tok.end;
@@ -106,14 +126,82 @@ fn inferMidLineLevel(line: []const u8, info: *LineInfo) void {
             return;
         }
     }
+}
 
-    if (simd.findGrpcCode(line)) |r| {
-        const name = line[r.start..r.end];
-        if (!std.mem.eql(u8, name, "OK")) {
-            info.level = .Error;
-            info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+/// Computes the `Rewrite` for a gRPC-flavoured error line. Inserts the level
+/// block right after the last `HH:MM[:SS]` (falling back to line start when
+/// no time is present) and truncates the trailing gRPC noise.
+fn computeGrpcRewrite(line: []const u8) Rewrite {
+    var insert_at: usize = findLastTimeEnd(line) orelse 0;
+    // Skip a single space so the level block doesn't hug the timestamp.
+    if (insert_at < line.len and line[insert_at] == ' ') insert_at += 1;
+
+    var truncate_at: usize = line.len;
+    // Prefer ", rpc " — this preserves the "clean" phrase that usually sits
+    // before the gRPC tail (e.g. `Client.GetSystemConfigParams()`).
+    if (std.mem.indexOfPos(u8, line, insert_at, ", rpc ")) |p| {
+        truncate_at = p;
+    } else if (std.mem.indexOfPos(u8, line, insert_at, "rpc error")) |p| {
+        truncate_at = p;
+        while (truncate_at > insert_at and
+            (line[truncate_at - 1] == ' ' or line[truncate_at - 1] == '\t'))
+        {
+            truncate_at -= 1;
         }
     }
+    return .{ .insert_at = insert_at, .truncate_at = truncate_at };
+}
+
+/// Byte offset immediately after the last `HH:MM` or `HH:MM:SS` substring in
+/// `line`, or null if none is present. Iterates via the internal
+/// `findTimeRange` helper so both plain syslog envelopes (`Jul 22 05:44:13`)
+/// and later embedded timestamps (`2026/07/22 05:44:13`) are considered — we
+/// want the LAST match so the inserted level block ends up next to the
+/// message body, not next to the syslog envelope.
+fn findLastTimeEnd(line: []const u8) ?usize {
+    var last: ?usize = null;
+    var from: usize = 0;
+    while (findTimeRange(line, from)) |r| {
+        last = r.end;
+        from = r.end;
+    }
+    return last;
+}
+
+/// Locates the next `HH:MM[:SS]` starting at or after `from`, mirroring the
+/// scan logic of `extractTime` but reporting the byte range instead of a
+/// borrowed slice.
+fn findTimeRange(line: []const u8, from: usize) ?struct { start: usize, end: usize } {
+    if (line.len < 5) return null;
+    var scan_pos: usize = if (from < 2) 2 else from;
+    while (scan_pos < line.len) {
+        const colon = simd.findByte(line, scan_pos, ':') orelse return null;
+        if (colon < 2) {
+            scan_pos = colon + 1;
+            continue;
+        }
+        const i = colon - 2;
+        if (i < from) {
+            scan_pos = colon + 1;
+            continue;
+        }
+        const boundary_ok = i == 0 or line[i - 1] == 'T' or line[i - 1] == ' ' or line[i - 1] == '[';
+        if (!boundary_ok or
+            i + 5 > line.len or
+            !isDigit(line[i]) or !isDigit(line[i + 1]) or
+            !isDigit(line[i + 3]) or !isDigit(line[i + 4]))
+        {
+            scan_pos = colon + 1;
+            continue;
+        }
+        const end = if (i + 8 <= line.len and line[i + 5] == ':' and
+            isDigit(line[i + 6]) and isDigit(line[i + 7]))
+            i + 8
+        else
+            i + 5;
+        return .{ .start = i, .end = end };
+    }
+    return null;
 }
 
 /// Targets we look up while walking a JSON object's top-level keys.
@@ -245,6 +333,14 @@ const Color = struct {
 const LevelPos = struct {
     start: usize,
     end: usize,
+};
+
+/// Rewrite instructions for plain-text lines whose level is inferred rather
+/// than lifted from a token. The printer keeps bytes `[0..insert_at]`, emits
+/// the level block, keeps `[insert_at..truncate_at]`, and drops the rest.
+pub const Rewrite = struct {
+    insert_at: usize,
+    truncate_at: usize,
 };
 
 /// Byte range of a search match within a line.
@@ -1473,6 +1569,10 @@ fn charAtIgnoreCase(line: []const u8, pos: usize, needle: []const u8) bool {
 
 /// Prints a log line to stdout with ANSI coloring appropriate for its format.
 /// Falls back to plain writeAll for lines with no recognized level.
+///
+/// Plain-text lines end in `\n\n` (blank line between entries) so consecutive
+/// syslog-style records don't visually merge; JSON output keeps the compact
+/// single-`\n` termination expected by pipeline consumers.
 fn printStyledLine(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
     if (line.len == 0) return;
 
@@ -1481,8 +1581,8 @@ fn printStyledLine(line: []const u8, info: LineInfo, search_matches: []const Mat
     } else if (info.level != null) {
         printPlainTextWithLevel(line, info, search_matches);
     } else {
-        writeRangeHighlighted(line, 0, line.len, search_matches);
-        writeOut("\n");
+        writeRangeHighlightedIn(line, 0, line.len, search_matches, Color.text);
+        writeOut("\n\n");
     }
 }
 
@@ -1495,15 +1595,40 @@ fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, info: LineIn
     } else if (info.level != null) {
         try printPlainTextWithLevelBuffered(output, line, info, search_matches);
     } else {
-        try writeRangeHighlightedBuffered(output, line, 0, line.len, search_matches);
-        try output.write("\n");
+        try writeRangeHighlightedInBuffered(output, line, 0, line.len, search_matches, Color.text);
+        try output.write("\n\n");
     }
 }
 
 /// Writes a byte range of `line` to stdout, inserting search highlight
 /// ANSI codes around `matches` that fall within the range.
 fn writeRangeHighlighted(line: []const u8, start: usize, end: usize, matches: []const MatchRange) void {
-    if (matches.len == 0) return writeOut(line[start..end]);
+    writeRangeHighlightedIn(line, start, end, matches, "");
+}
+
+/// Buffered version of `writeRangeHighlighted`.
+fn writeRangeHighlightedBuffered(output: *OutputBuffer, line: []const u8, start: usize, end: usize, matches: []const MatchRange) !void {
+    try writeRangeHighlightedInBuffered(output, line, start, end, matches, "");
+}
+
+/// Same as `writeRangeHighlighted`, but wraps the entire output in
+/// `wrap_color` (e.g. `Color.muted`) and re-applies it after each search
+/// highlight so `Color.reset` inside the highlight doesn't leak through and
+/// leave the tail uncolored.
+fn writeRangeHighlightedIn(
+    line: []const u8,
+    start: usize,
+    end: usize,
+    matches: []const MatchRange,
+    wrap_color: []const u8,
+) void {
+    const wrapped = wrap_color.len > 0;
+    if (wrapped) writeOut(wrap_color);
+    if (matches.len == 0) {
+        writeOut(line[start..end]);
+        if (wrapped) writeOut(Color.reset);
+        return;
+    }
     var pos = start;
     for (matches) |m| {
         if (m.end <= pos) continue;
@@ -1515,14 +1640,29 @@ fn writeRangeHighlighted(line: []const u8, start: usize, end: usize, matches: []
         writeOut(Color.search_underline);
         writeOut(line[seg_start..seg_end]);
         writeOut(Color.reset);
+        if (wrapped) writeOut(wrap_color);
         pos = seg_end;
     }
     if (pos < end) writeOut(line[pos..end]);
+    if (wrapped) writeOut(Color.reset);
 }
 
-/// Buffered version of `writeRangeHighlighted`.
-fn writeRangeHighlightedBuffered(output: *OutputBuffer, line: []const u8, start: usize, end: usize, matches: []const MatchRange) !void {
-    if (matches.len == 0) return output.write(line[start..end]);
+/// Buffered version of `writeRangeHighlightedIn`.
+fn writeRangeHighlightedInBuffered(
+    output: *OutputBuffer,
+    line: []const u8,
+    start: usize,
+    end: usize,
+    matches: []const MatchRange,
+    wrap_color: []const u8,
+) !void {
+    const wrapped = wrap_color.len > 0;
+    if (wrapped) try output.write(wrap_color);
+    if (matches.len == 0) {
+        try output.write(line[start..end]);
+        if (wrapped) try output.write(Color.reset);
+        return;
+    }
     var pos = start;
     for (matches) |m| {
         if (m.end <= pos) continue;
@@ -1534,9 +1674,11 @@ fn writeRangeHighlightedBuffered(output: *OutputBuffer, line: []const u8, start:
         try output.write(Color.search_underline);
         try output.write(line[seg_start..seg_end]);
         try output.write(Color.reset);
+        if (wrapped) try output.write(wrap_color);
         pos = seg_end;
     }
     if (pos < end) try output.write(line[pos..end]);
+    if (wrapped) try output.write(Color.reset);
 }
 
 /// Prints a line as JSON (JSONL format) for pipeline compatibility.
@@ -1646,47 +1788,90 @@ fn printJsonOutputLineBuffered(output: *OutputBuffer, line: []const u8, info: Li
     try output.write("\"}\n");
 }
 
-/// Writes a plain-text line, coloring the level token at `info.level_pos`
-/// with a background + foreground color pair. Renders the level value in uppercase.
+/// Writes a plain-text line with the level token highlighted.
+///
+/// Three modes, in order of priority:
+///   1. `info.rewrite` set → INSERT mode. Prefix `[0..insert_at]` is muted,
+///      the level block is emitted (label from `@tagName(info.level.?)`), then
+///      the "clean" tail `[insert_at..truncate_at]` is printed as text and the
+///      remainder is dropped. Used by the gRPC error heuristic.
+///   2. `info.level_pos` set → REPLACE mode. Prefix muted, level bytes
+///      replaced by the coloured block, suffix printed as text.
+///   3. Neither → whole line printed as text.
+///
+/// Every plain-text line ends in `\n\n` so consecutive syslog records don't
+/// visually merge — the extra blank keeps the eye able to segment entries.
 fn printPlainTextWithLevel(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
     const style = levelStyle(info.level.?);
 
+    if (info.rewrite) |rw| {
+        if (rw.insert_at > 0) writeRangeHighlightedIn(line, 0, rw.insert_at, search_matches, Color.muted);
+        writeOut(style.bg);
+        writeOut(style.fg);
+        writeOut("\u{2009}");
+        writeLevelLabel(@tagName(info.level.?));
+        writeOut("\u{2009}");
+        writeOut(Color.reset);
+        if (rw.insert_at < rw.truncate_at) {
+            writeOut(" ");
+            writeRangeHighlightedIn(line, rw.insert_at, rw.truncate_at, search_matches, Color.text);
+        }
+        writeOut("\n\n");
+        return;
+    }
+
     if (info.level_pos) |r| {
-        if (r.start > 0) writeRangeHighlighted(line, 0, r.start, search_matches);
+        if (r.start > 0) writeRangeHighlightedIn(line, 0, r.start, search_matches, Color.muted);
         writeOut(style.bg);
         writeOut(style.fg);
         writeOut("\u{2009}");
         writeLevelLabel(line[r.start..r.end]);
         writeOut("\u{2009}");
         writeOut(Color.reset);
-        if (r.end < line.len) writeRangeHighlighted(line, r.end, line.len, search_matches);
-        writeOut("\n");
+        if (r.end < line.len) writeRangeHighlightedIn(line, r.end, line.len, search_matches, Color.text);
+        writeOut("\n\n");
         return;
     }
 
-    writeRangeHighlighted(line, 0, line.len, search_matches);
-    writeOut("\n");
+    writeRangeHighlightedIn(line, 0, line.len, search_matches, Color.text);
+    writeOut("\n\n");
 }
 
-/// Buffered version of `printPlainTextWithLevel`.
+/// Buffered version of `printPlainTextWithLevel`. Semantics identical.
 fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
     const style = levelStyle(info.level.?);
 
+    if (info.rewrite) |rw| {
+        if (rw.insert_at > 0) try writeRangeHighlightedInBuffered(output, line, 0, rw.insert_at, search_matches, Color.muted);
+        try output.write(style.bg);
+        try output.write(style.fg);
+        try output.write("\u{2009}");
+        try writeLevelLabelBuffered(output, @tagName(info.level.?));
+        try output.write("\u{2009}");
+        try output.write(Color.reset);
+        if (rw.insert_at < rw.truncate_at) {
+            try output.write(" ");
+            try writeRangeHighlightedInBuffered(output, line, rw.insert_at, rw.truncate_at, search_matches, Color.text);
+        }
+        try output.write("\n\n");
+        return;
+    }
+
     if (info.level_pos) |r| {
-        if (r.start > 0) try writeRangeHighlightedBuffered(output, line, 0, r.start, search_matches);
+        if (r.start > 0) try writeRangeHighlightedInBuffered(output, line, 0, r.start, search_matches, Color.muted);
         try output.write(style.bg);
         try output.write(style.fg);
         try output.write("\u{2009}");
         try writeLevelLabelBuffered(output, line[r.start..r.end]);
         try output.write("\u{2009}");
         try output.write(Color.reset);
-        if (r.end < line.len) try writeRangeHighlightedBuffered(output, line, r.end, line.len, search_matches);
-        try output.write("\n");
+        if (r.end < line.len) try writeRangeHighlightedInBuffered(output, line, r.end, line.len, search_matches, Color.text);
+        try output.write("\n\n");
         return;
     }
 
-    try writeRangeHighlightedBuffered(output, line, 0, line.len, search_matches);
-    try output.write("\n");
+    try writeRangeHighlightedInBuffered(output, line, 0, line.len, search_matches, Color.text);
+    try output.write("\n\n");
 }
 
 /// Returns true if the byte at `i` in `line` is an unescaped `"`.
