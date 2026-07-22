@@ -139,7 +139,7 @@ const BatchAggregator = struct {
         self.order.appendAssumeCapacity(owned_key);
     }
 
-    fn printAll(self: *BatchAggregator, filter_state: *const formats.FilterState) void {
+    fn printAll(self: *BatchAggregator, filter_state: *formats.FilterState) void {
         for (self.order.items) |key| {
             const entry = self.entries.get(key).?;
 
@@ -265,7 +265,7 @@ pub fn readLastNLines(
     f: *OpenFile,
     args: flags.Args,
     file_size: u64,
-    filter_state: *const formats.FilterState,
+    filter_state: *formats.FilterState,
     read_buf: []u8,
 ) !u64 {
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
@@ -287,7 +287,7 @@ fn readAvailable(
     allocator: std.mem.Allocator,
     f: *OpenFile,
     args: flags.Args,
-    filter_state: *const formats.FilterState,
+    filter_state: *formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
 ) !usize {
@@ -305,7 +305,7 @@ pub fn readToEOF(
     allocator: std.mem.Allocator,
     f: *OpenFile,
     args: flags.Args,
-    filter_state: *const formats.FilterState,
+    filter_state: *formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
 ) !void {
@@ -316,7 +316,7 @@ fn readToEOFInternal(
     allocator: std.mem.Allocator,
     f: *OpenFile,
     args: flags.Args,
-    filter_state: *const formats.FilterState,
+    filter_state: *formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
     flush_final_line: bool,
@@ -394,7 +394,7 @@ fn keepUnprocessedTail(
 fn processLine(
     allocator: std.mem.Allocator,
     args: flags.Args,
-    filter_state: *const formats.FilterState,
+    filter_state: *formats.FilterState,
     aggregator: ?*BatchAggregator,
     line: []const u8,
 ) !void {
@@ -407,8 +407,8 @@ fn processLine(
     // Reuse LineInfo produced by checkLine — buildAggregateKey accepts it
     // directly, avoiding a second parse of the line for key construction,
     // and the aggregator caches it so printAll skips a third one.
-    if (filter_state.checkLine(line)) |info| {
-        try aggregator.?.observe(args.aggregate_mode, line, info);
+    if (filter_state.checkLine(line)) |ck| {
+        try aggregator.?.observe(args.aggregate_mode, ck.line, ck.info);
     }
 }
 
@@ -473,7 +473,7 @@ test "readLastNLines handles files with fewer lines than requested" {
     const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"small.log"};
     const args = makeSilentTailArgs(files_array[0..], 10, false, .exact);
-    const filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args);
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -555,7 +555,7 @@ test "position tracking correctly advances after reading" {
     const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"pos.log"};
     const args = makeSilentTailArgs(files_array[0..], 3, false, .exact);
-    const filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args);
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -608,7 +608,7 @@ test "appended data read correctly in sequential operations" {
     const stat1 = try file.stat(tail_io);
     var files_array = [_][]const u8{"append.log"};
     const args = makeSilentTailArgs(files_array[0..], 2, false, .exact);
-    const filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args);
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -632,7 +632,7 @@ test "appended data read correctly in sequential operations" {
     defer carry.deinit(allocator);
 
     const args2 = makeSilentTailArgs(files_array[0..], 0, false, .exact);
-    const filter_state2 = formats.FilterState.init(args2);
+    var filter_state2 = formats.FilterState.init(args2);
 
     try readToEOF(allocator, &of, args2, &filter_state2, &carry, read_buf);
     try testing.expectEqual(@as(u64, 36), of.position);
@@ -672,7 +672,7 @@ test "readToEOF with aggregate exact advances position and preserves carry" {
 
     var files_array = [_][]const u8{"agg.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, true, .exact);
-    const filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args);
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -705,7 +705,7 @@ test "readToEOF with aggregate normalized consumes complete data" {
 
     var files_array = [_][]const u8{"norm.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, true, .normalized);
-    const filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args);
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);

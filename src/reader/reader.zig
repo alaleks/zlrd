@@ -71,16 +71,49 @@ fn analyzeLine(line: []const u8) LineInfo {
     if (info.starts_with_bracket) {
         info.format = .plain_bracketed;
         if (simd.findBracketedLevel(line)) |r| {
-            info.level = flags.parseLevelInsensitive(line[r.start..r.end]);
-            info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+            if (flags.parseLevelInsensitive(line[r.start..r.end])) |lvl| {
+                info.level = lvl;
+                info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+            }
         }
     } else if (simd.findLogfmtLevel(line)) |r| {
         info.format = .plain_logfmt;
-        info.level = flags.parseLevelInsensitive(line[r.start..r.end]);
-        info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+        if (flags.parseLevelInsensitive(line[r.start..r.end])) |lvl| {
+            info.level = lvl;
+            info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+        }
     }
 
+    if (info.level == null) inferMidLineLevel(line, &info);
+
     return info;
+}
+
+/// Fallback level detector for lines whose level is a bare word somewhere in
+/// the middle (e.g. zerolog-formatted `... 9:32AM DBG message ...`). Scans
+/// contiguous ASCII-alpha tokens and keeps the first one that
+/// `parseLevelInsensitive` recognises. Also handles the gRPC status pattern
+/// `code = <NAME>` — non-`OK` names promote the line to `Error`.
+fn inferMidLineLevel(line: []const u8, info: *LineInfo) void {
+    var scan_from: usize = 0;
+    while (simd.nextAlphaToken(line, scan_from)) |tok| {
+        scan_from = tok.end;
+        const len = tok.end - tok.start;
+        if (len < 3 or len > 8) continue;
+        if (flags.parseLevelInsensitive(line[tok.start..tok.end])) |lvl| {
+            info.level = lvl;
+            info.level_pos = LevelPos{ .start = tok.start, .end = tok.end };
+            return;
+        }
+    }
+
+    if (simd.findGrpcCode(line)) |r| {
+        const name = line[r.start..r.end];
+        if (!std.mem.eql(u8, name, "OK")) {
+            info.level = .Error;
+            info.level_pos = LevelPos{ .start = r.start, .end = r.end };
+        }
+    }
 }
 
 /// Targets we look up while walking a JSON object's top-level keys.
@@ -233,6 +266,22 @@ const DateRange = struct {
 /// Build once with `FilterState.init`, then call `checkLine` per line.
 /// Keeping this separate from `flags.Args` avoids repeated string parsing
 /// and repeated `args.date` null-checks in the hot path.
+/// Result of a successful `FilterState.checkLine` call. `line` may point into
+/// the caller's original bytes OR into the FilterState-owned strip buffer
+/// (when the input contained literal `#033[..m` ANSI runs). Callers that
+/// print or aggregate must use `line` (not the raw input), so display and
+/// aggregation see the cleaned bytes.
+pub const CheckedLine = struct {
+    line: []const u8,
+    info: LineInfo,
+};
+
+/// Scratch size for the ANSI-strip buffer inside `FilterState`. Big enough
+/// for realistic log lines (16 KiB is well above zerolog+journalctl
+/// pathological cases); if a line exceeds it, `stripLiteralAnsi` falls back
+/// to the original bytes so nothing is silently truncated.
+const filter_strip_buf_size: usize = 16 * 1024;
+
 pub const FilterState = struct {
     has_date_filter: bool,
     date_range: DateRange,
@@ -246,6 +295,7 @@ pub const FilterState = struct {
     regex_list: regex.RegexList,
     search_expr: ?[]const u8,
     output_json: bool,
+    strip_buf: [filter_strip_buf_size]u8 = undefined,
 
     /// Builds a `FilterState` from parsed CLI arguments.
     /// Tries to compile regex; falls back to literal matching on failure.
@@ -283,10 +333,15 @@ pub const FilterState = struct {
         if (self.has_regex) self.regex_list.deinit();
     }
 
-    /// Returns the cached `LineInfo` if `line` passes all active filters, null otherwise.
+    /// Returns a `CheckedLine` if the (possibly ANSI-stripped) `line` passes
+    /// all active filters, null otherwise. The returned `line` slice must be
+    /// used for all subsequent operations (print, aggregation) so that the
+    /// stripped bytes propagate through the pipeline.
+    ///
     /// Filter order: search → level → date (cheapest to most expensive).
-    pub fn checkLine(self: *const FilterState, line: []const u8) ?LineInfo {
-        if (line.len == 0) return null;
+    pub fn checkLine(self: *FilterState, raw_line: []const u8) ?CheckedLine {
+        if (raw_line.len == 0) return null;
+        const line = simd.stripLiteralAnsi(&self.strip_buf, raw_line);
 
         if (self.has_regex) {
             if (!self.regex_list.allMatch(line)) return null;
@@ -309,18 +364,19 @@ pub const FilterState = struct {
             if (!matchTimeRange(info.time, self.from_time, self.to_time)) return null;
         }
 
-        return info;
+        return .{ .line = line, .info = info };
     }
 
     /// Convenience wrapper: filter and print in one call.
     /// Intended for tail.zig so it does not need to import `LineInfo` or `printStyledLine`.
-    pub fn printIfMatch(self: *const FilterState, line: []const u8) void {
-        if (self.checkLine(line)) |info| self.printChecked(line, info);
+    pub fn printIfMatch(self: *FilterState, line: []const u8) void {
+        if (self.checkLine(line)) |ck| self.printChecked(ck.line, ck.info);
     }
 
-    /// Prints an already-checked line using its cached `LineInfo`. Callers that
-    /// have already run `checkLine` use this to skip a second parse — most
-    /// notably the aggregating batch printers in tail.zig and gzip.zig.
+    /// Prints an already-checked line using its cached `LineInfo`. Callers
+    /// that have already run `checkLine` use this to skip a second parse.
+    /// `line` must be the (possibly stripped) `CheckedLine.line` — passing
+    /// the raw input undoes the ANSI stripping done in `checkLine`.
     pub fn printChecked(self: *const FilterState, line: []const u8, info: LineInfo) void {
         if (self.output_json) {
             printJsonOutputLine(line, info);
@@ -828,10 +884,10 @@ fn readAggregated(
             const line = slice[start..nl];
 
             // Reuse LineInfo from checkLine to avoid re-parsing in buildAggregateKey.
-            if (filter_state.checkLine(line)) |info| {
-                if (info.level) |lvl| counter.add(lvl);
-                const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, line, info);
-                try aggregator.add(key, line, info);
+            if (filter_state.checkLine(line)) |ck| {
+                if (ck.info.level) |lvl| counter.add(lvl);
+                const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, ck.line, ck.info);
+                try aggregator.add(key, ck.line, ck.info);
             }
 
             start = nl + 1;
@@ -842,10 +898,10 @@ fn readAggregated(
 
     // Process final line if present (no trailing newline).
     if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items)) |info| {
-            if (info.level) |lvl| counter.add(lvl);
-            const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, carry.items, info);
-            try aggregator.add(key, carry.items, info);
+        if (filter_state.checkLine(carry.items)) |ck| {
+            if (ck.info.level) |lvl| counter.add(lvl);
+            const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, ck.line, ck.info);
+            try aggregator.add(key, ck.line, ck.info);
         }
     }
 
@@ -898,17 +954,17 @@ fn readContinuous(
             const nl = simd.findByte(slice, start, '\n') orelse break;
             const line = slice[start..nl];
 
-            if (filter_state.checkLine(line)) |info| {
-                if (info.level) |lvl| counter.add(lvl);
+            if (filter_state.checkLine(line)) |ck| {
+                if (ck.info.level) |lvl| counter.add(lvl);
                 if (args.output_json) {
-                    try printJsonOutputLineBuffered(&output, line, info);
+                    try printJsonOutputLineBuffered(&output, ck.line, ck.info);
                 } else {
                     var match_buf: [max_search_matches]MatchRange = undefined;
                     const matches: []const MatchRange = if (filter_state.has_search_filter)
-                        findSearchMatches(line, filter_state.search_expr.?, &match_buf)
+                        findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
                     else
                         &.{};
-                    try printStyledLineBuffered(&output, line, info, matches);
+                    try printStyledLineBuffered(&output, ck.line, ck.info, matches);
                 }
             }
 
@@ -919,17 +975,17 @@ fn readContinuous(
     }
 
     if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items)) |info| {
-            if (info.level) |lvl| counter.add(lvl);
+        if (filter_state.checkLine(carry.items)) |ck| {
+            if (ck.info.level) |lvl| counter.add(lvl);
             if (args.output_json) {
-                try printJsonOutputLineBuffered(&output, carry.items, info);
+                try printJsonOutputLineBuffered(&output, ck.line, ck.info);
             } else {
                 var match_buf: [max_search_matches]MatchRange = undefined;
                 const matches: []const MatchRange = if (filter_state.has_search_filter)
-                    findSearchMatches(carry.items, filter_state.search_expr.?, &match_buf)
+                    findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
                 else
                     &.{};
-                try printStyledLineBuffered(&output, carry.items, info, matches);
+                try printStyledLineBuffered(&output, ck.line, ck.info, matches);
             }
         }
     }
@@ -983,17 +1039,17 @@ fn readWithPagination(
             const nl = simd.findByte(slice, start, '\n') orelse break;
             const line = slice[start..nl];
 
-            if (filter_state.checkLine(line)) |info| {
-                if (info.level) |lvl| counter.add(lvl);
+            if (filter_state.checkLine(line)) |ck| {
+                if (ck.info.level) |lvl| counter.add(lvl);
                 if (args.output_json) {
-                    try printJsonOutputLineBuffered(&output, line, info);
+                    try printJsonOutputLineBuffered(&output, ck.line, ck.info);
                 } else {
                     var match_buf: [max_search_matches]MatchRange = undefined;
                     const matches: []const MatchRange = if (filter_state.has_search_filter)
-                        findSearchMatches(line, filter_state.search_expr.?, &match_buf)
+                        findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
                     else
                         &.{};
-                    try printStyledLineBuffered(&output, line, info, matches);
+                    try printStyledLineBuffered(&output, ck.line, ck.info, matches);
                 }
                 batch += 1;
 
@@ -1015,17 +1071,17 @@ fn readWithPagination(
 
     // Flush any final line that had no trailing newline.
     if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items)) |info| {
-            if (info.level) |lvl| counter.add(lvl);
+        if (filter_state.checkLine(carry.items)) |ck| {
+            if (ck.info.level) |lvl| counter.add(lvl);
             if (args.output_json) {
-                try printJsonOutputLineBuffered(&output, carry.items, info);
+                try printJsonOutputLineBuffered(&output, ck.line, ck.info);
             } else {
                 var match_buf: [max_search_matches]MatchRange = undefined;
                 const matches: []const MatchRange = if (filter_state.has_search_filter)
-                    findSearchMatches(carry.items, filter_state.search_expr.?, &match_buf)
+                    findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
                 else
                     &.{};
-                try printStyledLineBuffered(&output, carry.items, info, matches);
+                try printStyledLineBuffered(&output, ck.line, ck.info, matches);
             }
         }
     }
@@ -2219,7 +2275,7 @@ test "FilterState.checkLine should filter by level" {
     };
     var state = FilterState.init(args);
     defer state.deinit();
-    try std.testing.expectEqual(flags.Level.Error, state.checkLine("[ERROR] Something went wrong").?.level.?);
+    try std.testing.expectEqual(flags.Level.Error, state.checkLine("[ERROR] Something went wrong").?.info.level.?);
     try std.testing.expect(state.checkLine("[INFO] Everything is fine") == null);
 }
 
@@ -2232,8 +2288,8 @@ test "FilterState.checkLine handles JSON non-string fields before level" {
     var state = FilterState.init(args);
     defer state.deinit();
 
-    const info = state.checkLine("{\"pid\":123,\"ok\":true,\"level\":\"error\",\"msg\":\"failed\"}").?;
-    try std.testing.expectEqual(flags.Level.Error, info.level.?);
+    const ck = state.checkLine("{\"pid\":123,\"ok\":true,\"level\":\"error\",\"msg\":\"failed\"}").?;
+    try std.testing.expectEqual(flags.Level.Error, ck.info.level.?);
 }
 
 test "FilterState.checkLine should filter by search" {

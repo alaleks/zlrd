@@ -35,6 +35,27 @@ pub fn parseLevelInsensitive(s: []const u8) ?Level {
     inline for (@typeInfo(Level).@"enum".fields) |f| {
         if (eqlIgnoreCaseFast(s, f.name)) return @enumFromInt(f.value);
     }
+    // Short / alternate forms emitted by common loggers (zerolog, gRPC, syslog).
+    if (s.len == 3) {
+        if (eqlIgnoreCaseFast(s, "trc")) return .Trace;
+        if (eqlIgnoreCaseFast(s, "dbg")) return .Debug;
+        if (eqlIgnoreCaseFast(s, "inf")) return .Info;
+        if (eqlIgnoreCaseFast(s, "wrn")) return .Warn;
+        if (eqlIgnoreCaseFast(s, "err")) return .Error;
+        if (eqlIgnoreCaseFast(s, "ftl")) return .Fatal;
+        if (eqlIgnoreCaseFast(s, "crt")) return .Fatal;
+        if (eqlIgnoreCaseFast(s, "pnc")) return .Panic;
+    } else if (eqlIgnoreCaseFast(s, "warning")) {
+        return .Warn;
+    } else if (eqlIgnoreCaseFast(s, "critical")) {
+        return .Fatal;
+    } else if (eqlIgnoreCaseFast(s, "emerg")) {
+        return .Panic;
+    } else if (eqlIgnoreCaseFast(s, "alert")) {
+        return .Panic;
+    } else if (eqlIgnoreCaseFast(s, "notice")) {
+        return .Info;
+    }
     return null;
 }
 
@@ -978,8 +999,30 @@ test "parseLevelInsensitive handles mixed case" {
 }
 
 test "parseLevelInsensitive returns null for unknown" {
-    try testing.expect(parseLevelInsensitive("critical") == null);
+    try testing.expect(parseLevelInsensitive("badlevel") == null);
     try testing.expect(parseLevelInsensitive("") == null);
+}
+
+test "parseLevelInsensitive handles zerolog short forms" {
+    try testing.expectEqual(Level.Trace, parseLevelInsensitive("TRC").?);
+    try testing.expectEqual(Level.Debug, parseLevelInsensitive("DBG").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("INF").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("WRN").?);
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("ERR").?);
+    try testing.expectEqual(Level.Fatal, parseLevelInsensitive("FTL").?);
+    try testing.expectEqual(Level.Panic, parseLevelInsensitive("PNC").?);
+    // lower-case variants
+    try testing.expectEqual(Level.Debug, parseLevelInsensitive("dbg").?);
+    try testing.expectEqual(Level.Error, parseLevelInsensitive("err").?);
+}
+
+test "parseLevelInsensitive handles syslog-style long forms" {
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("warning").?);
+    try testing.expectEqual(Level.Warn, parseLevelInsensitive("WARNING").?);
+    try testing.expectEqual(Level.Fatal, parseLevelInsensitive("critical").?);
+    try testing.expectEqual(Level.Info, parseLevelInsensitive("notice").?);
+    try testing.expectEqual(Level.Panic, parseLevelInsensitive("emerg").?);
+    try testing.expectEqual(Level.Panic, parseLevelInsensitive("alert").?);
 }
 
 test "parseAggregateMode parses known values" {

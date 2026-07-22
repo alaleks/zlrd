@@ -293,12 +293,18 @@ fn processLine(
     }
 
     _ = allocator;
-    if (filter_state.checkLine(line) != null) {
+    if (filter_state.checkLine(line)) |result| {
         const builder = key_builder orelse return GzipReadError.MissingAggregateKeyBuilder;
         const agg = aggregator orelse return GzipReadError.MissingAggregator;
 
-        const key = try builder(agg.allocator, &agg.key_scratch, args.aggregate_mode, line);
-        try agg.add(key, line);
+        // The real reader.FilterState returns `CheckedLine { line, info }` so
+        // aggregation keys and stored samples see the ANSI-stripped bytes.
+        // The unit-test sink below returns a scalar sentinel — fall back to
+        // the raw line for it (its callers never inspect the strip).
+        const T = @TypeOf(result);
+        const effective_line = if (comptime @typeInfo(T) == .@"struct" and @hasField(T, "line")) result.line else line;
+        const key = try builder(agg.allocator, &agg.key_scratch, args.aggregate_mode, effective_line);
+        try agg.add(key, effective_line);
     }
 }
 

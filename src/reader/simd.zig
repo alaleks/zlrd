@@ -313,6 +313,102 @@ pub fn findLogfmtLevel(line: []const u8) ?struct { start: usize, end: usize } {
     }
 }
 
+/// Strips journalctl-encoded ANSI escape sequences of the form `#033[…m`
+/// (SGR parameters made of digits, `;`, `:`) from `src` into `dst`, returning
+/// the populated slice. If `src` contains no such sequence, `src` is returned
+/// unchanged — the caller pays nothing on the hot path where the log source
+/// is not zerolog+journalctl.
+///
+/// Only well-formed SGR sequences are stripped: `#033[` followed by
+/// digits/`;`/`:` and terminated by `m`. Malformed matches are left in place
+/// so unrelated `#033[…` runs in real message bodies aren't swallowed.
+pub fn stripLiteralAnsi(dst: []u8, src: []const u8) []const u8 {
+    const needle = "#033[";
+    if (std.mem.indexOf(u8, src, needle) == null) return src;
+    // Stripping only removes bytes, so `dst` must be large enough to hold the
+    // worst-case (no-strip) output. If not, return `src` unchanged instead of
+    // silently truncating and desynchronising level_pos / search_matches.
+    if (dst.len < src.len) return src;
+
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (i + needle.len <= src.len and std.mem.eql(u8, src[i .. i + needle.len], needle)) {
+            var j = i + needle.len;
+            var ok = false;
+            while (j < src.len) : (j += 1) {
+                const c = src[j];
+                if (c == 'm') {
+                    ok = true;
+                    break;
+                }
+                if (!((c >= '0' and c <= '9') or c == ';' or c == ':')) break;
+            }
+            if (ok) {
+                i = j + 1;
+                continue;
+            }
+        }
+        dst[out] = src[i];
+        out += 1;
+        i += 1;
+    }
+    return dst[0..out];
+}
+
+inline fn isAsciiAlpha(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z');
+}
+
+/// Returns the byte range of the next contiguous ASCII-alpha token in
+/// `line[from..]`, or null if none. Used to enumerate candidate level tokens
+/// for `findFreeStandingLevel`.
+pub fn nextAlphaToken(line: []const u8, from: usize) ?struct { start: usize, end: usize } {
+    var i = from;
+    while (i < line.len and !isAsciiAlpha(line[i])) : (i += 1) {}
+    if (i >= line.len) return null;
+    const s = i;
+    while (i < line.len and isAsciiAlpha(line[i])) : (i += 1) {}
+    return .{ .start = s, .end = i };
+}
+
+/// Locates a gRPC status marker of the form `code = <NAME>` inside `line` and
+/// returns the byte range of `<NAME>` when it is non-empty. Whitespace around
+/// the `=` is tolerated. Boundary before `code` must be start-of-line or a
+/// non-alnum byte so we don't match tokens like `error_code`.
+///
+/// The caller decides how to interpret the name; `OK` means success.
+pub fn findGrpcCode(line: []const u8) ?struct { start: usize, end: usize } {
+    const needle = "code";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, line, i, needle)) |hit| {
+        const boundary_ok = if (hit == 0) true else blk: {
+            const c = line[hit - 1];
+            break :blk !isAsciiAlpha(c) and !(c >= '0' and c <= '9') and c != '_';
+        };
+        if (!boundary_ok) {
+            i = hit + needle.len;
+            continue;
+        }
+        var j = hit + needle.len;
+        while (j < line.len and (line[j] == ' ' or line[j] == '\t')) : (j += 1) {}
+        if (j >= line.len or line[j] != '=') {
+            i = hit + needle.len;
+            continue;
+        }
+        j += 1;
+        while (j < line.len and (line[j] == ' ' or line[j] == '\t')) : (j += 1) {}
+        const s = j;
+        while (j < line.len and (isAsciiAlpha(line[j]) or (line[j] >= '0' and line[j] <= '9') or line[j] == '_')) : (j += 1) {}
+        if (j == s) {
+            i = hit + needle.len;
+            continue;
+        }
+        return .{ .start = s, .end = j };
+    }
+    return null;
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -611,6 +707,81 @@ test "extractJsonField: whitespace around colon" {
     const line = "{ \"level\" : \"error\" }";
     const r = extractJsonField(line, "level", 10);
     try testing.expectEqualStrings("error", r.?);
+}
+
+// ── stripLiteralAnsi ─────────────────────────────────────────────────────────
+
+test "stripLiteralAnsi: no escapes → src returned unchanged" {
+    var buf: [64]u8 = undefined;
+    const src = "plain text with no escapes";
+    const out = stripLiteralAnsi(&buf, src);
+    try testing.expectEqual(src.ptr, out.ptr);
+}
+
+test "stripLiteralAnsi: removes single SGR sequence" {
+    var buf: [128]u8 = undefined;
+    const out = stripLiteralAnsi(&buf, "hello #033[31mworld#033[0m!");
+    try testing.expectEqualStrings("hello world!", out);
+}
+
+test "stripLiteralAnsi: removes multi-parameter SGR" {
+    var buf: [128]u8 = undefined;
+    const out = stripLiteralAnsi(&buf, "#033[38;2;255;0;0mred#033[0m");
+    try testing.expectEqualStrings("red", out);
+}
+
+test "stripLiteralAnsi: real zerolog+journalctl line" {
+    var buf: [256]u8 = undefined;
+    const line = "core[785424]: #033[90m9:32AM#033[0m #033[32mINF#033[0m #033[1mBuildTopology: 5.8s#033[0m #033[36merror_code=#033[0mUnknown";
+    const out = stripLiteralAnsi(&buf, line);
+    try testing.expectEqualStrings(
+        "core[785424]: 9:32AM INF BuildTopology: 5.8s error_code=Unknown",
+        out,
+    );
+}
+
+test "stripLiteralAnsi: malformed (no `m` terminator) left untouched" {
+    var buf: [64]u8 = undefined;
+    // First is valid (gets stripped), second is a random `#033[` in text.
+    const out = stripLiteralAnsi(&buf, "#033[0mkeep #033[abcxyz still here");
+    try testing.expectEqualStrings("keep #033[abcxyz still here", out);
+}
+
+// ── nextAlphaToken ───────────────────────────────────────────────────────────
+
+test "nextAlphaToken: walks tokens skipping punctuation and digits" {
+    const line = "9:32AM DBG msg";
+    const t1 = nextAlphaToken(line, 0).?;
+    try testing.expectEqualStrings("AM", line[t1.start..t1.end]);
+    const t2 = nextAlphaToken(line, t1.end).?;
+    try testing.expectEqualStrings("DBG", line[t2.start..t2.end]);
+    const t3 = nextAlphaToken(line, t2.end).?;
+    try testing.expectEqualStrings("msg", line[t3.start..t3.end]);
+    try testing.expect(nextAlphaToken(line, t3.end) == null);
+}
+
+// ── findGrpcCode ─────────────────────────────────────────────────────────────
+
+test "findGrpcCode: extracts name after code=" {
+    const line = "rpc error: code = Unavailable desc = connection error";
+    const r = findGrpcCode(line).?;
+    try testing.expectEqualStrings("Unavailable", line[r.start..r.end]);
+}
+
+test "findGrpcCode: OK is returned literally — caller decides" {
+    const line = "code = OK";
+    const r = findGrpcCode(line).?;
+    try testing.expectEqualStrings("OK", line[r.start..r.end]);
+}
+
+test "findGrpcCode: does not match error_code=" {
+    // `error_code=` has `_` immediately before `code`, so the boundary check
+    // rejects it and the scan continues; there is no second `code =` here.
+    try testing.expect(findGrpcCode("error_code=Unknown") == null);
+}
+
+test "findGrpcCode: does not match without =" {
+    try testing.expect(findGrpcCode("this code is fine") == null);
 }
 
 test "extractJsonField: non-string value is ignored" {
