@@ -32,6 +32,11 @@ pub const Out = struct {
     buf: []u8,
     len: usize = 0,
     allocator: std.mem.Allocator,
+    /// Set once a write fails, which in practice means the reader on the
+    /// other end of the pipe went away (`| head`, quitting the pager). The
+    /// read loops poll this and stop early instead of formatting the rest of
+    /// a file nobody will read.
+    broken: bool = false,
 
     /// Large enough that a page of styled output flushes once. Colour escapes
     /// inflate a log line roughly 3–5×, so this is ~1–2k lines per syscall.
@@ -62,7 +67,9 @@ pub const Out = struct {
             if (s.len > self.buf.len) {
                 // Bigger than the whole buffer: hand it straight to the file
                 // rather than growing without bound.
-                self.file.writeStreamingAll(debug_io, s) catch {};
+                self.file.writeStreamingAll(debug_io, s) catch {
+                    self.broken = true;
+                };
                 return;
             }
         }
@@ -92,7 +99,9 @@ pub const Out = struct {
 
     pub fn flush(self: *Out) void {
         if (self.len == 0) return;
-        self.file.writeStreamingAll(debug_io, self.buf[0..self.len]) catch {};
+        self.file.writeStreamingAll(debug_io, self.buf[0..self.len]) catch {
+            self.broken = true;
+        };
         self.len = 0;
     }
 };
@@ -504,6 +513,13 @@ pub const FilterState = struct {
     output_json: bool,
     /// Whether `analyzeLine` has to extract the date and time.
     needs_timestamps: bool = true,
+    /// Whether the current read chunk contains any byte that could open a
+    /// literal `#033[` escape. Set once per chunk by `beginChunk`; when
+    /// false, `checkLine` skips the per-line strip scan entirely.
+    ///
+    /// Defaults to true so callers that never call `beginChunk` (tail,
+    /// gzip) keep stripping unconditionally.
+    chunk_may_have_ansi: bool = true,
     /// Sink used by `printIfMatch` / `printChecked`. Null for filter-only use.
     out: ?*Out = null,
     /// Null disables embedded-JSON expansion.
@@ -562,9 +578,20 @@ pub const FilterState = struct {
     /// stripped bytes propagate through the pipeline.
     ///
     /// Filter order: search → level → date (cheapest to most expensive).
+    /// Called once per read chunk, before its lines are handed to
+    /// `checkLine`. Hoists the "does this data contain literal ANSI at all"
+    /// question out of the per-line path: one scan of the whole chunk
+    /// instead of one call per line over the same bytes.
+    pub fn beginChunk(self: *FilterState, chunk: []const u8) void {
+        self.chunk_may_have_ansi = simd.findByte(chunk, 0, '#') != null;
+    }
+
     pub fn checkLine(self: *FilterState, raw_line: []const u8) ?CheckedLine {
         if (raw_line.len == 0) return null;
-        const line = simd.stripLiteralAnsi(&self.strip_buf, raw_line);
+        const line = if (self.chunk_may_have_ansi)
+            simd.stripLiteralAnsi(&self.strip_buf, raw_line)
+        else
+            raw_line;
 
         if (self.has_regex) {
             if (!self.regex_list.allMatch(line)) return null;
@@ -931,6 +958,7 @@ pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args, th: *const Theme
     var counter = LevelCounter{};
     for (args.files) |path| {
         try readStreaming(allocator, path, args, &counter, &out);
+        if (out.broken) return;
     }
     if (!args.output_json) counter.print(&out);
 }
@@ -978,7 +1006,10 @@ pub fn readStreaming(
         .out = out,
         .paginate = args.num_lines > 0,
     };
-    try scanLines(allocator, file, &handler);
+    scanLines(allocator, file, &handler) catch |err| switch (err) {
+        error.OutputClosed => {},
+        else => return err,
+    };
 }
 
 /// Whether embedded JSON should be expanded for this run.
@@ -1017,6 +1048,7 @@ fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) 
         if (n == 0) break;
 
         const filled = buf[0 .. carry + n];
+        if (@hasDecl(@TypeOf(handler.*), "beginChunk")) handler.beginChunk(filled);
         var start: usize = 0;
         while (simd.findByte(filled, start, '\n')) |nl| {
             try handler.line(filled[start..nl]);
@@ -1038,6 +1070,11 @@ fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) 
     if (carry > 0) try handler.line(buf[0..carry]);
 }
 
+/// Raised by a line handler when the output sink has gone away. Caught by
+/// `readStreaming`, which treats it as a normal end of work rather than a
+/// failure — `zlrd big.log | head -20` is a successful command.
+const OutputClosed = error.OutputClosed;
+
 /// Line handler for the streaming and paginated modes.
 const PrintHandler = struct {
     args: flags.Args,
@@ -1048,10 +1085,15 @@ const PrintHandler = struct {
     batch: usize = 0,
     page: usize = 1,
 
+    fn beginChunk(self: *PrintHandler, chunk: []const u8) void {
+        self.filter_state.beginChunk(chunk);
+    }
+
     fn line(self: *PrintHandler, bytes: []const u8) !void {
         const ck = self.filter_state.checkLine(bytes) orelse return;
         if (ck.info.level) |lvl| self.counter.add(lvl);
         self.filter_state.printChecked(ck.line, ck.info);
+        if (self.out.broken) return OutputClosed;
 
         if (!self.paginate) return;
         self.batch += 1;
@@ -1103,6 +1145,10 @@ const AggregateHandler = struct {
     fn deinit(self: *AggregateHandler) void {
         self.key_scratch.deinit(self.allocator);
         self.aggregator.deinit();
+    }
+
+    fn beginChunk(self: *AggregateHandler, chunk: []const u8) void {
+        self.filter_state.beginChunk(chunk);
     }
 
     fn line(self: *AggregateHandler, bytes: []const u8) !void {
@@ -1497,6 +1543,24 @@ fn charAtIgnoreCase(line: []const u8, pos: usize, needle: []const u8) bool {
 fn printStyledLine(out: *Out, line: []const u8, info: LineInfo, search_matches: []const MatchRange, expand: ?*JsonExpander) void {
     if (line.len == 0) return;
 
+    // Colourless output with nothing to highlight and no block to expand is
+    // byte-for-byte the input line with the level token swapped for its
+    // badge. That is the shape every redirected run takes — `| grep`,
+    // `| less`, `> file` — so emit it directly instead of walking every
+    // token to decide which escape *not* to print.
+    if (!out.theme.colored and search_matches.len == 0 and expand == null and info.is_json) {
+        if (info.level_pos) |lp| {
+            // The badge replaces the quoted value, quotes included.
+            out.write(line[0 .. lp.start - 1]);
+            writeLevelBadge(out, info.level.?, line[lp.start..lp.end]);
+            out.write(line[lp.end + 1 ..]);
+        } else {
+            out.write(line);
+        }
+        out.write("\n");
+        return;
+    }
+
     if (info.is_json) {
         printJsonStyled(out, line, info, search_matches, expand);
     } else if (info.level != null) {
@@ -1657,8 +1721,6 @@ inline fn isUnescapedQuote(line: []const u8, i: usize) bool {
 fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: []const MatchRange, expand: ?*JsonExpander) void {
     const p = out.theme.palette;
     var i: usize = 0;
-    var in_string = false;
-    var str_start: usize = 0;
     // Start of the current run of unstyled bytes, flushed lazily.
     var plain_start: usize = 0;
     // Message-embedded JSON found while walking; expanded after the line so
@@ -1668,63 +1730,48 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
     while (i < line.len) {
         const c = line[i];
 
-        if (isUnescapedQuote(line, i)) {
-            if (!in_string) {
-                // Flush the plain bytes before the quote. The quoted token is
-                // emitted whole once we reach its closing quote, so the
-                // opening quote must not leak into the run.
-                if (i > plain_start) out.write(line[plain_start..i]);
-                in_string = true;
-                str_start = i + 1;
-                i += 1;
-                plain_start = i;
-                continue;
+        if (c == '"') {
+            // Jump straight to the closing quote. In a JSON log line most
+            // bytes sit inside string values, and the previous version
+            // stepped through every one of them re-testing whether it was an
+            // unescaped quote. `scanJsonStringEnd` vectorises the search for
+            // the next `\\` or `"` and skips escape pairs on the way.
+            const body = i + 1;
+            const end = simd.scanJsonStringEnd(line, body) orelse break;
+            if (i > plain_start) out.write(line[plain_start..i]);
+            const str = line[body..end];
+
+            if (info.level_pos) |lp| {
+                if (body == lp.start and end == lp.end) {
+                    writeLevelBadge(out, info.level.?, str);
+                    i = end + 1;
+                    plain_start = i;
+                    continue;
+                }
             }
+
+            // A key is a string followed by `:`.
+            var j = end + 1;
+            while (j < line.len and line[j] == ' ') : (j += 1) {}
+            const is_key = j < line.len and line[j] == ':';
+            out.write(if (is_key) p.json_key_open else p.json_string_open);
+            writeRangeHighlighted(out, line, body, end, search_matches);
+            out.write(p.quote_close);
+
+            if (!is_key and expand != null and nested == null and
+                jsonx.looksLikeNestedObject(str, .{}))
             {
-                in_string = false;
-                const str = line[str_start..i];
-
-                if (info.level_pos) |lp| {
-                    if (str_start == lp.start and i == lp.end) {
-                        writeLevelBadge(out, info.level.?, str);
-                        i += 1;
-                        plain_start = i;
-                        continue;
-                    }
-                }
-
-                // A key is a string followed by `:`.
-                var j = i + 1;
-                while (j < line.len and line[j] == ' ') : (j += 1) {}
-                const is_key = j < line.len and line[j] == ':';
-                out.write(if (is_key) p.json_key else p.json_string);
-                out.write("\"");
-                writeRangeHighlighted(out, line, str_start, i, search_matches);
-                out.write("\"");
-                out.write(p.reset);
-
-                if (!is_key and expand != null and nested == null and
-                    jsonx.looksLikeNestedObject(str, .{}))
-                {
-                    nested = str;
-                }
-
-                i += 1;
-                plain_start = i;
-                continue;
+                nested = str;
             }
-            i += 1;
-            continue;
-        }
 
-        if (in_string) {
-            i += 1;
+            i = end + 1;
+            plain_start = i;
             continue;
         }
 
         if (isDigit(c) or c == '-') {
             if (i > plain_start) out.write(line[plain_start..i]);
-            const start = i;
+            const num_start = i;
             i += 1;
             while (i < line.len and
                 (isDigit(line[i]) or line[i] == '.' or
@@ -1732,7 +1779,7 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
                     line[i] == '+' or line[i] == '-')) : (i += 1)
             {}
             out.write(p.json_number);
-            writeRangeHighlighted(out, line, start, i, search_matches);
+            writeRangeHighlighted(out, line, num_start, i, search_matches);
             out.write(p.reset);
             plain_start = i;
             continue;
@@ -3157,4 +3204,136 @@ test "a date filter still matches with the gate in place" {
     defer state.deinit();
     try std.testing.expect(state.checkLine("2026-08-25 12:00:01 [INFO] yes") != null);
     try std.testing.expect(state.checkLine("2026-08-26 12:00:01 [INFO] no") == null);
+}
+
+test "a broken sink stops the scan instead of formatting the rest of the file" {
+    // `zlrd big.log | head -20` must not walk the remaining gigabytes.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(std.testing.allocator);
+    for (0..1000) |i| {
+        var buf: [64]u8 = undefined;
+        try content.appendSlice(std.testing.allocator, try std.fmt.bufPrint(&buf, "[INFO] line {d}\n", .{i}));
+    }
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "s.log", .data = content.items });
+    const file = try tmp.dir.openFile(debug_io, "s.log", .{});
+    defer file.close(debug_io);
+
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    h.out.broken = true; // as if the reader on the far end went away
+
+    var file_arg = [_][]const u8{"s.log"};
+    var fs = FilterState.init(.{ .files = &file_arg }, &h.out, null);
+    defer fs.deinit();
+    var counter = LevelCounter{};
+    var handler = PrintHandler{
+        .args = .{ .files = &file_arg },
+        .counter = &counter,
+        .filter_state = &fs,
+        .out = &h.out,
+        .paginate = false,
+    };
+    try std.testing.expectError(error.OutputClosed, scanLines(std.testing.allocator, file, &handler));
+    // Stopped on the very first line, not after all 1000.
+    try std.testing.expectEqual(@as(usize, 1), counter.total);
+}
+
+test "an intact sink processes every line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(debug_io, .{
+        .sub_path = "ok.log",
+        .data = "[INFO] a\n[WARN] b\n[ERROR] c\n",
+    });
+    const file = try tmp.dir.openFile(debug_io, "ok.log", .{});
+    defer file.close(debug_io);
+
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+
+    var file_arg = [_][]const u8{"ok.log"};
+    var fs = FilterState.init(.{ .files = &file_arg }, &h.out, null);
+    defer fs.deinit();
+    var counter = LevelCounter{};
+    var handler = PrintHandler{
+        .args = .{ .files = &file_arg },
+        .counter = &counter,
+        .filter_state = &fs,
+        .out = &h.out,
+        .paginate = false,
+    };
+    try scanLines(std.testing.allocator, file, &handler);
+    try std.testing.expectEqual(@as(usize, 3), counter.total);
+    try std.testing.expect(!h.out.broken);
+}
+
+test "the colourless fast path matches the token walk byte for byte" {
+    // `printStyledLine` short-circuits the whole JSON token walk when there
+    // is no colour, no highlight and no block to expand. It has to produce
+    // exactly what the walk would have.
+    const cases = [_][]const u8{
+        "{\"level\":\"info\",\"msg\":\"hello\",\"n\":42}",
+        "{\"time\":\"2026-08-25T12:00:00Z\",\"level\":\"error\",\"msg\":\"boom\"}",
+        "{\"level\":\"warn\"}",
+        "{\"no_level\":\"here\",\"n\":1,\"ok\":true}",
+        "{\"msg\":\"quote \\\" and back\\\\slash\",\"level\":\"debug\"}",
+        "{}",
+        "{\"level\":\"fatal\",\"trailing\":null}",
+    };
+    for (cases) |line| {
+        const info = analyzeLine(line, true);
+
+        var fast = TestOut{ .th = theme.Theme.plain };
+        try fast.start();
+        defer fast.deinit();
+        printStyledLine(&fast.out, line, info, &.{}, null);
+        const a = try fast.take();
+        defer std.testing.allocator.free(a);
+
+        var slow = TestOut{ .th = theme.Theme.plain };
+        try slow.start();
+        defer slow.deinit();
+        printJsonStyled(&slow.out, line, info, &.{}, null);
+        const b = try slow.take();
+        defer std.testing.allocator.free(b);
+
+        try std.testing.expectEqualStrings(b, a);
+    }
+}
+
+test "search highlighting still takes the token walk" {
+    // A non-empty match list must not be short-circuited away, even without
+    // colour: the highlight escapes are the whole point.
+    const line = "{\"level\":\"info\",\"msg\":\"needle here\"}";
+    const info = analyzeLine(line, true);
+    var match_buf: [max_search_matches]MatchRange = undefined;
+    const matches = findSearchMatches(line, "needle", &match_buf);
+    try std.testing.expect(matches.len > 0);
+
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    try h.start();
+    defer h.deinit();
+    printStyledLine(&h.out, line, info, matches, null);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, h.th.palette.match_on) != null);
+}
+
+test "the fast path never runs when a JSON block would be expanded" {
+    const line = "{\"level\":\"info\",\"body\":\"{\\\"id\\\":5,\\\"ok\\\":true}\"}";
+    const info = analyzeLine(line, true);
+    var expander = try JsonExpander.init(std.testing.allocator, .{});
+    defer expander.deinit();
+
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    printStyledLine(&h.out, line, info, &.{}, &expander);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"id\": 5") != null);
 }

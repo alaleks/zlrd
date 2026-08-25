@@ -65,6 +65,13 @@ pub const Palette = struct {
 
     json_key: []const u8,
     json_string: []const u8,
+    /// `json_key` / `json_string` with the opening quote already attached,
+    /// and the closing quote with the reset attached. A JSON line is mostly
+    /// quoted tokens, and these three are always written adjacently — one
+    /// append each beats two.
+    json_key_open: []const u8,
+    json_string_open: []const u8,
+    quote_close: []const u8,
     json_number: []const u8,
     json_bool_null: []const u8,
     /// Braces, brackets, commas, colons.
@@ -164,6 +171,9 @@ const truecolor_palette: Palette = .{
     .text = esc ++ "39m",
     .json_key = fg(0x1974fc),
     .json_string = fg(0x188796),
+    .json_key_open = fg(0x1974fc) ++ "\"",
+    .json_string_open = fg(0x188796) ++ "\"",
+    .quote_close = "\"" ++ esc ++ "0m",
     .json_number = fg(0xa34bfb),
     .json_bool_null = fg(0x038f19),
     .json_punct = esc ++ "2m",
@@ -189,6 +199,9 @@ const ansi256_palette: Palette = .{
     .text = esc ++ "39m",
     .json_key = esc ++ "38;5;33m",
     .json_string = esc ++ "38;5;30m",
+    .json_key_open = esc ++ "38;5;33m" ++ "\"",
+    .json_string_open = esc ++ "38;5;30m" ++ "\"",
+    .quote_close = "\"" ++ esc ++ "0m",
     .json_number = esc ++ "38;5;135m",
     .json_bool_null = esc ++ "38;5;28m",
     .json_punct = esc ++ "2m",
@@ -215,6 +228,9 @@ const ansi16_palette: Palette = .{
     .text = esc ++ "39m",
     .json_key = esc ++ "34m",
     .json_string = esc ++ "36m",
+    .json_key_open = esc ++ "34m" ++ "\"",
+    .json_string_open = esc ++ "36m" ++ "\"",
+    .quote_close = "\"" ++ esc ++ "0m",
     .json_number = esc ++ "35m",
     .json_bool_null = esc ++ "32m",
     .json_punct = esc ++ "2m",
@@ -237,6 +253,9 @@ const no_palette: Palette = .{
     .text = "",
     .json_key = "",
     .json_string = "",
+    .json_key_open = "\"",
+    .json_string_open = "\"",
+    .quote_close = "\"",
     .json_number = "",
     .json_bool_null = "",
     .json_punct = "",

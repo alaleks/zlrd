@@ -36,6 +36,21 @@ pub inline fn levelBit(lvl: Level) LevelMask {
 }
 
 pub fn parseLevelInsensitive(s: []const u8) ?Level {
+    // Reject on shape before comparing against ~20 candidate names.
+    //
+    // `inferMidLineLevel` calls this for every alphabetic token of every line
+    // whose level wasn't found structurally, so the overwhelmingly common
+    // input here is an ordinary English word. Every recognised spelling is
+    // 3–8 bytes and starts with one of ten letters, which rejects most words
+    // in two comparisons instead of twenty.
+    if (s.len < 3 or s.len > 8) return null;
+    switch (toLowerFast(s[0])) {
+        // trace/trc, debug/dbg, info/inf, warn/wrn/warning, error/err/emerg,
+        // fatal/ftl, panic/pnc, critical/crt, alert, notice.
+        't', 'd', 'i', 'w', 'e', 'f', 'p', 'c', 'a', 'n' => {},
+        else => return null,
+    }
+
     inline for (@typeInfo(Level).@"enum".fields) |f| {
         if (eqlIgnoreCaseFast(s, f.name)) return @enumFromInt(f.value);
     }
