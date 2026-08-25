@@ -358,6 +358,14 @@ pub const JournalSource = struct {
         });
         defer watcher.deinit();
 
+        // Scratch for entry field bytes, reset between entries so the
+        // per-entry arena draws from a warm buffer instead of hitting the
+        // general-purpose allocator. That is worth ~5x on the drain loop; see
+        // the note on `Iterator.next`. An entry's bytes die at the next
+        // reset, which is the same lifetime `deinit` already gave them.
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+
         while (!self.stop_flag.load(.monotonic)) {
             switch (watcher.waitForChange(&self.stop_flag)) {
                 .stop => return false,
@@ -368,7 +376,9 @@ pub const JournalSource = struct {
                 log.warn("journal source '{s}' refresh failed: {t}", .{ self.name, err });
                 continue;
             };
-            while (try it.next(self.allocator)) |entry| {
+            while (true) {
+                _ = scratch.reset(.retain_capacity);
+                const entry = try it.next(scratch.allocator()) orelse break;
                 var e = entry;
                 defer e.deinit();
                 self.handleNativeEntry(&e);
