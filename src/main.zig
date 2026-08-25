@@ -17,7 +17,6 @@ pub fn main(opts: struct {
     preopens: std.process.Preopens,
 }) !void {
     _ = opts.arena;
-    _ = opts.environ_map;
     _ = opts.preopens;
     const allocator = opts.gpa;
     const io = opts.io;
@@ -106,10 +105,23 @@ pub fn main(opts: struct {
         return;
     }
 
-    if (!parsed_args.output_json and !parsed_args.tail_mode) {
-        if (std.Io.File.stdout().isTty(io) catch false) printBanner(io);
-    }
-    processFiles(allocator, parsed_args) catch |err| {
+    // Resolve terminal capabilities once: colour depth, whether to colour at
+    // all, and whether box-drawing will render. Everything downstream reads
+    // the result instead of assuming a dark 24-bit terminal.
+    const stdout = std.Io.File.stdout();
+    const vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
+    const is_tty = vt_ok and (stdout.isTty(io) catch false);
+    const th = reader.theme_mod.resolve(
+        reader.theme_mod.fromMap(opts.environ_map, is_tty),
+        switch (parsed_args.color) {
+            .auto => .auto,
+            .always => .always,
+            .never => .never,
+        },
+    );
+
+    if (!parsed_args.output_json and !parsed_args.tail_mode and th.colored) printBanner(io, &th);
+    processFiles(allocator, parsed_args, &th) catch |err| {
         fatal(io, runtimeErrorMessage(err), null);
         std.process.exit(1);
     };
@@ -129,15 +141,21 @@ fn fatal(io: std.Io, msg: []const u8, hint: ?[]const u8) void {
     e.writeStreamingAll(io, "\n") catch {};
 }
 
-fn printBanner(io: std.Io) void {
+fn printBanner(io: std.Io, th: *const reader.Theme) void {
     const w = std.Io.File.stdout();
-    const dim = "\x1b[2m";
-    const rst = "\x1b[0m";
-    const ul = "\x1b[4m";
+    const p = th.palette;
+    const dim = p.dim;
+    const rst = p.reset;
+    const ul = if (th.colored) "\x1b[4m" else "";
     const ver = build_options.version;
 
-    // z=DEBUG(blue) l=INFO(green) r=WARN(yellow) d=ERROR(red)
-    const name = "\x1b[2m\x1b[38;2;88;166;255mz\x1b[38;2;63;185;80ml\x1b[38;2;227;179;65mr\x1b[38;2;248;81;73md\x1b[0m\x1b[2m";
+    // z=DEBUG l=INFO r=WARN d=ERROR, drawn from the resolved palette so the
+    // banner degrades with the terminal instead of assuming 24-bit colour.
+    var name_buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{s}{s}z{s}l{s}r{s}d{s}{s}", .{
+        p.dim,      p.json_key, p.json_bool_null, p.muted,
+        p.json_key, p.reset,    p.dim,
+    }) catch return;
 
     var buf: [256]u8 = undefined;
     const header = std.fmt.bufPrint(&buf, "{s} {s}\n", .{ name, ver }) catch return;
@@ -185,23 +203,24 @@ fn findLogFiles(allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
 fn processFiles(
     allocator: std.mem.Allocator,
     parsed_args: flags.Args,
+    th: *const reader.Theme,
 ) !void {
     if (parsed_args.tail_mode) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        try reader.readLogs(arena.allocator(), parsed_args);
+        try reader.readLogs(arena.allocator(), parsed_args, th);
         return;
     }
 
     if (parsed_args.files.len == 1) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        try reader.readLogs(arena.allocator(), parsed_args);
+        try reader.readLogs(arena.allocator(), parsed_args, th);
         return;
     }
 
     for (parsed_args.files) |file_path| {
-        try processFileWithArena(allocator, file_path, parsed_args);
+        try processFileWithArena(allocator, file_path, parsed_args, th);
     }
 }
 
@@ -209,6 +228,7 @@ fn processFileWithArena(
     base_allocator: std.mem.Allocator,
     file_path: []const u8,
     parsed_args: flags.Args,
+    th: *const reader.Theme,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(base_allocator);
     defer arena.deinit();
@@ -217,7 +237,7 @@ fn processFileWithArena(
     var single_file_args = parsed_args;
     single_file_args.files = single_file[0..];
 
-    try reader.readLogs(arena.allocator(), single_file_args);
+    try reader.readLogs(arena.allocator(), single_file_args, th);
 }
 
 fn parseErrorMessage(err: anyerror) []const u8 {
@@ -228,6 +248,8 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.InvalidLevel => "invalid log level (valid: trace debug info warn error fatal panic)",
         error.InvalidAggregateMode => "invalid aggregate mode (valid: exact level-message json-message normalized)",
         error.InvalidOutputMode => "invalid output mode (valid: json)",
+        error.InvalidColorChoice => "invalid --color value (valid: auto, always, never)",
+        error.MissingColor => "--color requires a value (auto, always, never)",
         error.MissingFile => "missing value for --file",
         error.MissingSearch => "missing value for --search",
         error.MissingLevel => "missing value for --level",

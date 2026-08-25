@@ -11,5 +11,8 @@ const reader = @import("reader.zig");
 
 pub const FilterState = reader.FilterState;
 pub const LineInfo = reader.LineInfo;
+pub const Out = reader.Out;
+pub const Theme = reader.Theme;
+pub const JsonExpander = reader.JsonExpander;
 pub const buildAggregateKey = reader.buildAggregateKey;
 pub const buildAggregateKeyForLine = reader.buildAggregateKeyForLine;

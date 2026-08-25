@@ -130,6 +130,8 @@ pub fn build(b: *std.Build) void {
         "src/reader/tail.zig",
         "src/reader/reader.zig",
         "src/reader/regex.zig",
+        "src/reader/theme.zig",
+        "src/reader/jsonx.zig",
     }) |path| {
         const mod = b.createModule(.{
             .root_source_file = b.path(path),

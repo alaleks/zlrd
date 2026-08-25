@@ -10,6 +10,10 @@ pub const Level = enum(u8) {
     Panic,
 };
 
+/// `--color` setting. Mirrors `theme.ColorChoice`; kept here so `flags` has
+/// no dependency on the reader package.
+pub const ColorChoice = enum { auto, always, never };
+
 pub const AggregateMode = enum {
     exact,
     level_message,
@@ -104,6 +108,11 @@ pub const Args = struct {
     aggregate: bool = false,
     aggregate_mode: AggregateMode = .exact,
     output_json: bool = false,
+    /// How colour should be resolved. `auto` honours NO_COLOR and whether
+    /// stdout is a terminal.
+    color: ColorChoice = .auto,
+    /// Suppress expansion of JSON found inside a log message.
+    no_expand_json: bool = false,
 
     // Agent mode flags. See src/agent/ for the implementation.
     agent_mode: bool = false,
@@ -180,6 +189,8 @@ pub const ParseError = error{
     InvalidLevel,
     InvalidAggregateMode,
     InvalidOutputMode,
+    InvalidColorChoice,
+    MissingColor,
     MissingSearch,
     MissingLevel,
     MissingDate,
@@ -248,6 +259,12 @@ pub fn printHelp() void {
         "      " ++ lo ++ "--output" ++ r ++
         "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
         ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--color" ++ r ++
+        "            " ++ ar ++ "<when>   " ++ r ++ "  " ++
+        ar ++ "auto" ++ r ++ " · " ++ ar ++ "always" ++ r ++ " · " ++ ar ++ "never" ++ r ++
+        "   (auto honours NO_COLOR)\n" ++
+        "      " ++ lo ++ "--no-expand-json" ++ r ++
+        "                Do not expand JSON found inside a message\n" ++
         "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
         "                          Follow file in real time\n" ++
         "  " ++ sh ++ "-n" ++ r ++ ", " ++ lo ++ "--num-lines" ++ r ++
@@ -354,6 +371,12 @@ pub fn printHelpLite() void {
         "      " ++ lo ++ "--output" ++ r ++
         "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
         ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--color" ++ r ++
+        "            " ++ ar ++ "<when>   " ++ r ++ "  " ++
+        ar ++ "auto" ++ r ++ " · " ++ ar ++ "always" ++ r ++ " · " ++ ar ++ "never" ++ r ++
+        "   (auto honours NO_COLOR)\n" ++
+        "      " ++ lo ++ "--no-expand-json" ++ r ++
+        "                Do not expand JSON found inside a message\n" ++
         "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
         "                          Follow file in real time\n" ++
         "  " ++ sh ++ "-n" ++ r ++ ", " ++ lo ++ "--num-lines" ++ r ++
@@ -543,6 +566,7 @@ const ValuedFlag = enum {
     from_time,
     to_time,
     output,
+    color,
     listen,
     metrics_token,
     alert_error_rate,
@@ -570,6 +594,7 @@ const ValuedFlag = enum {
             .{ .name = "from", .kind = .from_time },
             .{ .name = "to", .kind = .to_time },
             .{ .name = "output", .kind = .output },
+            .{ .name = "color", .kind = .color },
             .{ .name = "listen", .kind = .listen },
             .{ .name = "metrics-token", .kind = .metrics_token },
             .{ .name = "alert-error-rate", .kind = .alert_error_rate },
@@ -598,6 +623,7 @@ const ValuedFlag = enum {
             .date => error.MissingDate,
             .num_lines => error.MissingNumLines,
             .aggregate_mode => error.MissingAggregateMode,
+            .color => error.MissingColor,
             .from_time => error.MissingFromTime,
             .to_time => error.MissingToTime,
             .output => error.MissingOutput,
@@ -625,8 +651,8 @@ const ValuedFlag = enum {
 /// silently dropping the value.
 fn isBoolLongFlag(flag: []const u8) bool {
     const names = [_][]const u8{
-        "tail",         "aggregate",    "agent",         "alert-first-seen",
-        "alert-stderr", "alert-exit",   "kernel-probes",
+        "tail",         "aggregate",  "agent",         "alert-first-seen",
+        "alert-stderr", "alert-exit", "kernel-probes", "no-expand-json",
     };
     for (names) |n| if (std.mem.eql(u8, flag, n)) return true;
     return false;
@@ -684,6 +710,10 @@ fn parseLongFlag(
         parsed.kernel_probes = true;
         return;
     }
+    if (std.mem.eql(u8, flag, "no-expand-json")) {
+        parsed.no_expand_json = true;
+        return;
+    }
 
     return error.UnknownArgument;
 }
@@ -719,8 +749,19 @@ fn applyValuedFlag(
         .sidecar_url => try replaceOwnedString(allocator, &parsed.sidecar_url, val),
         .sidecar_header => try appendString(allocator, &bufs.sidecar_headers, val),
         .sidecar_flush_interval => try replaceOwnedString(allocator, &parsed.sidecar_flush_interval, val),
+        .color => try parseColorChoice(parsed, val),
         .sidecar_batch_size => try replaceOwnedString(allocator, &parsed.sidecar_batch_size, val),
     }
+}
+
+fn parseColorChoice(parsed: *Args, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, value, "auto")) {
+        parsed.color = .auto;
+    } else if (std.mem.eql(u8, value, "always")) {
+        parsed.color = .always;
+    } else if (std.mem.eql(u8, value, "never")) {
+        parsed.color = .never;
+    } else return error.InvalidColorChoice;
 }
 
 fn parseOutputMode(parsed: *Args, value: []const u8) ParseError!void {
@@ -1593,8 +1634,8 @@ test "--bool=value is rejected, not silently dropped" {
 test "-- ends option parsing; remaining args are positional files" {
     const allocator = testing.allocator;
     const fake = FakeIter{ .argv = &.{
-        "zlrd",                  "-t",
-        "--",                    "--looks-like-a-flag.log",
+        "zlrd",                "-t",
+        "--",                  "--looks-like-a-flag.log",
         "-also-not-an-option",
     } };
     var it = fake;

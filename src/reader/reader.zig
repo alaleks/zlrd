@@ -8,12 +8,94 @@ const simd = @import("simd");
 const tail_reader = @import("tail.zig");
 const gzip = @import("gzip.zig");
 const regex = @import("regex");
+const theme = @import("theme.zig");
+const jsonx = @import("jsonx.zig");
 const debug_io = std.Options.debug_io;
 
-/// Write bytes to stdout. Swallows errors — log output is best-effort.
-fn writeOut(bytes: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(debug_io, bytes) catch {};
-}
+pub const Theme = theme.Theme;
+pub const theme_mod = theme;
+
+/// Buffered sink for everything this package prints.
+///
+/// Every printer used to exist twice — once writing straight to stdout for
+/// tail/gzip, once into a buffer for the file readers — which meant the
+/// gzip and follow paths issued a `write` syscall per colour escape and per
+/// punctuation byte. Funnelling both through one buffered sink removed that
+/// (and ~400 lines of copy-pasted printer).
+///
+/// Writes are infallible: output is best-effort, exactly as the previous
+/// direct-to-stdout path was. That keeps `try` out of the printers, where
+/// there is nothing useful to do with a write error anyway.
+pub const Out = struct {
+    file: std.Io.File,
+    theme: *const Theme,
+    buf: []u8,
+    len: usize = 0,
+    allocator: std.mem.Allocator,
+
+    /// Large enough that a page of styled output flushes once. Colour escapes
+    /// inflate a log line roughly 3–5×, so this is ~1–2k lines per syscall.
+    pub const capacity: usize = 256 * 1024;
+
+    pub fn init(allocator: std.mem.Allocator, file: std.Io.File, th: *const Theme) !Out {
+        return .{
+            .file = file,
+            .theme = th,
+            .buf = try allocator.alloc(u8, capacity),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Out) void {
+        self.flush();
+        self.allocator.free(self.buf);
+        self.* = undefined;
+    }
+
+    /// Appends `s`. The zero-length early-out matters: under the plain
+    /// (no-colour) theme every palette entry is `""`, so this turns each
+    /// styling call into a single predictable branch instead of a memcpy.
+    pub fn write(self: *Out, s: []const u8) void {
+        if (s.len == 0) return;
+        if (s.len > self.buf.len - self.len) {
+            self.flush();
+            if (s.len > self.buf.len) {
+                // Bigger than the whole buffer: hand it straight to the file
+                // rather than growing without bound.
+                self.file.writeStreamingAll(debug_io, s) catch {};
+                return;
+            }
+        }
+        @memcpy(self.buf[self.len..][0..s.len], s);
+        self.len += s.len;
+    }
+
+    pub fn writeByte(self: *Out, c: u8) void {
+        if (self.len == self.buf.len) self.flush();
+        self.buf[self.len] = c;
+        self.len += 1;
+    }
+
+    /// Writes `s` wrapped in `style`, resetting afterwards. No-ops the escapes
+    /// when colour is off.
+    pub fn writeStyled(self: *Out, style: []const u8, s: []const u8) void {
+        self.write(style);
+        self.write(s);
+        self.write(self.theme.palette.reset);
+    }
+
+    pub fn print(self: *Out, comptime fmt: []const u8, args: anytype) void {
+        var buf: [256]u8 = undefined;
+        const printed = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        self.write(printed);
+    }
+
+    pub fn flush(self: *Out) void {
+        if (self.len == 0) return;
+        self.file.writeStreamingAll(debug_io, self.buf[0..self.len]) catch {};
+        self.len = 0;
+    }
+};
 
 /// Cached analysis of a single log line.
 /// Computed once per line by `analyzeLine` and reused by all filters and the printer.
@@ -49,7 +131,7 @@ pub const LineInfo = struct {
 /// JSON lines are walked once via `analyzeJsonInPlace` which extracts level,
 /// date, time, and level_pos in a single pass — the previous implementation
 /// performed up to 4 full `extractJsonField` scans (one per candidate key).
-fn analyzeLine(line: []const u8) LineInfo {
+fn analyzeLine(line: []const u8, want_timestamps: bool) LineInfo {
     var info: LineInfo = .{
         .format = .plain_unknown,
         .level = null,
@@ -72,8 +154,12 @@ fn analyzeLine(line: []const u8) LineInfo {
         return info;
     }
 
-    info.date = extractDate(line);
-    info.time = extractTime(line);
+    // Two full scans of the line that only pay off if a date/time filter is
+    // active or the output format carries them. Skipped otherwise.
+    if (want_timestamps) {
+        info.date = extractDate(line);
+        info.time = extractTime(line);
+    }
 
     if (info.starts_with_bracket) {
         info.format = .plain_bracketed;
@@ -303,31 +389,11 @@ fn timeWithinValue(value: []const u8) ?[]const u8 {
     return null;
 }
 
-/// ANSI escape codes for terminal coloring.
-/// Theme: GitHub Dark palette on terminal background #0d1117.
-const Color = struct {
-    pub const reset = "\x1b[0m";
-    pub const dim = "\x1b[2m";
-
-    /// Main text: #e6edf3
-    pub const text = "\x1b[38;2;230;237;243m";
-    /// Dim/muted text: #8b949e
-    pub const muted = "\x1b[38;2;139;148;158m";
-
-    /// JSON key: #58a6ff
-    pub const json_key = "\x1b[38;2;88;166;255m";
-    /// JSON string value: #a5d6ff
-    pub const json_string = "\x1b[38;2;165;214;255m";
-    /// JSON number: #79c0ff
-    pub const json_number = "\x1b[38;2;121;192;255m";
-    /// JSON true/false/null: #56d364
-    pub const json_bool_null = "\x1b[38;2;86;211;100m";
-
-    /// Search highlight fg: #ffd700
-    pub const search_fg = "\x1b[38;2;255;215;0m";
-    /// Search underline: dotted
-    pub const search_underline = "\x1b[4:3m";
-};
+// The palette lives in `theme.zig`. It is resolved once at startup from the
+// terminal's advertised capabilities rather than hard-coded, because the
+// previous fixed GitHub-Dark table was unreadable on a light background
+// (contrast as low as 1.18:1 against white) and printed raw escape bytes on
+// terminals without 24-bit colour.
 
 /// Byte range of a level value within a line.
 const LevelPos = struct {
@@ -378,6 +444,51 @@ pub const CheckedLine = struct {
 /// to the original bytes so nothing is silently truncated.
 const filter_strip_buf_size: usize = 16 * 1024;
 
+/// Expands JSON found inside a log message into an indented, coloured block
+/// printed under the line.
+///
+/// Owns the scratch used to decode escaped payloads, so expansion costs no
+/// allocation once the reader is running. One instance is shared by a whole
+/// read loop.
+pub const JsonExpander = struct {
+    limits: jsonx.Limits = .{},
+    /// Un-escape target for JSON carried as a string value. Sized to the
+    /// largest region `limits` will expand, so a payload that passes
+    /// validation always fits.
+    scratch: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, limits: jsonx.Limits) !JsonExpander {
+        return .{
+            .limits = limits,
+            .scratch = try allocator.alloc(u8, limits.max_bytes),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *JsonExpander) void {
+        self.allocator.free(self.scratch);
+        self.* = undefined;
+    }
+
+    /// Expands raw JSON embedded in a plain-text line, searching from `from`
+    /// (the end of the level token) so a bracketed prefix can't be mistaken
+    /// for a payload.
+    pub fn expandPlain(self: *JsonExpander, out: *Out, line: []const u8, from: usize) void {
+        const span = jsonx.find(line, from, self.limits) orelse return;
+        jsonx.writeBlock(out, out.theme, span.slice(line), self.limits);
+    }
+
+    /// Expands JSON carried as an escaped string value of a JSON log line.
+    /// Silently does nothing when the value turns out not to be JSON after
+    /// decoding — the compact line already showed it verbatim.
+    pub fn expandEscaped(self: *JsonExpander, out: *Out, value: []const u8) void {
+        const decoded = jsonx.unescape(self.scratch, value) orelse return;
+        if (jsonx.validate(decoded, self.limits) == null) return;
+        jsonx.writeBlock(out, out.theme, decoded, self.limits);
+    }
+};
+
 pub const FilterState = struct {
     has_date_filter: bool,
     date_range: DateRange,
@@ -391,12 +502,21 @@ pub const FilterState = struct {
     regex_list: regex.RegexList,
     search_expr: ?[]const u8,
     output_json: bool,
+    /// Whether `analyzeLine` has to extract the date and time.
+    needs_timestamps: bool = true,
+    /// Sink used by `printIfMatch` / `printChecked`. Null for filter-only use.
+    out: ?*Out = null,
+    /// Null disables embedded-JSON expansion.
+    expander: ?*JsonExpander = null,
     strip_buf: [filter_strip_buf_size]u8 = undefined,
 
     /// Builds a `FilterState` from parsed CLI arguments.
     /// Tries to compile regex; falls back to literal matching on failure.
     /// Date filtering is disabled in tail mode.
-    pub fn init(args: flags.Args) FilterState {
+    ///
+    /// `out` and `expander` may be null for filter-only use (tests, and
+    /// gzip's collecting sink); `printIfMatch` then does nothing.
+    pub fn init(args: flags.Args, out: ?*Out, expander: ?*JsonExpander) FilterState {
         const has_date = !args.tail_mode and args.date != null;
         const has_time = !args.tail_mode and (args.from_time != null or args.to_time != null);
         const has_search = args.search != null;
@@ -421,6 +541,13 @@ pub const FilterState = struct {
             .regex_list = rx_list,
             .search_expr = args.search,
             .output_json = args.output_json,
+            // `analyzeLine` only needs the date and time when something
+            // downstream will read them. Skipping the two scans on every
+            // plain-text line is pure win when neither filter is active and
+            // output isn't JSON.
+            .needs_timestamps = has_date or has_time or args.output_json,
+            .out = out,
+            .expander = expander,
         };
     }
 
@@ -445,7 +572,7 @@ pub const FilterState = struct {
             if (!matchSearch(line, self.search_expr.?)) return null;
         }
 
-        const info = analyzeLine(line);
+        const info = analyzeLine(line, self.needs_timestamps);
 
         if (self.has_level_filter) {
             const lvl = info.level orelse return null;
@@ -464,7 +591,8 @@ pub const FilterState = struct {
     }
 
     /// Convenience wrapper: filter and print in one call.
-    /// Intended for tail.zig so it does not need to import `LineInfo` or `printStyledLine`.
+    /// Intended for tail.zig so it does not need to import `LineInfo` or
+    /// `printStyledLine`.
     pub fn printIfMatch(self: *FilterState, line: []const u8) void {
         if (self.checkLine(line)) |ck| self.printChecked(ck.line, ck.info);
     }
@@ -473,9 +601,10 @@ pub const FilterState = struct {
     /// that have already run `checkLine` use this to skip a second parse.
     /// `line` must be the (possibly stripped) `CheckedLine.line` — passing
     /// the raw input undoes the ANSI stripping done in `checkLine`.
-    pub fn printChecked(self: *const FilterState, line: []const u8, info: LineInfo) void {
+    pub fn printChecked(self: *FilterState, line: []const u8, info: LineInfo) void {
+        const out = self.out orelse return;
         if (self.output_json) {
-            printJsonOutputLine(line, info);
+            printJsonOutputLine(out, line, info);
             return;
         }
         var match_buf: [max_search_matches]MatchRange = undefined;
@@ -483,7 +612,7 @@ pub const FilterState = struct {
             findSearchMatches(line, self.search_expr.?, &match_buf)
         else
             &.{};
-        printStyledLine(line, info, matches);
+        printStyledLine(out, line, info, matches, self.expander);
     }
 };
 
@@ -498,28 +627,21 @@ pub const LevelCounter = struct {
     }
 
     /// Print a colored summary of matched line counts per level.
-    pub fn print(self: LevelCounter) void {
+    pub fn print(self: LevelCounter, out: *Out) void {
         if (self.total == 0) return;
         const levels = [_]flags.Level{ .Trace, .Debug, .Info, .Warn, .Error, .Fatal, .Panic };
         for (levels) |lvl| {
             const n = self.counts[@intFromEnum(lvl)];
             if (n == 0) continue;
-            const style = levelStyle(lvl);
-            writeOut(style.bg);
-            writeOut(style.fg);
-            writeOut("\u{2009}");
-            writeLevelLabel(@tagName(lvl));
-            var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, " {d}", .{n}) catch continue;
-            writeOut(s);
-            writeOut("\u{2009}");
-            writeOut(Color.reset);
+            out.write(out.theme.levelStyle(lvl));
+            out.write(" ");
+            writeUpperPadded(out, @tagName(lvl), 5);
+            out.print(" {d} ", .{n});
+            out.write(out.theme.palette.reset);
         }
-        var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "  total {d}\n", .{self.total}) catch return;
-        writeOut(Color.dim);
-        writeOut(s);
-        writeOut(Color.reset);
+        out.write(out.theme.palette.dim);
+        out.print("  total {d}\n", .{self.total});
+        out.write(out.theme.palette.reset);
     }
 };
 
@@ -586,91 +708,35 @@ pub const Aggregator = struct {
 
     /// Print all aggregated entries in first-seen order.
     /// If `page_size > 0`, paginate the aggregated output.
-    fn printAll(self: *Aggregator, output: *OutputBuffer, page_size: usize, output_json: bool) !void {
+    fn printAll(self: *Aggregator, out: *Out, page_size: usize, output_json: bool, expander: ?*JsonExpander) void {
         var batch: usize = 0;
         var page: usize = 1;
 
+        // Iterate the entry pointers stored alongside the key order rather
+        // than re-hashing every key to fetch its entry.
         for (self.order.items) |key| {
-            const entry = self.entries.get(key).?;
+            const entry = self.entries.getPtr(key) orelse continue;
             if (output_json) {
-                try printJsonOutputLineBuffered(output, entry.sample_line, entry.sample_info);
+                printJsonOutputLine(out, entry.sample_line, entry.sample_info);
             } else {
-                try printAggregatePrefix(output, entry.count);
-                try printStyledLineBuffered(output, entry.sample_line, entry.sample_info, &.{});
+                out.write(out.theme.palette.dim);
+                out.print("[x{d}] ", .{entry.count});
+                out.write(out.theme.palette.reset);
+                printStyledLine(out, entry.sample_line, entry.sample_info, &.{}, expander);
             }
 
             if (page_size > 0) {
                 batch += 1;
                 if (batch >= page_size) {
-                    try output.flush();
-                    printPaginationPrompt(page, batch);
+                    out.flush();
+                    printPaginationPrompt(out, page, batch);
+                    out.flush();
                     waitForEnter();
-                    clearScreen();
+                    clearScreen(out);
                     batch = 0;
                     page += 1;
                 }
             }
-        }
-    }
-};
-
-/// Print `[xN] ` prefix before an aggregated line.
-fn printAggregatePrefix(output: *OutputBuffer, count: usize) !void {
-    try output.write(Color.dim);
-    try output.print("[x{d}] ", .{count});
-    try output.write(Color.reset);
-}
-
-/// Write-buffered wrapper around a `std.Io.File`.
-/// Accumulates output in a heap-allocated `ArrayList` and flushes automatically
-/// when the buffer reaches `max_size` or on `deinit`.
-///
-/// Zig 0.15.2 note: `File.writer(buf)` requires an explicit `[]u8` scratch buffer
-/// and `ArrayList.writer()` requires the allocator at the call site. Both are
-/// avoided here by caching the allocator and using `appendSlice` directly.
-const OutputBuffer = struct {
-    allocator: std.mem.Allocator,
-    buffer: std.ArrayList(u8),
-    file: std.Io.File,
-    max_size: usize,
-
-    fn init(allocator: std.mem.Allocator, file: std.Io.File) !OutputBuffer {
-        return .{
-            .allocator = allocator,
-            .buffer = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024),
-            .file = file,
-            .max_size = 64 * 1024,
-        };
-    }
-
-    fn deinit(self: *OutputBuffer) void {
-        self.flush() catch {};
-        self.buffer.deinit(self.allocator);
-    }
-
-    /// Formats and appends text to the internal buffer, flushing if full.
-    fn print(self: *OutputBuffer, comptime fmt: []const u8, args: anytype) !void {
-        var buf: [256]u8 = undefined;
-        const printed = try std.fmt.bufPrint(&buf, fmt, args);
-        try self.buffer.appendSlice(self.allocator, printed);
-        if (self.buffer.items.len >= self.max_size) try self.flush();
-    }
-
-    /// Appends a raw byte slice to the internal buffer, flushing if full.
-    fn write(self: *OutputBuffer, s: []const u8) !void {
-        if (s.len >= self.max_size) {
-            try self.flush();
-            try self.file.writeStreamingAll(debug_io, s);
-            return;
-        }
-        try self.buffer.appendSlice(self.allocator, s);
-        if (self.buffer.items.len >= self.max_size) try self.flush();
-    }
-
-    fn flush(self: *OutputBuffer) !void {
-        if (self.buffer.items.len > 0) {
-            try self.file.writeStreamingAll(debug_io, self.buffer.items);
-            self.buffer.clearRetainingCapacity();
         }
     }
 };
@@ -804,21 +870,18 @@ fn matchTimeRange(time: ?[]const u8, from_time: ?[]const u8, to_time: ?[]const u
 }
 
 /// Background + foreground ANSI codes for a log level.
-const LevelStyle = struct {
-    bg: []const u8,
-    fg: []const u8,
-};
-
-/// Maps a log level to its background and foreground ANSI codes.
-inline fn levelStyle(lvl: flags.Level) LevelStyle {
-    return switch (lvl) {
-        .Trace => .{ .bg = "\x1b[48;2;48;54;61m", .fg = "\x1b[38;2;139;148;158m" },
-        .Debug => .{ .bg = "\x1b[48;2;26;58;92m", .fg = "\x1b[38;2;88;166;255m" },
-        .Info => .{ .bg = "\x1b[48;2;26;61;43m", .fg = "\x1b[38;2;63;185;80m" },
-        .Warn => .{ .bg = "\x1b[48;2;61;46;0m", .fg = "\x1b[38;2;227;179;65m" },
-        .Error => .{ .bg = "\x1b[48;2;61;26;26m", .fg = "\x1b[38;2;248;81;73m" },
-        .Fatal, .Panic => .{ .bg = "\x1b[48;2;248;81;73m", .fg = "\x1b[38;2;255;255;255m" },
-    };
+/// Emits a level badge: the level name uppercased and padded to a uniform
+/// width, wrapped in that level's colours.
+///
+/// Padding uses plain spaces rather than U+2009 THIN SPACE — the old choice
+/// rendered as a replacement box on Windows consoles and in terminals with a
+/// narrow font fallback.
+fn writeLevelBadge(out: *Out, lvl: flags.Level, label: []const u8) void {
+    out.write(out.theme.levelStyle(lvl));
+    out.write(" ");
+    writeUpperPadded(out, label, 5);
+    out.write(" ");
+    out.write(out.theme.palette.reset);
 }
 
 /// Upper bound for a single logical line. Logs are line-oriented; a line
@@ -854,23 +917,25 @@ fn getOptimalBufferSize(file: std.Io.File) usize {
         256 * 1024; // ≤ 10 MB  → 256 KB
 }
 
-/// Entry point for reading a log file with filtering and colored output.
-/// Dispatches to pagination or continuous streaming based on `args.num_lines`.
-/// Public entry point called by main.zig.
+/// Entry point for reading log files with filtering and coloured output.
 /// Dispatches to tail follow mode, gzip, pagination, or continuous streaming.
-pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args) !void {
+pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args, th: *const Theme) !void {
     if (args.tail_mode) {
-        try tail_reader.follow(allocator, args);
+        try tail_reader.follow(allocator, args, th);
         return;
     }
+
+    var out = try Out.init(allocator, std.Io.File.stdout(), th);
+    defer out.deinit();
+
     var counter = LevelCounter{};
     for (args.files) |path| {
-        try readStreaming(allocator, path, args, &counter);
+        try readStreaming(allocator, path, args, &counter, &out);
     }
-    if (!args.output_json) counter.print();
+    if (!args.output_json) counter.print(&out);
 }
 
-/// Read a log file with filtering and colored output.
+/// Read one log file with filtering and coloured output.
 /// If aggregation is enabled, matched lines are grouped by `args.aggregate_mode`.
 /// If `args.num_lines > 0`, paginates the output; otherwise streams continuously.
 pub fn readStreaming(
@@ -878,310 +943,185 @@ pub fn readStreaming(
     path: []const u8,
     args: flags.Args,
     counter: *LevelCounter,
+    out: *Out,
 ) !void {
+    var expander: ?JsonExpander = if (wantsJsonExpansion(args, out.theme))
+        try JsonExpander.init(allocator, .{})
+    else
+        null;
+    defer if (expander) |*x| x.deinit();
+    const expander_ptr: ?*JsonExpander = if (expander) |*x| x else null;
+
+    var filter_state = FilterState.init(args, out, expander_ptr);
+    defer filter_state.deinit();
+
     if (gzip.isGzip(path)) {
-        var filter_state = FilterState.init(args);
-        defer filter_state.deinit();
         try gzip.readGzip(allocator, path, args, &filter_state, buildAggregateKeyForLine);
         return;
     }
 
+    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
+    defer file.close(debug_io);
+
     if (args.aggregate) {
-        try readAggregated(allocator, path, args, counter);
+        var handler = try AggregateHandler.init(allocator, args, counter, &filter_state, out, expander_ptr);
+        defer handler.deinit();
+        try scanLines(allocator, file, &handler);
+        handler.finish();
         return;
     }
 
-    if (args.num_lines > 0) {
-        try readWithPagination(allocator, path, args, counter);
-    } else {
-        try readContinuous(allocator, path, args, counter);
-    }
+    var handler = PrintHandler{
+        .args = args,
+        .counter = counter,
+        .filter_state = &filter_state,
+        .out = out,
+        .paginate = args.num_lines > 0,
+    };
+    try scanLines(allocator, file, &handler);
 }
 
-fn keepUnprocessedTail(
-    allocator: std.mem.Allocator,
-    carry: *std.ArrayList(u8),
-    slice: []const u8,
-    start: usize,
-    used_carry: bool,
-) !void {
-    if (used_carry) {
-        if (start < carry.items.len) {
-            const rest = carry.items[start..];
-            std.mem.copyForwards(u8, carry.items[0..rest.len], rest);
-            carry.items.len = rest.len;
-        } else {
-            carry.clearRetainingCapacity();
-        }
-        return;
-    }
-
-    carry.clearRetainingCapacity();
-    if (start < slice.len) {
-        try ensureLineCapacity(0, slice.len - start);
-        try carry.appendSlice(allocator, slice[start..]);
-    }
-}
-
-/// Read the whole file, aggregate identical matched lines, and print them once.
+/// Whether embedded JSON should be expanded for this run.
 ///
-/// Aggregation is applied after all active filters.
-/// Output keeps the order of the first occurrence of each unique line.
-fn readAggregated(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    args: flags.Args,
-    counter: *LevelCounter,
-) !void {
-    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
-    defer file.close(debug_io);
+/// Off for `--output json` (the consumer is a program, not a person) and off
+/// when the output isn't a terminal, so redirecting to a file still produces
+/// one record per line.
+fn wantsJsonExpansion(args: flags.Args, th: *const Theme) bool {
+    if (args.no_expand_json or args.output_json) return false;
+    return th.colored;
+}
 
-    const buffer_size = getOptimalBufferSize(file);
-    const buffer = try allocator.alloc(u8, buffer_size);
-    defer allocator.free(buffer);
+/// Splits `file` into lines and hands each to `handler.line(bytes)`.
+///
+/// One buffer holds both the freshly read bytes and the partial line left
+/// over from the previous read: the leftover is compacted to the front and
+/// the next read fills in behind it. The previous design kept a separate
+/// `carry` list and appended each whole read chunk into it whenever a line
+/// straddled a boundary — which, since the last line of a chunk almost never
+/// ends exactly on the boundary, meant memcpy-ing the entire file a second
+/// time.
+///
+/// The slice handed to `handler.line` stays valid only until the next read.
+fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) !void {
+    var buf = try allocator.alloc(u8, getOptimalBufferSize(file));
+    defer allocator.free(buf);
 
-    var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
-    defer carry.deinit(allocator);
-
-    var filter_state = FilterState.init(args);
-    defer filter_state.deinit();
-
-    var aggregator = try Aggregator.init(allocator);
-    defer aggregator.deinit();
-
-    // Reusable scratch buffer for non-.exact key building — one allocation
-    // for the whole file instead of one per matched line.
-    var key_scratch: std.ArrayList(u8) = .empty;
-    defer key_scratch.deinit(allocator);
-
-    var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
-    defer output.deinit();
+    // Bytes of an unfinished line sitting at the front of `buf`.
+    var carry: usize = 0;
 
     while (true) {
-        const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
+        const n = file.readStreaming(debug_io, &.{buf[carry..]}) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
         if (n == 0) break;
 
-        var slice = buffer[0..n];
-
-        const used_carry = carry.items.len > 0;
-        if (used_carry) {
-            try ensureLineCapacity(carry.items.len, slice.len);
-            try carry.appendSlice(allocator, slice);
-            slice = carry.items;
-        }
-
+        const filled = buf[0 .. carry + n];
         var start: usize = 0;
-
-        while (true) {
-            const nl = simd.findByte(slice, start, '\n') orelse break;
-            const line = slice[start..nl];
-
-            // Reuse LineInfo from checkLine to avoid re-parsing in buildAggregateKey.
-            if (filter_state.checkLine(line)) |ck| {
-                if (ck.info.level) |lvl| counter.add(lvl);
-                const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, ck.line, ck.info);
-                try aggregator.add(key, ck.line, ck.info);
-            }
-
+        while (simd.findByte(filled, start, '\n')) |nl| {
+            try handler.line(filled[start..nl]);
             start = nl + 1;
         }
 
-        try keepUnprocessedTail(allocator, &carry, slice, start, used_carry);
-    }
+        const rest = filled.len - start;
+        if (rest > 0 and start > 0) std.mem.copyForwards(u8, buf[0..rest], filled[start..]);
+        carry = rest;
 
-    // Process final line if present (no trailing newline).
-    if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items)) |ck| {
-            if (ck.info.level) |lvl| counter.add(lvl);
-            const key = try buildAggregateKey(allocator, &key_scratch, args.aggregate_mode, ck.line, ck.info);
-            try aggregator.add(key, ck.line, ck.info);
+        // A whole buffer with no newline in it: the line is longer than the
+        // buffer, so grow rather than stall. `max_line_bytes` bounds this.
+        if (carry == buf.len) {
+            try ensureLineCapacity(buf.len, buf.len);
+            buf = try allocator.realloc(buf, buf.len * 2);
         }
     }
 
-    try aggregator.printAll(&output, args.num_lines, args.output_json);
+    if (carry > 0) try handler.line(buf[0..carry]);
 }
 
-/// Streams a log file continuously, printing each matching line as it is read.
-fn readContinuous(
-    allocator: std.mem.Allocator,
-    path: []const u8,
+/// Line handler for the streaming and paginated modes.
+const PrintHandler = struct {
     args: flags.Args,
     counter: *LevelCounter,
-) !void {
-    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
-    defer file.close(debug_io);
+    filter_state: *FilterState,
+    out: *Out,
+    paginate: bool,
+    batch: usize = 0,
+    page: usize = 1,
 
-    const buffer_size = getOptimalBufferSize(file);
-    const buffer = try allocator.alloc(u8, buffer_size);
-    defer allocator.free(buffer);
+    fn line(self: *PrintHandler, bytes: []const u8) !void {
+        const ck = self.filter_state.checkLine(bytes) orelse return;
+        if (ck.info.level) |lvl| self.counter.add(lvl);
+        self.filter_state.printChecked(ck.line, ck.info);
 
-    // Accumulates bytes from the end of one read that did not form a complete line.
-    var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
-    defer carry.deinit(allocator);
-
-    var filter_state = FilterState.init(args);
-    defer filter_state.deinit();
-
-    var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
-    defer output.deinit();
-
-    while (true) {
-        const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-
-        var slice = buffer[0..n];
-
-        const used_carry = carry.items.len > 0;
-        if (used_carry) {
-            try ensureLineCapacity(carry.items.len, slice.len);
-            try carry.appendSlice(allocator, slice);
-            slice = carry.items;
-        }
-
-        var start: usize = 0;
-
-        while (true) {
-            const nl = simd.findByte(slice, start, '\n') orelse break;
-            const line = slice[start..nl];
-
-            if (filter_state.checkLine(line)) |ck| {
-                if (ck.info.level) |lvl| counter.add(lvl);
-                if (args.output_json) {
-                    try printJsonOutputLineBuffered(&output, ck.line, ck.info);
-                } else {
-                    var match_buf: [max_search_matches]MatchRange = undefined;
-                    const matches: []const MatchRange = if (filter_state.has_search_filter)
-                        findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
-                    else
-                        &.{};
-                    try printStyledLineBuffered(&output, ck.line, ck.info, matches);
-                }
-            }
-
-            start = nl + 1;
-        }
-
-        try keepUnprocessedTail(allocator, &carry, slice, start, used_carry);
-    }
-
-    if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items)) |ck| {
-            if (ck.info.level) |lvl| counter.add(lvl);
-            if (args.output_json) {
-                try printJsonOutputLineBuffered(&output, ck.line, ck.info);
-            } else {
-                var match_buf: [max_search_matches]MatchRange = undefined;
-                const matches: []const MatchRange = if (filter_state.has_search_filter)
-                    findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
-                else
-                    &.{};
-                try printStyledLineBuffered(&output, ck.line, ck.info, matches);
-            }
+        if (!self.paginate) return;
+        self.batch += 1;
+        if (self.batch >= self.args.num_lines) {
+            self.out.flush();
+            printPaginationPrompt(self.out, self.page, self.batch);
+            self.out.flush();
+            waitForEnter();
+            clearScreen(self.out);
+            self.batch = 0;
+            self.page += 1;
         }
     }
-}
+};
 
-/// Reads a log file in pages of `args.num_lines` matching lines,
-/// pausing between pages and waiting for the user to press Enter.
-fn readWithPagination(
+/// Line handler for `--aggregate`: groups matched lines and prints once at
+/// the end.
+const AggregateHandler = struct {
     allocator: std.mem.Allocator,
-    path: []const u8,
     args: flags.Args,
     counter: *LevelCounter,
-) !void {
-    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
-    defer file.close(debug_io);
+    filter_state: *FilterState,
+    out: *Out,
+    expander: ?*JsonExpander,
+    aggregator: Aggregator,
+    /// Reusable scratch for non-`.exact` key building — one allocation for
+    /// the whole file instead of one per matched line.
+    key_scratch: std.ArrayList(u8) = .empty,
 
-    const buffer_size = getOptimalBufferSize(file);
-    const buffer = try allocator.alloc(u8, buffer_size);
-    defer allocator.free(buffer);
-
-    var carry = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
-    defer carry.deinit(allocator);
-
-    var filter_state = FilterState.init(args);
-    defer filter_state.deinit();
-
-    var output = try OutputBuffer.init(allocator, std.Io.File.stdout());
-    defer output.deinit();
-
-    var batch: usize = 0;
-    var page: usize = 1;
-
-    while (true) {
-        const n = file.readStreaming(debug_io, &.{buffer}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
+    fn init(
+        allocator: std.mem.Allocator,
+        args: flags.Args,
+        counter: *LevelCounter,
+        filter_state: *FilterState,
+        out: *Out,
+        expander: ?*JsonExpander,
+    ) !AggregateHandler {
+        return .{
+            .allocator = allocator,
+            .args = args,
+            .counter = counter,
+            .filter_state = filter_state,
+            .out = out,
+            .expander = expander,
+            .aggregator = try Aggregator.init(allocator),
         };
-        if (n == 0) break;
-
-        var slice = buffer[0..n];
-        const used_carry = carry.items.len > 0;
-        if (used_carry) {
-            try ensureLineCapacity(carry.items.len, slice.len);
-            try carry.appendSlice(allocator, slice);
-            slice = carry.items;
-        }
-
-        var start: usize = 0;
-
-        while (true) {
-            const nl = simd.findByte(slice, start, '\n') orelse break;
-            const line = slice[start..nl];
-
-            if (filter_state.checkLine(line)) |ck| {
-                if (ck.info.level) |lvl| counter.add(lvl);
-                if (args.output_json) {
-                    try printJsonOutputLineBuffered(&output, ck.line, ck.info);
-                } else {
-                    var match_buf: [max_search_matches]MatchRange = undefined;
-                    const matches: []const MatchRange = if (filter_state.has_search_filter)
-                        findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
-                    else
-                        &.{};
-                    try printStyledLineBuffered(&output, ck.line, ck.info, matches);
-                }
-                batch += 1;
-
-                if (batch >= args.num_lines) {
-                    try output.flush();
-                    printPaginationPrompt(page, batch);
-                    waitForEnter();
-                    clearScreen();
-                    batch = 0;
-                    page += 1;
-                }
-            }
-
-            start = nl + 1;
-        }
-
-        try keepUnprocessedTail(allocator, &carry, slice, start, used_carry);
     }
 
-    // Flush any final line that had no trailing newline.
-    if (carry.items.len > 0) {
-        if (filter_state.checkLine(carry.items)) |ck| {
-            if (ck.info.level) |lvl| counter.add(lvl);
-            if (args.output_json) {
-                try printJsonOutputLineBuffered(&output, ck.line, ck.info);
-            } else {
-                var match_buf: [max_search_matches]MatchRange = undefined;
-                const matches: []const MatchRange = if (filter_state.has_search_filter)
-                    findSearchMatches(ck.line, filter_state.search_expr.?, &match_buf)
-                else
-                    &.{};
-                try printStyledLineBuffered(&output, ck.line, ck.info, matches);
-            }
-        }
+    fn deinit(self: *AggregateHandler) void {
+        self.key_scratch.deinit(self.allocator);
+        self.aggregator.deinit();
     }
-}
+
+    fn line(self: *AggregateHandler, bytes: []const u8) !void {
+        const ck = self.filter_state.checkLine(bytes) orelse return;
+        if (ck.info.level) |lvl| self.counter.add(lvl);
+        const key = try buildAggregateKey(
+            self.allocator,
+            &self.key_scratch,
+            self.args.aggregate_mode,
+            ck.line,
+            ck.info,
+        );
+        try self.aggregator.add(key, ck.line, ck.info);
+    }
+
+    fn finish(self: *AggregateHandler) void {
+        self.aggregator.printAll(self.out, self.args.num_lines, self.args.output_json, self.expander);
+    }
+};
 
 /// Extracts the log level from a line without a full `analyzeLine` call.
 /// Used in contexts where only the level is needed (e.g. unit tests).
@@ -1237,7 +1177,9 @@ pub fn buildAggregateKeyForLine(
     mode: flags.AggregateMode,
     line: []const u8,
 ) ![]const u8 {
-    return buildAggregateKey(allocator, scratch, mode, line, analyzeLine(line));
+    // Callers of this entry point (gzip) have no cached LineInfo, so the
+    // timestamps are extracted here rather than assumed present.
+    return buildAggregateKey(allocator, scratch, mode, line, analyzeLine(line, true));
 }
 
 /// Build a key from `level + message` into `scratch`.
@@ -1472,37 +1414,16 @@ fn skipJsonValue(line: []const u8, start: usize) usize {
     return i;
 }
 
-/// Writes bytes to stdout in uppercase. Anything past the stack buffer is
-/// truncated — log levels are always short, and a malformed 100-char level
-/// field mustn't cause 100 syscalls to stdout.
-fn writeUpper(bytes: []const u8) void {
-    var buf: [256]u8 = undefined;
+/// Writes `bytes` uppercased and right-padded to `width` characters, so level
+/// badges line up. Anything past the stack buffer is truncated — levels are
+/// always short, and a malformed 100-character level field mustn't turn into
+/// 100 separate appends.
+fn writeUpperPadded(out: *Out, bytes: []const u8, width: usize) void {
+    var buf: [16]u8 = undefined;
     const n = @min(bytes.len, buf.len);
     for (bytes[0..n], 0..) |b, j| buf[j] = std.ascii.toUpper(b);
-    writeOut(buf[0..n]);
-}
-
-/// Buffered version of `writeUpper`.
-fn writeUpperBuffered(output: *OutputBuffer, bytes: []const u8) !void {
-    var buf: [256]u8 = undefined;
-    const n = @min(bytes.len, buf.len);
-    for (bytes[0..n], 0..) |b, j| buf[j] = std.ascii.toUpper(b);
-    try output.write(buf[0..n]);
-}
-
-/// Writes a log level label in uppercase, right-padded to 5 characters
-/// (e.g. "INFO " or "ERROR") for uniform block width.
-fn writeLevelLabel(bytes: []const u8) void {
-    writeUpper(bytes);
-    var i: usize = bytes.len;
-    while (i < 5) : (i += 1) writeOut(" ");
-}
-
-/// Buffered version of `writeLevelLabel`.
-fn writeLevelLabelBuffered(output: *OutputBuffer, bytes: []const u8) !void {
-    try writeUpperBuffered(output, bytes);
-    var i: usize = bytes.len;
-    while (i < 5) : (i += 1) try output.write(" ");
+    out.write(buf[0..n]);
+    if (n < width) out.write("     "[0 .. width - n]);
 }
 
 /// Finds all non-overlapping search matches for `expr` in `line`.
@@ -1567,66 +1488,50 @@ fn charAtIgnoreCase(line: []const u8, pos: usize, needle: []const u8) bool {
     return true;
 }
 
-/// Prints a log line to stdout with ANSI coloring appropriate for its format.
-/// Falls back to plain writeAll for lines with no recognized level.
+/// Prints a log line with colouring appropriate for its format, then — when
+/// enabled — the expanded JSON block for any JSON embedded in its message.
 ///
 /// Plain-text lines end in `\n\n` (blank line between entries) so consecutive
 /// syslog-style records don't visually merge; JSON output keeps the compact
 /// single-`\n` termination expected by pipeline consumers.
-fn printStyledLine(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
+fn printStyledLine(out: *Out, line: []const u8, info: LineInfo, search_matches: []const MatchRange, expand: ?*JsonExpander) void {
     if (line.len == 0) return;
 
     if (info.is_json) {
-        printJsonStyled(line, info, search_matches);
+        printJsonStyled(out, line, info, search_matches, expand);
     } else if (info.level != null) {
-        printPlainTextWithLevel(line, info, search_matches);
+        printPlainTextWithLevel(out, line, info, search_matches, expand);
     } else {
-        writeRangeHighlightedIn(line, 0, line.len, search_matches, Color.text);
-        writeOut("\n\n");
+        writeRangeHighlightedIn(out, line, 0, line.len, search_matches, out.theme.palette.text);
+        out.write("\n");
+        if (expand) |x| x.expandPlain(out, line, 0);
+        out.write("\n");
     }
 }
 
-/// Buffered version of `printStyledLine`, used in read loops to reduce syscalls.
-fn printStyledLineBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
-    if (line.len == 0) return;
-
-    if (info.is_json) {
-        try printJsonStyledBuffered(output, line, info, search_matches);
-    } else if (info.level != null) {
-        try printPlainTextWithLevelBuffered(output, line, info, search_matches);
-    } else {
-        try writeRangeHighlightedInBuffered(output, line, 0, line.len, search_matches, Color.text);
-        try output.write("\n\n");
-    }
+/// Writes a byte range of `line`, inserting search-highlight escapes around
+/// `matches` that fall inside the range.
+fn writeRangeHighlighted(out: *Out, line: []const u8, start: usize, end: usize, matches: []const MatchRange) void {
+    writeRangeHighlightedIn(out, line, start, end, matches, "");
 }
 
-/// Writes a byte range of `line` to stdout, inserting search highlight
-/// ANSI codes around `matches` that fall within the range.
-fn writeRangeHighlighted(line: []const u8, start: usize, end: usize, matches: []const MatchRange) void {
-    writeRangeHighlightedIn(line, start, end, matches, "");
-}
-
-/// Buffered version of `writeRangeHighlighted`.
-fn writeRangeHighlightedBuffered(output: *OutputBuffer, line: []const u8, start: usize, end: usize, matches: []const MatchRange) !void {
-    try writeRangeHighlightedInBuffered(output, line, start, end, matches, "");
-}
-
-/// Same as `writeRangeHighlighted`, but wraps the entire output in
-/// `wrap_color` (e.g. `Color.muted`) and re-applies it after each search
-/// highlight so `Color.reset` inside the highlight doesn't leak through and
-/// leave the tail uncolored.
+/// Same as `writeRangeHighlighted`, but wraps the whole range in `wrap_color`
+/// and re-applies it after each highlight so the `reset` that closes a
+/// highlight doesn't leave the tail uncoloured.
 fn writeRangeHighlightedIn(
+    out: *Out,
     line: []const u8,
     start: usize,
     end: usize,
     matches: []const MatchRange,
     wrap_color: []const u8,
 ) void {
+    const reset = out.theme.palette.reset;
     const wrapped = wrap_color.len > 0;
-    if (wrapped) writeOut(wrap_color);
+    if (wrapped) out.write(wrap_color);
     if (matches.len == 0) {
-        writeOut(line[start..end]);
-        if (wrapped) writeOut(Color.reset);
+        out.write(line[start..end]);
+        if (wrapped) out.write(reset);
         return;
     }
     var pos = start;
@@ -1635,130 +1540,28 @@ fn writeRangeHighlightedIn(
         if (m.start >= end) break;
         const seg_start = @max(pos, m.start);
         const seg_end = @min(end, m.end);
-        if (pos < seg_start) writeOut(line[pos..seg_start]);
-        writeOut(Color.search_fg);
-        writeOut(Color.search_underline);
-        writeOut(line[seg_start..seg_end]);
-        writeOut(Color.reset);
-        if (wrapped) writeOut(wrap_color);
+        if (pos < seg_start) out.write(line[pos..seg_start]);
+        out.write(out.theme.palette.match_on);
+        out.write(line[seg_start..seg_end]);
+        out.write(reset);
+        if (wrapped) out.write(wrap_color);
         pos = seg_end;
     }
-    if (pos < end) writeOut(line[pos..end]);
-    if (wrapped) writeOut(Color.reset);
-}
-
-/// Buffered version of `writeRangeHighlightedIn`.
-fn writeRangeHighlightedInBuffered(
-    output: *OutputBuffer,
-    line: []const u8,
-    start: usize,
-    end: usize,
-    matches: []const MatchRange,
-    wrap_color: []const u8,
-) !void {
-    const wrapped = wrap_color.len > 0;
-    if (wrapped) try output.write(wrap_color);
-    if (matches.len == 0) {
-        try output.write(line[start..end]);
-        if (wrapped) try output.write(Color.reset);
-        return;
-    }
-    var pos = start;
-    for (matches) |m| {
-        if (m.end <= pos) continue;
-        if (m.start >= end) break;
-        const seg_start = @max(pos, m.start);
-        const seg_end = @min(end, m.end);
-        if (pos < seg_start) try output.write(line[pos..seg_start]);
-        try output.write(Color.search_fg);
-        try output.write(Color.search_underline);
-        try output.write(line[seg_start..seg_end]);
-        try output.write(Color.reset);
-        if (wrapped) try output.write(wrap_color);
-        pos = seg_end;
-    }
-    if (pos < end) try output.write(line[pos..end]);
-    if (wrapped) try output.write(Color.reset);
+    if (pos < end) out.write(line[pos..end]);
+    if (wrapped) out.write(reset);
 }
 
 /// Prints a line as JSON (JSONL format) for pipeline compatibility.
-/// Unbuffered JSON output used by `FilterState.printChecked` when a
-/// long-lived `OutputBuffer` is not in scope (tail-follow, gzip paths).
-/// Builds into a 16 KiB stack buffer and flushes in chunks — the common
-/// case of a short log line emits exactly one syscall.
-fn printJsonOutputLine(line: []const u8, info: LineInfo) void {
+fn printJsonOutputLine(out: *Out, line: []const u8, info: LineInfo) void {
     const lvl = if (info.level) |l| @tagName(l) else "";
     const date = if (info.date) |d| d else "";
     const time = if (info.time) |t| t else "";
 
-    var buf: [16 * 1024]u8 = undefined;
-    var len: usize = 0;
-    const stdout = std.Io.File.stdout();
+    out.print("{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time });
 
-    const Sink = struct {
-        fn flush(f: std.Io.File, b: []u8, l: *usize) void {
-            if (l.* == 0) return;
-            f.writeStreamingAll(debug_io, b[0..l.*]) catch {};
-            l.* = 0;
-        }
-        fn writeChunk(f: std.Io.File, b: []u8, l: *usize, s: []const u8) void {
-            if (s.len > b.len) {
-                flush(f, b, l);
-                f.writeStreamingAll(debug_io, s) catch {};
-                return;
-            }
-            if (l.* + s.len > b.len) flush(f, b, l);
-            @memcpy(b[l.* .. l.* + s.len], s);
-            l.* += s.len;
-        }
-    };
-
-    var prefix_buf: [256]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time }) catch return;
-    Sink.writeChunk(stdout, &buf, &len, prefix);
-
-    var run_start: usize = 0;
-    var i: usize = 0;
-    while (i < line.len) : (i += 1) {
-        const c = line[i];
-        const needs_escape = switch (c) {
-            '"', '\\', '\n', '\r', '\t', 0...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => true,
-            else => false,
-        };
-        if (!needs_escape) continue;
-        if (i > run_start) Sink.writeChunk(stdout, &buf, &len, line[run_start..i]);
-        switch (c) {
-            '"' => Sink.writeChunk(stdout, &buf, &len, "\\\""),
-            '\\' => Sink.writeChunk(stdout, &buf, &len, "\\\\"),
-            '\n' => Sink.writeChunk(stdout, &buf, &len, "\\n"),
-            '\r' => Sink.writeChunk(stdout, &buf, &len, "\\r"),
-            '\t' => Sink.writeChunk(stdout, &buf, &len, "\\t"),
-            else => {
-                var esc: [6]u8 = undefined;
-                const s = std.fmt.bufPrint(&esc, "\\u{X:0>4}", .{c}) catch continue;
-                Sink.writeChunk(stdout, &buf, &len, s);
-            },
-        }
-        run_start = i + 1;
-    }
-    if (run_start < line.len) Sink.writeChunk(stdout, &buf, &len, line[run_start..]);
-    Sink.writeChunk(stdout, &buf, &len, "\"}\n");
-    Sink.flush(stdout, &buf, &len);
-}
-
-/// Buffered JSON output: writes the line into `output` rather than directly
-/// to stdout. Used by the read loops (which already own an `OutputBuffer`)
-/// so JSON output gets the same syscall amortization as colored output.
-fn printJsonOutputLineBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo) !void {
-    const lvl = if (info.level) |l| @tagName(l) else "";
-    const date = if (info.date) |d| d else "";
-    const time = if (info.time) |t| t else "";
-
-    try output.print("{{\"level\":\"{s}\",\"date\":\"{s}\",\"time\":\"{s}\",\"raw\":\"", .{ lvl, date, time });
-
-    // Walk the line in runs of safe (no-escape) bytes and flush each run as
-    // a single write. Saves one switch + buffer-append per byte for the
-    // common case (printable ASCII).
+    // Walk the line in runs of safe (no-escape) bytes and flush each run as a
+    // single write. Saves one switch plus one append per byte for the common
+    // case of printable ASCII.
     var run_start: usize = 0;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
@@ -1769,114 +1572,71 @@ fn printJsonOutputLineBuffered(output: *OutputBuffer, line: []const u8, info: Li
         };
         if (!needs_escape) continue;
 
-        if (i > run_start) try output.write(line[run_start..i]);
+        if (i > run_start) out.write(line[run_start..i]);
         switch (c) {
-            '"' => try output.write("\\\""),
-            '\\' => try output.write("\\\\"),
-            '\n' => try output.write("\\n"),
-            '\r' => try output.write("\\r"),
-            '\t' => try output.write("\\t"),
+            '"' => out.write("\\\""),
+            '\\' => out.write("\\\\"),
+            '\n' => out.write("\\n"),
+            '\r' => out.write("\\r"),
+            '\t' => out.write("\\t"),
             else => {
                 var esc: [6]u8 = undefined;
                 const s = std.fmt.bufPrint(&esc, "\\u{X:0>4}", .{c}) catch continue;
-                try output.write(s);
+                out.write(s);
             },
         }
         run_start = i + 1;
     }
-    if (run_start < line.len) try output.write(line[run_start..]);
-    try output.write("\"}\n");
+    if (run_start < line.len) out.write(line[run_start..]);
+    out.write("\"}\n");
 }
 
 /// Writes a plain-text line with the level token highlighted.
 ///
 /// Three modes, in order of priority:
 ///   1. `info.rewrite` set → INSERT mode. Prefix `[0..insert_at]` is muted,
-///      the level block is emitted (label from `@tagName(info.level.?)`), then
-///      the "clean" tail `[insert_at..truncate_at]` is printed as text and the
-///      remainder is dropped. Used by the gRPC error heuristic.
+///      the level badge is emitted, then the "clean" tail
+///      `[insert_at..truncate_at]` is printed as text and the rest dropped.
+///      Used by the gRPC error heuristic.
 ///   2. `info.level_pos` set → REPLACE mode. Prefix muted, level bytes
-///      replaced by the coloured block, suffix printed as text.
+///      replaced by the badge, suffix printed as text.
 ///   3. Neither → whole line printed as text.
-///
-/// Every plain-text line ends in `\n\n` so consecutive syslog records don't
-/// visually merge — the extra blank keeps the eye able to segment entries.
-fn printPlainTextWithLevel(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
-    const style = levelStyle(info.level.?);
+fn printPlainTextWithLevel(out: *Out, line: []const u8, info: LineInfo, search_matches: []const MatchRange, expand: ?*JsonExpander) void {
+    const lvl = info.level.?;
+    const p = out.theme.palette;
 
     if (info.rewrite) |rw| {
-        if (rw.insert_at > 0) writeRangeHighlightedIn(line, 0, rw.insert_at, search_matches, Color.muted);
-        writeOut(style.bg);
-        writeOut(style.fg);
-        writeOut("\u{2009}");
-        writeLevelLabel(@tagName(info.level.?));
-        writeOut("\u{2009}");
-        writeOut(Color.reset);
+        if (rw.insert_at > 0) writeRangeHighlightedIn(out, line, 0, rw.insert_at, search_matches, p.muted);
+        writeLevelBadge(out, lvl, @tagName(lvl));
         if (rw.insert_at < rw.truncate_at) {
-            writeOut(" ");
-            writeRangeHighlightedIn(line, rw.insert_at, rw.truncate_at, search_matches, Color.text);
+            out.write(" ");
+            writeRangeHighlightedIn(out, line, rw.insert_at, rw.truncate_at, search_matches, p.text);
         }
-        writeOut("\n\n");
+        out.write("\n");
+        if (expand) |x| x.expandPlain(out, line[0..rw.truncate_at], rw.insert_at);
+        out.write("\n");
         return;
     }
 
     if (info.level_pos) |r| {
-        if (r.start > 0) writeRangeHighlightedIn(line, 0, r.start, search_matches, Color.muted);
-        writeOut(style.bg);
-        writeOut(style.fg);
-        writeOut("\u{2009}");
-        writeLevelLabel(line[r.start..r.end]);
-        writeOut("\u{2009}");
-        writeOut(Color.reset);
-        if (r.end < line.len) writeRangeHighlightedIn(line, r.end, line.len, search_matches, Color.text);
-        writeOut("\n\n");
+        if (r.start > 0) writeRangeHighlightedIn(out, line, 0, r.start, search_matches, p.muted);
+        writeLevelBadge(out, lvl, line[r.start..r.end]);
+        if (r.end < line.len) writeRangeHighlightedIn(out, line, r.end, line.len, search_matches, p.text);
+        out.write("\n");
+        if (expand) |x| x.expandPlain(out, line, r.end);
+        out.write("\n");
         return;
     }
 
-    writeRangeHighlightedIn(line, 0, line.len, search_matches, Color.text);
-    writeOut("\n\n");
-}
-
-/// Buffered version of `printPlainTextWithLevel`. Semantics identical.
-fn printPlainTextWithLevelBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
-    const style = levelStyle(info.level.?);
-
-    if (info.rewrite) |rw| {
-        if (rw.insert_at > 0) try writeRangeHighlightedInBuffered(output, line, 0, rw.insert_at, search_matches, Color.muted);
-        try output.write(style.bg);
-        try output.write(style.fg);
-        try output.write("\u{2009}");
-        try writeLevelLabelBuffered(output, @tagName(info.level.?));
-        try output.write("\u{2009}");
-        try output.write(Color.reset);
-        if (rw.insert_at < rw.truncate_at) {
-            try output.write(" ");
-            try writeRangeHighlightedInBuffered(output, line, rw.insert_at, rw.truncate_at, search_matches, Color.text);
-        }
-        try output.write("\n\n");
-        return;
-    }
-
-    if (info.level_pos) |r| {
-        if (r.start > 0) try writeRangeHighlightedInBuffered(output, line, 0, r.start, search_matches, Color.muted);
-        try output.write(style.bg);
-        try output.write(style.fg);
-        try output.write("\u{2009}");
-        try writeLevelLabelBuffered(output, line[r.start..r.end]);
-        try output.write("\u{2009}");
-        try output.write(Color.reset);
-        if (r.end < line.len) try writeRangeHighlightedInBuffered(output, line, r.end, line.len, search_matches, Color.text);
-        try output.write("\n\n");
-        return;
-    }
-
-    try writeRangeHighlightedInBuffered(output, line, 0, line.len, search_matches, Color.text);
-    try output.write("\n\n");
+    writeRangeHighlightedIn(out, line, 0, line.len, search_matches, p.text);
+    out.write("\n");
+    if (expand) |x| x.expandPlain(out, line, 0);
+    out.write("\n");
 }
 
 /// Returns true if the byte at `i` in `line` is an unescaped `"`.
-/// Handles `\\\"` sequences by counting consecutive preceding backslashes:
-/// an even count means the backslashes are themselves escaped, so the `"` is unescaped.
+/// Handles `\\\"` by counting consecutive preceding backslashes: an even
+/// count means the backslashes escape each other, so the `"` is unescaped.
 inline fn isUnescapedQuote(line: []const u8, i: usize) bool {
     if (line[i] != '"') return false;
     var backslashes: usize = 0;
@@ -1888,57 +1648,70 @@ inline fn isUnescapedQuote(line: []const u8, i: usize) bool {
     return backslashes % 2 == 0;
 }
 
-/// Writes a JSON log line to stdout with syntax highlighting.
-/// Keys use `Color.json_key`, strings `Color.json_string`, numbers
-/// `Color.json_number`, booleans and nulls `Color.json_bool_null`.
-/// The `"level"` value gets a background + foreground color from `levelStyle`.
-fn printJsonStyled(line: []const u8, info: LineInfo, search_matches: []const MatchRange) void {
+/// Writes a JSON log line with syntax highlighting.
+///
+/// Bytes that need no styling are accumulated into runs and emitted with one
+/// append each. The previous version wrote every brace, comma and space as
+/// its own one-byte call, which for a typical record meant dozens of appends
+/// (and, on the unbuffered path, dozens of syscalls) per line.
+fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: []const MatchRange, expand: ?*JsonExpander) void {
+    const p = out.theme.palette;
     var i: usize = 0;
     var in_string = false;
     var str_start: usize = 0;
-    var scratch: [1]u8 = undefined;
+    // Start of the current run of unstyled bytes, flushed lazily.
+    var plain_start: usize = 0;
+    // Message-embedded JSON found while walking; expanded after the line so
+    // the compact overview stays on one line.
+    var nested: ?[]const u8 = null;
 
     while (i < line.len) {
         const c = line[i];
 
         if (isUnescapedQuote(line, i)) {
             if (!in_string) {
+                // Flush the plain bytes before the quote. The quoted token is
+                // emitted whole once we reach its closing quote, so the
+                // opening quote must not leak into the run.
+                if (i > plain_start) out.write(line[plain_start..i]);
                 in_string = true;
                 str_start = i + 1;
-            } else {
+                i += 1;
+                plain_start = i;
+                continue;
+            }
+            {
                 in_string = false;
                 const str = line[str_start..i];
 
                 if (info.level_pos) |lp| {
                     if (str_start == lp.start and i == lp.end) {
-                        const style = levelStyle(info.level.?);
-                        writeOut(style.bg);
-                        writeOut(style.fg);
-                        writeOut("\u{2009}");
-                        writeLevelLabel(str);
-                        writeOut("\u{2009}");
-                        writeOut(Color.reset);
+                        writeLevelBadge(out, info.level.?, str);
                         i += 1;
+                        plain_start = i;
                         continue;
                     }
                 }
 
-                // Detect whether this string is a JSON key (followed by ':').
+                // A key is a string followed by `:`.
                 var j = i + 1;
                 while (j < line.len and line[j] == ' ') : (j += 1) {}
-                if (j < line.len and line[j] == ':') {
-                    writeOut(Color.json_key);
-                    writeOut("\"");
-                    writeRangeHighlighted(line, str_start, i, search_matches);
-                    writeOut("\"");
-                    writeOut(Color.reset);
-                } else {
-                    writeOut(Color.json_string);
-                    writeOut("\"");
-                    writeRangeHighlighted(line, str_start, i, search_matches);
-                    writeOut("\"");
-                    writeOut(Color.reset);
+                const is_key = j < line.len and line[j] == ':';
+                out.write(if (is_key) p.json_key else p.json_string);
+                out.write("\"");
+                writeRangeHighlighted(out, line, str_start, i, search_matches);
+                out.write("\"");
+                out.write(p.reset);
+
+                if (!is_key and expand != null and nested == null and
+                    jsonx.looksLikeNestedObject(str, .{}))
+                {
+                    nested = str;
                 }
+
+                i += 1;
+                plain_start = i;
+                continue;
             }
             i += 1;
             continue;
@@ -1950,6 +1723,7 @@ fn printJsonStyled(line: []const u8, info: LineInfo, search_matches: []const Mat
         }
 
         if (isDigit(c) or c == '-') {
+            if (i > plain_start) out.write(line[plain_start..i]);
             const start = i;
             i += 1;
             while (i < line.len and
@@ -1957,180 +1731,54 @@ fn printJsonStyled(line: []const u8, info: LineInfo, search_matches: []const Mat
                     line[i] == 'e' or line[i] == 'E' or
                     line[i] == '+' or line[i] == '-')) : (i += 1)
             {}
-            writeOut(Color.json_number);
-            writeRangeHighlighted(line, start, i, search_matches);
-            writeOut(Color.reset);
+            out.write(p.json_number);
+            writeRangeHighlighted(out, line, start, i, search_matches);
+            out.write(p.reset);
+            plain_start = i;
             continue;
         }
 
-        if (matchWord(line, i, "true")) {
-            writeOut(Color.json_bool_null);
-            writeRangeHighlighted(line, i, i + 4, search_matches);
-            writeOut(Color.reset);
-            i += 4;
-            continue;
-        }
-        if (matchWord(line, i, "false")) {
-            writeOut(Color.json_bool_null);
-            writeRangeHighlighted(line, i, i + 5, search_matches);
-            writeOut(Color.reset);
-            i += 5;
-            continue;
-        }
-        if (matchWord(line, i, "null")) {
-            writeOut(Color.json_bool_null);
-            writeRangeHighlighted(line, i, i + 4, search_matches);
-            writeOut(Color.reset);
-            i += 4;
+        const word_len: usize = if (matchWord(line, i, "true"))
+            4
+        else if (matchWord(line, i, "false"))
+            5
+        else if (matchWord(line, i, "null"))
+            4
+        else
+            0;
+        if (word_len != 0) {
+            if (i > plain_start) out.write(line[plain_start..i]);
+            out.write(p.json_bool_null);
+            writeRangeHighlighted(out, line, i, i + word_len, search_matches);
+            out.write(p.reset);
+            i += word_len;
+            plain_start = i;
             continue;
         }
 
-        switch (c) {
-            '{', '}' => {
-                scratch[0] = c;
-                writeOut(Color.dim);
-                writeOut(scratch[0..1]);
-                writeOut(Color.reset);
-            },
-            ':' => {
-                writeOut(Color.muted);
-                writeOut(":");
-                writeOut(Color.reset);
-            },
-            else => {
-                scratch[0] = c;
-                writeOut(scratch[0..1]);
-            },
-        }
         i += 1;
     }
 
-    writeOut("\n");
-}
-
-/// Buffered version of `printJsonStyled`, used in read loops to reduce syscalls.
-fn printJsonStyledBuffered(output: *OutputBuffer, line: []const u8, info: LineInfo, search_matches: []const MatchRange) !void {
-    var i: usize = 0;
-    var in_string = false;
-    var str_start: usize = 0;
-    var scratch: [1]u8 = undefined;
-
-    while (i < line.len) {
-        const c = line[i];
-
-        if (isUnescapedQuote(line, i)) {
-            if (!in_string) {
-                in_string = true;
-                str_start = i + 1;
-            } else {
-                in_string = false;
-                const str = line[str_start..i];
-
-                if (info.level_pos) |lp| {
-                    if (str_start == lp.start and i == lp.end) {
-                        const style = levelStyle(info.level.?);
-                        try output.write(style.bg);
-                        try output.write(style.fg);
-                        try output.write("\u{2009}");
-                        try writeLevelLabelBuffered(output, str);
-                        try output.write("\u{2009}");
-                        try output.write(Color.reset);
-                        i += 1;
-                        continue;
-                    }
-                }
-
-                var j = i + 1;
-                while (j < line.len and line[j] == ' ') : (j += 1) {}
-                if (j < line.len and line[j] == ':') {
-                    try output.write(Color.json_key);
-                    try output.write("\"");
-                    try writeRangeHighlightedBuffered(output, line, str_start, i, search_matches);
-                    try output.write("\"");
-                    try output.write(Color.reset);
-                } else {
-                    try output.write(Color.json_string);
-                    try output.write("\"");
-                    try writeRangeHighlightedBuffered(output, line, str_start, i, search_matches);
-                    try output.write("\"");
-                    try output.write(Color.reset);
-                }
-            }
-            i += 1;
-            continue;
+    if (plain_start < line.len) out.write(line[plain_start..]);
+    out.write("\n");
+    if (nested) |value| {
+        if (expand) |x| {
+            x.expandEscaped(out, value);
+            // Blank line after an expanded block, so the next record doesn't
+            // butt up against the gutter. Unexpanded JSON output keeps its
+            // compact one-line-per-record shape.
+            out.write("\n");
         }
-
-        if (in_string) {
-            i += 1;
-            continue;
-        }
-
-        if (isDigit(c) or c == '-') {
-            const start = i;
-            i += 1;
-            while (i < line.len and
-                (isDigit(line[i]) or line[i] == '.' or
-                    line[i] == 'e' or line[i] == 'E' or
-                    line[i] == '+' or line[i] == '-')) : (i += 1)
-            {}
-            try output.write(Color.json_number);
-            try writeRangeHighlightedBuffered(output, line, start, i, search_matches);
-            try output.write(Color.reset);
-            continue;
-        }
-
-        if (matchWord(line, i, "true")) {
-            try output.write(Color.json_bool_null);
-            try writeRangeHighlightedBuffered(output, line, i, i + 4, search_matches);
-            try output.write(Color.reset);
-            i += 4;
-            continue;
-        }
-        if (matchWord(line, i, "false")) {
-            try output.write(Color.json_bool_null);
-            try writeRangeHighlightedBuffered(output, line, i, i + 5, search_matches);
-            try output.write(Color.reset);
-            i += 5;
-            continue;
-        }
-        if (matchWord(line, i, "null")) {
-            try output.write(Color.json_bool_null);
-            try writeRangeHighlightedBuffered(output, line, i, i + 4, search_matches);
-            try output.write(Color.reset);
-            i += 4;
-            continue;
-        }
-
-        switch (c) {
-            '{', '}' => {
-                scratch[0] = c;
-                try output.write(Color.dim);
-                try output.write(scratch[0..1]);
-                try output.write(Color.reset);
-            },
-            ':' => {
-                try output.write(Color.muted);
-                try output.write(":");
-                try output.write(Color.reset);
-            },
-            else => {
-                scratch[0] = c;
-                try output.write(scratch[0..1]);
-            },
-        }
-        i += 1;
     }
-
-    try output.write("\n");
 }
 
-/// Prints a pagination prompt to stdout after each full page.
-inline fn printPaginationPrompt(page: usize, count: usize) void {
-    var buf: [128]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\n{s}--- Page {d}: {d} lines | Press Enter...{s}\n", .{
-        Color.dim, page, count, Color.reset,
-    }) catch return;
-    writeOut(s);
+/// Prints a pagination prompt after each full page.
+fn printPaginationPrompt(out: *Out, page: usize, count: usize) void {
+    out.write("\n");
+    out.write(out.theme.palette.dim);
+    out.print("--- Page {d}: {d} lines | Press Enter...", .{ page, count });
+    out.write(out.theme.palette.reset);
+    out.write("\n");
 }
 
 /// Blocks until the user presses Enter (reads one byte from stdin).
@@ -2139,10 +1787,13 @@ fn waitForEnter() void {
     _ = std.Io.File.stdin().readStreaming(debug_io, &.{&buf}) catch {};
 }
 
-/// Clears the terminal screen if stdout is a TTY.
-fn clearScreen() void {
-    const stdout = std.Io.File.stdout();
-    if (stdout.isTty(debug_io) catch false) writeOut("\x1b[2J\x1b[H");
+/// Clears the terminal screen. Only meaningful when the output is a styled
+/// terminal — the theme already encodes that, so redirecting to a file no
+/// longer injects a clear-screen sequence into it.
+fn clearScreen(out: *Out) void {
+    if (!out.theme.colored) return;
+    out.write("\x1b[2J\x1b[H");
+    out.flush();
 }
 
 /// Matches `line` against a search expression.
@@ -2241,6 +1892,53 @@ fn containsIgnoreCaseScalar(hay: []const u8, needle: []const u8) bool {
 // Unit Tests
 // ============================================================================
 
+/// Renders into memory so printer tests can assert on exact bytes without
+/// touching stdout.
+const TestOut = struct {
+    th: theme.Theme,
+    out: Out = undefined,
+
+    /// Two-phase on purpose: `out.theme` points back into this struct, so it
+    /// can only be set once the struct sits at its final address. Returning a
+    /// fully-built value from `init` would leave that pointer dangling.
+    fn start(self: *TestOut) !void {
+        self.out = .{
+            // Never actually written to: tests drain the buffer with `take`
+            // and every fixture is far below `Out.capacity`.
+            .file = std.Io.File.stdout(),
+            .theme = &self.th,
+            .buf = try std.testing.allocator.alloc(u8, Out.capacity),
+            .allocator = std.testing.allocator,
+        };
+    }
+
+    fn deinit(self: *TestOut) void {
+        std.testing.allocator.free(self.out.buf);
+    }
+
+    /// Returns everything buffered so far and resets, without flushing.
+    fn take(self: *TestOut) ![]u8 {
+        const copy = try std.testing.allocator.dupe(u8, self.out.buf[0..self.out.len]);
+        self.out.len = 0;
+        return copy;
+    }
+};
+
+/// Renders one line through the real printer under the plain theme.
+fn renderLine(line: []const u8, expand_json: bool) ![]u8 {
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    var expander: ?JsonExpander = if (expand_json)
+        try JsonExpander.init(std.testing.allocator, .{})
+    else
+        null;
+    defer if (expander) |*x| x.deinit();
+    const info = analyzeLine(line, true);
+    printStyledLine(&h.out, line, info, &.{}, if (expander) |*x| x else null);
+    return h.take();
+}
+
 test "parseDateRange should parse single date" {
     const range = parseDateRange("2023-10-15");
     try std.testing.expectEqualStrings("2023-10-15", range.from.?);
@@ -2322,7 +2020,7 @@ test "extractDate should extract ISO date from bracketed prefix" {
 
 test "buildAggregateKey exact returns borrowed slice into line" {
     const line = "[ERROR] Connection failed";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(std.testing.allocator);
     const key = try buildAggregateKey(std.testing.allocator, &scratch, .exact, line, info);
@@ -2334,7 +2032,7 @@ test "buildAggregateKey exact returns borrowed slice into line" {
 
 test "buildAggregateKey level_message uses level + message" {
     const line = "[ERROR] Connection failed";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(std.testing.allocator);
     const key = try buildAggregateKey(std.testing.allocator, &scratch, .level_message, line, info);
@@ -2440,7 +2138,7 @@ test "FilterState.init should initialize from args" {
         .search = "error",
         .num_lines = 0,
     };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.has_date_filter);
     try std.testing.expect(state.has_level_filter);
@@ -2458,7 +2156,7 @@ test "FilterState.checkLine should filter by level" {
         .search = null,
         .num_lines = 0,
     };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expectEqual(flags.Level.Error, state.checkLine("[ERROR] Something went wrong").?.info.level.?);
     try std.testing.expect(state.checkLine("[INFO] Everything is fine") == null);
@@ -2470,7 +2168,7 @@ test "FilterState.checkLine handles JSON non-string fields before level" {
         .files = &file,
         .levels = flags.levelBit(.Error),
     };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
 
     const ck = state.checkLine("{\"pid\":123,\"ok\":true,\"level\":\"error\",\"msg\":\"failed\"}").?;
@@ -2487,7 +2185,7 @@ test "FilterState.checkLine should filter by search" {
         .search = "connection",
         .num_lines = 0,
     };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.checkLine("[ERROR] Connection failed") != null);
     try std.testing.expect(state.checkLine("[INFO] Operation successful") == null);
@@ -2503,7 +2201,7 @@ test "FilterState.checkLine should filter by date" {
         .search = null,
         .num_lines = 0,
     };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     const in_range = "{\"time\":\"2023-10-18T12:00:00Z\",\"level\":\"info\",\"msg\":\"test\"}";
     try std.testing.expect(state.checkLine(in_range) != null);
@@ -2511,14 +2209,33 @@ test "FilterState.checkLine should filter by date" {
     try std.testing.expect(state.checkLine(out_of_range) == null);
 }
 
-test "levelStyle should return correct bg+fg codes" {
-    try std.testing.expectEqualStrings("\x1b[48;2;61;26;26m", levelStyle(.Error).bg);
-    try std.testing.expectEqualStrings("\x1b[48;2;248;81;73m", levelStyle(.Fatal).bg);
-    try std.testing.expectEqualStrings("\x1b[48;2;248;81;73m", levelStyle(.Panic).bg);
-    try std.testing.expectEqualStrings("\x1b[48;2;61;46;0m", levelStyle(.Warn).bg);
-    try std.testing.expectEqualStrings("\x1b[48;2;26;61;43m", levelStyle(.Info).bg);
-    try std.testing.expectEqualStrings("\x1b[48;2;26;58;92m", levelStyle(.Debug).bg);
-    try std.testing.expectEqualStrings("\x1b[48;2;48;54;61m", levelStyle(.Trace).bg);
+test "level badges are distinct per level and padded to a fixed width" {
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    try h.start();
+    defer h.deinit();
+
+    var seen: [7][]const u8 = undefined;
+    const levels = [_]flags.Level{ .Trace, .Debug, .Info, .Warn, .Error, .Fatal, .Panic };
+    for (levels, 0..) |lvl, i| {
+        seen[i] = h.out.theme.levelStyle(lvl);
+        try std.testing.expect(seen[i].len > 0);
+    }
+    // Fatal and Panic deliberately share a badge; everything else is distinct.
+    try std.testing.expect(!std.mem.eql(u8, seen[0], seen[1]));
+    try std.testing.expect(!std.mem.eql(u8, seen[2], seen[3]));
+    try std.testing.expect(!std.mem.eql(u8, seen[3], seen[4]));
+
+    writeLevelBadge(&h.out, .Info, "info");
+    const a = try h.take();
+    defer std.testing.allocator.free(a);
+    writeLevelBadge(&h.out, .Error, "error");
+    const b = try h.take();
+    defer std.testing.allocator.free(b);
+    // " INFO  " and " ERROR " — same visible width either way.
+    try std.testing.expect(std.mem.indexOf(u8, a, " INFO  ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b, " ERROR ") != null);
+    // Never U+2009: it renders as a box on Windows consoles.
+    try std.testing.expect(std.mem.indexOf(u8, a, "\u{2009}") == null);
 }
 
 // --- isUnescapedQuote ---
@@ -2548,11 +2265,11 @@ test "Aggregator counts identical lines and preserves first-seen order" {
     var agg = try Aggregator.init(std.testing.allocator);
     defer agg.deinit();
 
-    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
-    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two"));
-    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
-    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one"));
-    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two"));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one", true));
+    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two", true));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one", true));
+    try agg.add("[ERROR] one", "[ERROR] one", analyzeLine("[ERROR] one", true));
+    try agg.add("[WARN] two", "[WARN] two", analyzeLine("[WARN] two", true));
 
     try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
     try std.testing.expectEqualStrings("[ERROR] one", agg.order.items[0]);
@@ -2575,7 +2292,7 @@ test "FilterState with aggregation semantics still filters before counting" {
         .aggregate = true,
     };
 
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
 
     try std.testing.expect(state.checkLine("[ERROR] Connection failed") != null);
@@ -2654,9 +2371,9 @@ test "Aggregator groups by key and keeps first sample line" {
 
     const key = "error\x1fConnection failed";
 
-    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed"));
-    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed"));
-    try agg.add(key, "[ERROR] Connection failed at retry", analyzeLine("[ERROR] Connection failed at retry"));
+    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed", true));
+    try agg.add(key, "[ERROR] Connection failed", analyzeLine("[ERROR] Connection failed", true));
+    try agg.add(key, "[ERROR] Connection failed at retry", analyzeLine("[ERROR] Connection failed at retry", true));
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
     try std.testing.expectEqual(@as(usize, 3), agg.entries.get(key).?.count);
@@ -2674,11 +2391,11 @@ test "level_message aggregation groups same message with different timestamps" {
 
     {
         const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .level_message, line1);
-        try agg.add(key, line1, analyzeLine(line1));
+        try agg.add(key, line1, analyzeLine(line1, true));
     }
     {
         const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .level_message, line2);
-        try agg.add(key, line2, analyzeLine(line2));
+        try agg.add(key, line2, analyzeLine(line2, true));
     }
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
@@ -2697,11 +2414,11 @@ test "json_message aggregation separates different messages" {
 
     {
         const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .json_message, line1);
-        try agg.add(key, line1, analyzeLine(line1));
+        try agg.add(key, line1, analyzeLine(line1, true));
     }
     {
         const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .json_message, line2);
-        try agg.add(key, line2, analyzeLine(line2));
+        try agg.add(key, line2, analyzeLine(line2, true));
     }
 
     try std.testing.expectEqual(@as(usize, 2), agg.order.items.len);
@@ -2718,11 +2435,11 @@ test "normalized aggregation groups noisy numeric variants" {
 
     {
         const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .normalized, line1);
-        try agg.add(key, line1, analyzeLine(line1));
+        try agg.add(key, line1, analyzeLine(line1, true));
     }
     {
         const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .normalized, line2);
-        try agg.add(key, line2, analyzeLine(line2));
+        try agg.add(key, line2, analyzeLine(line2, true));
     }
 
     try std.testing.expectEqual(@as(usize, 1), agg.order.items.len);
@@ -2739,7 +2456,7 @@ test "extractLogfmtField extracts quoted and unquoted values" {
 
 test "extractMessage uses logfmt message field" {
     const line = "level=error message=\"connection failed\"";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
 
     const msg = extractMessage(line, info).?;
     try std.testing.expectEqualStrings("connection failed", msg);
@@ -2747,7 +2464,7 @@ test "extractMessage uses logfmt message field" {
 
 test "extractMessage uses plain tail after bracketed level" {
     const line = "[ERROR] connection failed";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
 
     const msg = extractMessage(line, info).?;
     try std.testing.expectEqualStrings("connection failed", msg);
@@ -2838,31 +2555,31 @@ test "isValidDateString: invalid inputs" {
 
 test "extractPlainMessage: strips bracketed prefix with colon" {
     const line = "[ERROR]: connection failed";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     try std.testing.expectEqualStrings("connection failed", extractPlainMessage(line, info).?);
 }
 
 test "extractPlainMessage: strips bracketed prefix with dash" {
     const line = "[WARN] - something happened";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     try std.testing.expectEqualStrings("something happened", extractPlainMessage(line, info).?);
 }
 
 test "extractPlainMessage: returns full line without brackets" {
     const line = "Just a plain message";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     try std.testing.expectEqualStrings("Just a plain message", extractPlainMessage(line, info).?);
 }
 
 test "extractPlainMessage: bracket-only line" {
     const line = "[ERROR]";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     try std.testing.expect(extractPlainMessage(line, info) == null);
 }
 
 test "buildNormalizedKey: collapses digits and spaces" {
     const line = "error code 12345 at line 99";
-    _ = analyzeLine(line);
+    _ = analyzeLine(line, true);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(std.testing.allocator);
     const key = try buildNormalizedKey(std.testing.allocator, &scratch, line);
@@ -2871,7 +2588,7 @@ test "buildNormalizedKey: collapses digits and spaces" {
 
 test "buildNormalizedKey: replaces ISO date" {
     const line = "request 2023-10-18 failed";
-    _ = analyzeLine(line);
+    _ = analyzeLine(line, true);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(std.testing.allocator);
     const key = try buildNormalizedKey(std.testing.allocator, &scratch, line);
@@ -2880,7 +2597,7 @@ test "buildNormalizedKey: replaces ISO date" {
 
 test "buildNormalizedKey: collapses multiple spaces" {
     const line = "error    multiple    spaces";
-    _ = analyzeLine(line);
+    _ = analyzeLine(line, true);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(std.testing.allocator);
     const key = try buildNormalizedKey(std.testing.allocator, &scratch, line);
@@ -2956,7 +2673,7 @@ test "FilterState: time filter rejects early time" {
         .from_time = "14:00",
         .to_time = "15:00",
     };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.checkLine("2023-10-15T14:30:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-15T13:00:00Z [INFO] msg") == null);
@@ -2966,7 +2683,7 @@ test "FilterState: time filter rejects early time" {
 test "FilterState: --from only" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .from_time = "14:00" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.checkLine("2023-10-15T15:00:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-15T13:00:00Z [INFO] msg") == null);
@@ -2975,7 +2692,7 @@ test "FilterState: --from only" {
 test "FilterState: time filter disabled in tail mode" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .tail_mode = true, .from_time = "14:00" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(!state.has_time_filter);
 }
@@ -2983,7 +2700,7 @@ test "FilterState: time filter disabled in tail mode" {
 test "FilterState: date + time combined filter" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .date = "2023-10-15", .from_time = "14:00", .to_time = "15:00" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.checkLine("2023-10-15T14:30:00Z [INFO] msg") != null);
     try std.testing.expect(state.checkLine("2023-10-16T14:30:00Z [INFO] msg") == null);
@@ -3040,19 +2757,78 @@ test "Aggregator drops new keys past max_aggregate_keys cap" {
     try std.testing.expectEqual(@as(usize, 2), agg.entries.get("k0").?.count);
 }
 
-test "keepUnprocessedTail compacts carry without self-copy append" {
-    var carry = try std.ArrayList(u8).initCapacity(std.testing.allocator, 16);
-    defer carry.deinit(std.testing.allocator);
-    try carry.appendSlice(std.testing.allocator, "hello partial");
+test "scanLines splits on newlines across read boundaries" {
+    // The scanner reads into the tail of one buffer and compacts the
+    // leftover to the front. A line straddling a boundary must come back
+    // whole, exactly once.
+    const Collect = struct {
+        seen: std.ArrayList([]u8) = .empty,
+        fn line(self: *@This(), bytes: []const u8) !void {
+            try self.seen.append(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
+        }
+        fn deinit(self: *@This()) void {
+            for (self.seen.items) |x| std.testing.allocator.free(x);
+            self.seen.deinit(std.testing.allocator);
+        }
+    };
 
-    try keepUnprocessedTail(std.testing.allocator, &carry, carry.items, 6, true);
-    try std.testing.expectEqualStrings("partial", carry.items);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Lines long enough that several reads are needed, with no trailing
+    // newline on the last one.
+    var expected: std.ArrayList([]u8) = .empty;
+    defer {
+        for (expected.items) |x| std.testing.allocator.free(x);
+        expected.deinit(std.testing.allocator);
+    }
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(std.testing.allocator);
+    for (0..500) |i| {
+        var buf: [512]u8 = undefined;
+        const ln = try std.fmt.bufPrint(&buf, "line {d} {s}", .{ i, "x" ** 300 });
+        try expected.append(std.testing.allocator, try std.testing.allocator.dupe(u8, ln));
+        try content.appendSlice(std.testing.allocator, ln);
+        if (i != 499) try content.append(std.testing.allocator, '\n');
+    }
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "scan.log", .data = content.items });
+
+    const file = try tmp.dir.openFile(debug_io, "scan.log", .{});
+    defer file.close(debug_io);
+
+    var collect = Collect{};
+    defer collect.deinit();
+    try scanLines(std.testing.allocator, file, &collect);
+
+    try std.testing.expectEqual(expected.items.len, collect.seen.items.len);
+    for (expected.items, collect.seen.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "scanLines rejects a line past max_line_bytes instead of growing forever" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const huge = try std.testing.allocator.alloc(u8, max_line_bytes + 1024);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'z');
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "huge.log", .data = huge });
+
+    const file = try tmp.dir.openFile(debug_io, "huge.log", .{});
+    defer file.close(debug_io);
+
+    const Ignore = struct {
+        fn line(_: *@This(), _: []const u8) !void {}
+    };
+    var ignore = Ignore{};
+    try std.testing.expectError(error.LineTooLong, scanLines(std.testing.allocator, file, &ignore));
 }
 
 test "FilterState: regex matches simple pattern" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .search = ".*error.*" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.has_regex);
     try std.testing.expect(state.checkLine("some error occurred") != null);
@@ -3062,7 +2838,7 @@ test "FilterState: regex matches simple pattern" {
 test "FilterState: plain search stays on literal fast path" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .search = "error" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(!state.has_regex);
     try std.testing.expect(state.checkLine("some error occurred") != null);
@@ -3071,7 +2847,7 @@ test "FilterState: plain search stays on literal fast path" {
 test "FilterState: regex OR via pipe" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .search = "error|timeout" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.checkLine("connection timeout") != null);
     try std.testing.expect(state.checkLine("some error") != null);
@@ -3081,7 +2857,7 @@ test "FilterState: regex OR via pipe" {
 test "FilterState: regex AND via ampersand" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .search = "error&connection" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(state.checkLine("error: connection failed") != null);
     try std.testing.expect(state.checkLine("error: timeout") == null);
@@ -3090,7 +2866,7 @@ test "FilterState: regex AND via ampersand" {
 test "FilterState: invalid regex falls back to literal" {
     var file = [_][]const u8{"test.log"};
     const args = flags.Args{ .files = &file, .search = "[invalid" };
-    var state = FilterState.init(args);
+    var state = FilterState.init(args, null, null);
     defer state.deinit();
     try std.testing.expect(!state.has_regex);
     try std.testing.expect(state.has_search_filter);
@@ -3133,8 +2909,252 @@ test "--output json flag" {
 
 test "printJsonOutputLine: produces valid JSON" {
     const line = "[ERROR] connection failed";
-    const info = analyzeLine(line);
+    const info = analyzeLine(line, true);
     // Just verify it doesn't crash and produces non-empty output.
     // The actual output goes to stdout which we can't easily capture.
     try std.testing.expect(info.level != null);
+}
+
+// --- Output sink ---
+
+test "Out buffers until capacity and flushes on demand" {
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+
+    h.out.write("hello ");
+    h.out.write("world");
+    try std.testing.expectEqual(@as(usize, 11), h.out.len);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("hello world", got);
+    try std.testing.expectEqual(@as(usize, 0), h.out.len);
+}
+
+test "Out treats an empty write as a no-op" {
+    // Every palette entry is "" under the plain theme, so this path runs
+    // several times per printed line.
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    h.out.write("");
+    h.out.write("");
+    try std.testing.expectEqual(@as(usize, 0), h.out.len);
+}
+
+// --- Styled output is lossless ---
+
+/// Strips ANSI CSI sequences so a styled line can be compared with its input.
+fn stripAnsi(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
+            i += 2;
+            while (i < s.len and s[i] != 'm' and s[i] != 'H' and s[i] != 'J') : (i += 1) {}
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, s[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "styled JSON output reproduces the input byte for byte" {
+    // The JSON styler emits unstyled bytes in runs and styled tokens
+    // separately. Getting the hand-off wrong duplicates or drops content in
+    // a way that colour makes hard to see, so assert on the stripped bytes.
+    // No `level` field in these: the level badge is the one place the
+    // printer deliberately rewrites content (see the test below).
+    const cases = [_][]const u8{
+        "{\"lvl\":\"info\",\"msg\":\"hello\",\"n\":42,\"ok\":true,\"z\":null}",
+        "{\"a\":[1,2,3],\"b\":{\"c\":-1.5e3}}",
+        "{\"msg\":\"quote \\\" inside\",\"esc\":\"back\\\\slash\"}",
+        "{\"empty\":\"\",\"spaces\" : \"  x  \"}",
+        "{}",
+        "{\"unicode\":\"привет мир\",\"emoji\":\"ok\"}",
+    };
+    for (cases) |line| {
+        var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+        try h.start();
+        defer h.deinit();
+        const info = analyzeLine(line, true);
+        printJsonStyled(&h.out, line, info, &.{}, null);
+        const raw = try h.take();
+        defer std.testing.allocator.free(raw);
+        const plain = try stripAnsi(std.testing.allocator, raw);
+        defer std.testing.allocator.free(plain);
+        // The printer appends a newline.
+        try std.testing.expectEqualStrings(line, std.mem.trimEnd(u8, plain, "\n"));
+    }
+}
+
+test "the level badge is the only rewrite the JSON styler performs" {
+    const line = "{\"level\":\"info\",\"msg\":\"hello\"}";
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    const info = analyzeLine(line, true);
+    printJsonStyled(&h.out, line, info, &.{}, null);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+    // `"info"` becomes the padded badge; every other byte survives.
+    try std.testing.expectEqualStrings(
+        "{\"level\": INFO  ,\"msg\":\"hello\"}\n",
+        got,
+    );
+}
+
+test "styled JSON output carries no colour under the plain theme" {
+    const got = try renderLine("{\"level\":\"info\",\"msg\":\"hello\"}", false);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\x1b[") == null);
+}
+
+test "plain-text line keeps its bytes when the level is replaced by a badge" {
+    const line = "2026-08-25 12:00:01 [INFO] api: started";
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    const info = analyzeLine(line, true);
+    printStyledLine(&h.out, line, info, &.{}, null);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+    // The badge pads "INFO" to a fixed width; everything else is verbatim.
+    try std.testing.expect(std.mem.startsWith(u8, got, "2026-08-25 12:00:01 ["));
+    try std.testing.expect(std.mem.indexOf(u8, got, "] api: started") != null);
+}
+
+// --- Embedded JSON expansion ---
+
+test "embedded JSON in a plain line is expanded below it" {
+    const got = try renderLine(
+        "12:00:01 [INFO] api: replied {\"id\":5,\"status\":200,\"ok\":true}",
+        true,
+    );
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"id\": 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"status\": 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "+-") != null);
+}
+
+test "escaped JSON inside a JSON log line is decoded and expanded" {
+    const got = try renderLine(
+        "{\"level\":\"error\",\"msg\":\"failed\",\"body\":\"{\\\"code\\\":503,\\\"detail\\\":\\\"down\\\"}\"}",
+        true,
+    );
+    defer std.testing.allocator.free(got);
+    // The compact line still shows the escaped form...
+    try std.testing.expect(std.mem.indexOf(u8, got, "\\\"code\\\":503") != null);
+    // ...and the block shows it decoded.
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"code\": 503") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"detail\": \"down\"") != null);
+}
+
+test "expansion is skipped when disabled" {
+    const line = "12:00:01 [INFO] api: replied {\"id\":5,\"status\":200,\"ok\":true}";
+    const got = try renderLine(line, false);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"id\": 5") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "+-") == null);
+}
+
+test "a line without embedded JSON gains nothing" {
+    const got = try renderLine("12:00:01 [WARN] cache: eviction ran, nothing to see", true);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "+-") == null);
+}
+
+test "a brace that is not JSON is left alone" {
+    // Go's `map[...]` printing and prose braces must not trigger a block.
+    for ([_][]const u8{
+        "12:00:01 [INFO] state map[a:1 b:2] settled",
+        "12:00:01 [INFO] template {placeholder} unresolved",
+        "12:00:01 [INFO] truncated {\"id\":5,\"name\":\"unclos",
+    }) |line| {
+        const got = try renderLine(line, true);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "+-") == null);
+    }
+}
+
+test "expansion never runs for --output json" {
+    var file = [_][]const u8{"x.log"};
+    const args = flags.Args{ .files = &file, .output_json = true };
+    const th = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode);
+    try std.testing.expect(!wantsJsonExpansion(args, &th));
+}
+
+test "expansion follows colour, and --no-expand-json overrides it" {
+    var file = [_][]const u8{"x.log"};
+    const colored = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode);
+    const plain = theme.Theme.plain;
+
+    try std.testing.expect(wantsJsonExpansion(.{ .files = &file }, &colored));
+    // Redirected output stays one record per line.
+    try std.testing.expect(!wantsJsonExpansion(.{ .files = &file }, &plain));
+    try std.testing.expect(!wantsJsonExpansion(.{ .files = &file, .no_expand_json = true }, &colored));
+}
+
+test "expanding a huge embedded payload is refused rather than attempted" {
+    // `Limits.max_bytes` bounds both the validate scan and the unescape
+    // buffer; a payload past it prints as-is.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(std.testing.allocator);
+    try big.appendSlice(std.testing.allocator, "12:00:01 [INFO] dump {\"k\":\"");
+    try big.appendSlice(std.testing.allocator, "y" ** 4096);
+    try big.appendSlice(std.testing.allocator, "\"}");
+
+    var h = TestOut{ .th = theme.Theme.plain };
+    try h.start();
+    defer h.deinit();
+    var expander = try JsonExpander.init(std.testing.allocator, .{ .max_bytes = 128 });
+    defer expander.deinit();
+    const info = analyzeLine(big.items, true);
+    printStyledLine(&h.out, big.items, info, &.{}, &expander);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "+-") == null);
+}
+
+// --- Timestamp extraction gate ---
+
+test "timestamps are skipped when nothing downstream needs them" {
+    const line = "2026-08-25 12:00:01 [INFO] api: started";
+    const with = analyzeLine(line, true);
+    try std.testing.expect(with.date != null);
+    try std.testing.expect(with.time != null);
+
+    const without = analyzeLine(line, false);
+    try std.testing.expect(without.date == null);
+    try std.testing.expect(without.time == null);
+    // Level detection is unaffected — only the two timestamp scans are.
+    try std.testing.expectEqual(with.level, without.level);
+    try std.testing.expectEqual(with.format, without.format);
+}
+
+test "FilterState asks for timestamps exactly when it needs them" {
+    var file = [_][]const u8{"x.log"};
+    const none = FilterState.init(.{ .files = &file }, null, null);
+    try std.testing.expect(!none.needs_timestamps);
+
+    const dated = FilterState.init(.{ .files = &file, .date = "2026-08-25" }, null, null);
+    try std.testing.expect(dated.needs_timestamps);
+
+    const timed = FilterState.init(.{ .files = &file, .from_time = "12:00" }, null, null);
+    try std.testing.expect(timed.needs_timestamps);
+
+    // JSON output carries date and time fields, so they must be extracted.
+    const as_json = FilterState.init(.{ .files = &file, .output_json = true }, null, null);
+    try std.testing.expect(as_json.needs_timestamps);
+}
+
+test "a date filter still matches with the gate in place" {
+    var file = [_][]const u8{"x.log"};
+    var state = FilterState.init(.{ .files = &file, .date = "2026-08-25" }, null, null);
+    defer state.deinit();
+    try std.testing.expect(state.checkLine("2026-08-25 12:00:01 [INFO] yes") != null);
+    try std.testing.expect(state.checkLine("2026-08-26 12:00:01 [INFO] no") == null);
 }

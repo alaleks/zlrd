@@ -159,6 +159,7 @@ const BatchAggregator = struct {
 pub fn follow(
     allocator: std.mem.Allocator,
     args: flags.Args,
+    th: *const formats.Theme,
 ) !void {
     const file_count = args.files.len;
     if (file_count == 0) return;
@@ -174,7 +175,18 @@ pub fn follow(
         }
     }
 
-    var filter_state = formats.FilterState.init(args);
+    // Follow output goes through the same buffered sink as file reads. It
+    // used to write straight to stdout, one syscall per colour escape.
+    var out = try formats.Out.init(allocator, std.Io.File.stdout(), th);
+    defer out.deinit();
+
+    var expander: ?formats.JsonExpander = if (!args.output_json and th.colored and !args.no_expand_json)
+        try formats.JsonExpander.init(allocator, .{})
+    else
+        null;
+    defer if (expander) |*x| x.deinit();
+
+    var filter_state = formats.FilterState.init(args, &out, if (expander) |*x| x else null);
     defer filter_state.deinit();
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
@@ -473,7 +485,7 @@ test "readLastNLines handles files with fewer lines than requested" {
     const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"small.log"};
     const args = makeSilentTailArgs(files_array[0..], 10, false, .exact);
-    var filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args, null, null);
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -555,7 +567,7 @@ test "position tracking correctly advances after reading" {
     const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"pos.log"};
     const args = makeSilentTailArgs(files_array[0..], 3, false, .exact);
-    var filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args, null, null);
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -608,7 +620,7 @@ test "appended data read correctly in sequential operations" {
     const stat1 = try file.stat(tail_io);
     var files_array = [_][]const u8{"append.log"};
     const args = makeSilentTailArgs(files_array[0..], 2, false, .exact);
-    var filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args, null, null);
 
     const read_buf = try allocator.alloc(u8, READ_BUF_SIZE);
     defer allocator.free(read_buf);
@@ -632,7 +644,7 @@ test "appended data read correctly in sequential operations" {
     defer carry.deinit(allocator);
 
     const args2 = makeSilentTailArgs(files_array[0..], 0, false, .exact);
-    var filter_state2 = formats.FilterState.init(args2);
+    var filter_state2 = formats.FilterState.init(args2, null, null);
 
     try readToEOF(allocator, &of, args2, &filter_state2, &carry, read_buf);
     try testing.expectEqual(@as(u64, 36), of.position);
@@ -672,7 +684,7 @@ test "readToEOF with aggregate exact advances position and preserves carry" {
 
     var files_array = [_][]const u8{"agg.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, true, .exact);
-    var filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args, null, null);
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -705,7 +717,7 @@ test "readToEOF with aggregate normalized consumes complete data" {
 
     var files_array = [_][]const u8{"norm.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, true, .normalized);
-    var filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args, null, null);
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -739,7 +751,7 @@ test "readToEOFInternal can flush final line without trailing newline" {
     const stat = try file.stat(tail_io);
     var files_array = [_][]const u8{"unterminated.log"};
     const args = makeSilentTailArgs(files_array[0..], 0, false, .exact);
-    var filter_state = formats.FilterState.init(args);
+    var filter_state = formats.FilterState.init(args, null, null);
     defer filter_state.deinit();
 
     var carry: std.ArrayList(u8) = .empty;
