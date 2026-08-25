@@ -315,6 +315,17 @@ pub const Sidecar = struct {
 
     // ─── Internals ───────────────────────────────────────────────────────
 
+    /// Snapshots one record into the active buffer.
+    ///
+    /// Attribute *keys* are borrowed, not cloned: every one is a string
+    /// literal from `recordFired` / `recordService` / `recordKernel`, so they
+    /// have program-wide lifetime — the same reasoning already applied to
+    /// `severity_text`. Cloning them cost ~110 bytes of arena and seven
+    /// `dupe` calls per event for no gain. Attribute *values* and the body do
+    /// get cloned: those borrow from line buffers that are reused as soon as
+    /// this returns.
+    ///
+    /// Callers must therefore pass keys with static lifetime.
     fn pushClone(
         self: *Sidecar,
         time_ns: u64,
@@ -342,10 +353,6 @@ pub const Sidecar = struct {
             return;
         };
         for (attrs_in, 0..) |a, i| {
-            const key_copy = arena_alloc.dupe(u8, a.key) catch {
-                _ = self.dropped_alloc.fetchAdd(1, .monotonic);
-                return;
-            };
             const value_copy: otlp.Value = switch (a.value) {
                 .string => |s| .{ .string = arena_alloc.dupe(u8, s) catch {
                     _ = self.dropped_alloc.fetchAdd(1, .monotonic);
@@ -354,7 +361,7 @@ pub const Sidecar = struct {
                 .int => |n| .{ .int = n },
                 .bool => |b| .{ .bool = b },
             };
-            attrs_copy[i] = .{ .key = key_copy, .value = value_copy };
+            attrs_copy[i] = .{ .key = a.key, .value = value_copy };
         }
 
         // `severity_text` is borrowed from a static table (`severityText`)
@@ -713,4 +720,56 @@ test "addCounters: emits one metric per level and per rule kind" {
         }
     }
     try testing.expect(found_regex_rule);
+}
+
+test "pushClone: borrows static attribute keys, clones transient values" {
+    // Keys are string literals with program-wide lifetime, so cloning them
+    // cost arena bytes and a `dupe` per attribute for nothing. Values are
+    // the opposite: they borrow from line buffers the caller reuses the
+    // moment this returns, so they must be copied.
+    const allocator = testing.allocator;
+    var m = metrics_mod.Metrics.init(0);
+    var s = try Sidecar.init(allocator, std.Options.debug_io, .{
+        .base_url = "https://127.0.0.1:1",
+        .headers = &.{},
+        .metrics = &m,
+    });
+    defer s.deinit();
+
+    // A value living in storage the caller is about to overwrite.
+    var volatile_value: [16]u8 = undefined;
+    @memcpy(volatile_value[0..5], "first");
+
+    const static_key = "test.key";
+    s.pushClone(1_000, .info, "INFO", "body", &.{
+        .{ .key = static_key, .value = .{ .string = volatile_value[0..5] } },
+    });
+
+    try testing.expectEqual(@as(usize, 1), s.active.queue.items.len);
+    const rec = s.active.queue.items[0];
+
+    // The key is the very same bytes we passed in — not a copy.
+    try testing.expectEqual(static_key.ptr, rec.attrs[0].key.ptr);
+
+    // The value was copied, so clobbering the caller's buffer can't reach it.
+    @memcpy(volatile_value[0..5], "XXXXX");
+    try testing.expectEqualStrings("first", rec.attrs[0].value.string);
+    // Same for the body.
+    try testing.expectEqualStrings("body", rec.body);
+}
+
+test "pushClone: honours the queue cap and counts the drops" {
+    const allocator = testing.allocator;
+    var m = metrics_mod.Metrics.init(0);
+    var s = try Sidecar.init(allocator, std.Options.debug_io, .{
+        .base_url = "https://127.0.0.1:1",
+        .headers = &.{},
+        .max_queue = 3,
+        .metrics = &m,
+    });
+    defer s.deinit();
+
+    for (0..5) |_| s.pushClone(1, .info, "INFO", "b", &.{});
+    try testing.expectEqual(@as(usize, 3), s.active.queue.items.len);
+    try testing.expectEqual(@as(u64, 2), s.dropped_queue_full.load(.monotonic));
 }

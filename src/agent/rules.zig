@@ -104,6 +104,17 @@ pub const Fired = struct {
     observed_count: u64,
 };
 
+/// Upper bound on distinct error signatures retained by the `first_seen`
+/// rule.
+///
+/// The map only ever grows: an agent is a long-lived daemon, and a service
+/// that emits high-cardinality errors (one signature per tenant, per request
+/// id that normalisation fails to collapse) would otherwise expand it without
+/// limit for the life of the process. Past the cap the rule stops treating
+/// new signatures as novel rather than stopping the agent — the same
+/// trade-off `max_aggregate_keys` makes in the reader.
+pub const max_seen_signatures: usize = 100_000;
+
 pub const RuleSet = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex,
@@ -111,6 +122,9 @@ pub const RuleSet = struct {
     regexes: []RegexState,
     seen_enabled: bool,
     seen: std.AutoHashMapUnmanaged(u64, void),
+    /// Set once `seen` hits `max_seen_signatures`, so the warning is logged
+    /// a single time instead of on every subsequent error line.
+    seen_capped: bool,
     silence_window_ms: ?u64,
 
     /// Constructs a RuleSet from a parsed AgentConfig. Owns the `regexes`
@@ -140,6 +154,7 @@ pub const RuleSet = struct {
             .regexes = regexes,
             .seen_enabled = cfg.first_seen,
             .seen = .empty,
+            .seen_capped = false,
             .silence_window_ms = cfg.silence_window_ms,
         };
     }
@@ -212,6 +227,18 @@ pub const RuleSet = struct {
 
         if (self.seen_enabled and level != null and signature.isErrorLevel(level.?) and n < out.len) {
             const sig = signature.errorSignature(line);
+            // Look before inserting: at the cap a known signature must still
+            // resolve as already-seen, only genuinely new ones are refused.
+            if (self.seen.count() >= max_seen_signatures and !self.seen.contains(sig)) {
+                if (!self.seen_capped) {
+                    self.seen_capped = true;
+                    std.log.scoped(.zlrd_rules).warn(
+                        "first_seen: {d} distinct error signatures retained; no longer tracking new ones",
+                        .{max_seen_signatures},
+                    );
+                }
+                return n;
+            }
             const gop = try self.seen.getOrPut(self.allocator, sig);
             if (!gop.found_existing) {
                 out[n] = .{
@@ -460,4 +487,64 @@ test "RuleSet.checkSilence: per-file latch lets other files fire in the same epo
     // latch on the RuleSet so the second file was silently suppressed.
     try testing.expectEqual(@as(usize, 1), rs.checkSilence(io, "a.log", 0, 2_000, &latch_a, &out));
     try testing.expectEqual(@as(usize, 1), rs.checkSilence(io, "b.log", 0, 2_000, &latch_b, &out));
+}
+
+test "first_seen: stops admitting new signatures at the cap" {
+    const allocator = testing.allocator;
+    var args = flags.Args{};
+    args.metrics_token = "t";
+    args.alert_first_seen = true;
+
+    var cfg = try config.AgentConfig.fromArgs(allocator, args);
+    defer cfg.deinit(allocator);
+    var rs = try RuleSet.init(allocator, cfg);
+    defer rs.deinit();
+
+    // Pre-fill to the cap without going through `observe`, so the test stays
+    // fast; the guard reads `seen.count()`.
+    var i: u64 = 0;
+    while (i < max_seen_signatures) : (i += 1) {
+        try rs.seen.put(allocator, i, {});
+    }
+
+    var fired: [8]Fired = undefined;
+    const io = std.Options.debug_io;
+
+    // A novel signature is refused rather than growing the map.
+    const before = rs.seen.count();
+    const n = try rs.observe(io, "ERROR something never seen before", .Error, "app.log", 1000, &fired);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expectEqual(before, rs.seen.count());
+    try testing.expect(rs.seen_capped);
+}
+
+test "first_seen: a signature already known still resolves at the cap" {
+    // The cap must not turn known signatures into repeat alerts.
+    const allocator = testing.allocator;
+    var args = flags.Args{};
+    args.metrics_token = "t";
+    args.alert_first_seen = true;
+
+    var cfg = try config.AgentConfig.fromArgs(allocator, args);
+    defer cfg.deinit(allocator);
+    var rs = try RuleSet.init(allocator, cfg);
+    defer rs.deinit();
+
+    var fired: [8]Fired = undefined;
+    const io = std.Options.debug_io;
+    const line = "ERROR disk full on /dev/sda1";
+
+    // First sighting fires.
+    try testing.expectEqual(@as(usize, 1), try rs.observe(io, line, .Error, "app.log", 1000, &fired));
+
+    // Now fill the rest of the map to the cap.
+    var i: u64 = 0;
+    while (rs.seen.count() < max_seen_signatures) : (i += 1) {
+        try rs.seen.put(allocator, 0x8000_0000_0000_0000 | i, {});
+    }
+
+    // The same line must stay "seen" — no alert, no growth.
+    const before = rs.seen.count();
+    try testing.expectEqual(@as(usize, 0), try rs.observe(io, line, .Error, "app.log", 2000, &fired));
+    try testing.expectEqual(before, rs.seen.count());
 }

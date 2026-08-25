@@ -161,9 +161,16 @@ pub const Sender = struct {
     }
 
     /// Pops the oldest queued item in amortized O(1). We advance `head`
-    /// instead of shifting the array; once everything in the current
-    /// batch has been drained the ArrayList is cleared so it doesn't
-    /// keep growing across bursts.
+    /// instead of shifting the array on every pop.
+    ///
+    /// Reclaiming only when the queue hits exactly empty is not enough:
+    /// `max_pending` bounds the *live window* (`items.len - head`), not the
+    /// array behind it. Under sustained load — producers enqueueing at least
+    /// as fast as the single worker can POST — `head` never catches the tail,
+    /// so both indices climb together and the backing store grows without
+    /// bound while `pending` looks healthy. Compacting once `head` passes
+    /// `max_pending` caps the array at twice that, and each item is moved at
+    /// most once per `max_pending` pops.
     fn takeOne(self: *Sender) ?QueuedPost {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -173,6 +180,11 @@ pub const Sender = struct {
         if (self.head == self.queue.items.len) {
             self.head = 0;
             self.queue.clearRetainingCapacity();
+        } else if (self.head >= max_pending) {
+            const live = self.queue.items[self.head..];
+            std.mem.copyForwards(QueuedPost, self.queue.items[0..live.len], live);
+            self.queue.items.len = live.len;
+            self.head = 0;
         }
         return item;
     }
@@ -260,3 +272,45 @@ test "Sender: stop is idempotent and safe before start" {
     sender.stop(); // second call is a no-op
 }
 
+test "queue: the backing array stays bounded under sustained load" {
+    // `max_pending` caps the live window, not the array. Draining one item
+    // for every item enqueued keeps the queue permanently non-empty, so the
+    // "clear when it hits empty" path never runs — and without compaction
+    // both `head` and `items.len` climb forever.
+    const allocator = testing.allocator;
+    var sender = try Sender.init(allocator, std.Options.debug_io, &.{});
+    defer sender.deinit();
+
+    // Prime a live window, then hold it steady for many rounds.
+    for (0..max_pending) |_| sender.send("https://example.invalid/hook", "{}");
+    try testing.expectEqual(max_pending, sender.queue.items.len - sender.head);
+
+    for (0..max_pending * 20) |_| {
+        var item = sender.takeOne().?;
+        item.deinit(allocator);
+        sender.send("https://example.invalid/hook", "{}");
+        // The live window never moves...
+        try testing.expectEqual(max_pending, sender.queue.items.len - sender.head);
+        // ...and neither does the array behind it.
+        try testing.expect(sender.queue.items.len <= max_pending * 2);
+    }
+}
+
+test "queue: compaction preserves order" {
+    const allocator = testing.allocator;
+    var sender = try Sender.init(allocator, std.Options.debug_io, &.{});
+    defer sender.deinit();
+
+    var buf: [32]u8 = undefined;
+    for (0..max_pending) |i| {
+        sender.send("https://example.invalid/hook", try std.fmt.bufPrint(&buf, "{d}", .{i}));
+    }
+    // Drive past the compaction threshold, checking FIFO order throughout.
+    for (0..max_pending * 3) |i| {
+        var item = sender.takeOne().?;
+        defer item.deinit(allocator);
+        const want = try std.fmt.bufPrint(&buf, "{d}", .{i});
+        try testing.expectEqualStrings(want, item.payload);
+        sender.send("https://example.invalid/hook", try std.fmt.bufPrint(&buf, "{d}", .{i + max_pending}));
+    }
+}

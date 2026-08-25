@@ -113,6 +113,16 @@ pub fn run(
     defer w.deinit();
 
     const server_thread = try std.Thread.spawn(.{}, runServer, .{&srv});
+    // Shut the listener down and join before `srv.deinit()` runs. As a
+    // trailing statement this was skipped whenever anything below returned an
+    // error — the journal setup is all `try` — leaving the server thread
+    // running against a destroyed `Server`. `requestShutdown` closes the
+    // listener under a swap-guard, so a pending `accept()` returns at once
+    // and this is safe to call twice.
+    defer {
+        srv.requestShutdown();
+        server_thread.join();
+    }
 
     var km: ?kernel.Monitor = if (args.kernel_probes)
         kernel.Monitor.init(io, alert.kernelSinkThunk, &dispatcher)
@@ -146,6 +156,8 @@ pub fn run(
     }
     for (cfg.journal_units) |spec| {
         const js = try allocator.create(journal.JournalSource);
+        // Until `journals` owns it, nothing else will free it.
+        errdefer allocator.destroy(js);
         js.* = journal.JournalSource.init(
             allocator,
             io,
@@ -172,13 +184,6 @@ pub fn run(
         log.err("watcher exited unexpectedly: {t}", .{err});
         watcher_failed = true;
     };
-
-    // `requestShutdown` closes the listener under a swap-guard so any
-    // pending `accept()` returns immediately — no separate wake-up
-    // connection needed (the previous nudge had no timeout and could
-    // itself stall the shutdown path).
-    srv.requestShutdown();
-    server_thread.join();
 
     if (dispatcher.shouldExit()) return 1;
     if (watcher_failed) return 2;

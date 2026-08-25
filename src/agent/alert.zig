@@ -42,7 +42,11 @@ pub const Dispatcher = struct {
     sinks: config.SinkConfig,
     file: ?std.Io.File,
     file_offset: u64,
-    file_mutex: std.Io.Mutex,
+    /// Serialises every sink write. The dispatchers run concurrently — the
+    /// watcher thread, one thread per journal source, and the kernel
+    /// monitor all call in — so without this two alerts interleave inside a
+    /// single record.
+    sink_mutex: std.Io.Mutex,
     metrics: *metrics.Metrics,
     exit_flag: std.atomic.Value(bool),
     alert_exit: bool,
@@ -67,7 +71,7 @@ pub const Dispatcher = struct {
             .sinks = sinks,
             .file = file,
             .file_offset = offset,
-            .file_mutex = .init,
+            .sink_mutex = .init,
             .metrics = m,
             .exit_flag = .init(false),
             .alert_exit = alert_exit,
@@ -173,8 +177,17 @@ pub const Dispatcher = struct {
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
 
+    /// Writes one alert record to stderr.
+    ///
+    /// The payload and its newline go out under the lock. Emitting them as
+    /// two unguarded writes let a concurrent dispatch land between them,
+    /// producing `{...}{...}\n\n` — two records merged onto one line and an
+    /// empty line after, which breaks any JSONL consumer. `writeFile` was
+    /// already fixed for exactly this; stderr had been left behind.
     fn writeStderr(self: *Dispatcher, payload: []const u8) void {
         const stderr = std.Io.File.stderr();
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
         stderr.writeStreamingAll(self.io, payload) catch return;
         stderr.writeStreamingAll(self.io, "\n") catch return;
     }
@@ -203,8 +216,8 @@ pub const Dispatcher = struct {
         combined[payload.len] = '\n';
         const record = combined[0 .. payload.len + 1];
 
-        self.file_mutex.lockUncancelable(self.io);
-        defer self.file_mutex.unlock(self.io);
+        self.sink_mutex.lockUncancelable(self.io);
+        defer self.sink_mutex.unlock(self.io);
         f.writePositionalAll(self.io, record, self.file_offset) catch return;
         self.file_offset += record.len;
         // Only fsync when the caller asked — crash + kernel events. Rule
@@ -435,4 +448,69 @@ test "formatAlert: passes multi-byte UTF-8 through verbatim (no mojibake)" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("café / привет / 你好 / 🚀", parsed.value.object.get("line").?.string);
+}
+
+test "concurrent dispatch produces whole records, never interleaved" {
+    // Every dispatcher entry point is called from a different thread — the
+    // watcher, one per journal source, and the kernel monitor. Two of them
+    // writing a record as separate payload/newline calls used to interleave,
+    // merging two alerts onto one line. Drive the file sink (same lock, and
+    // unlike stderr it can be read back) from several threads at once and
+    // check that every line parses on its own.
+    const allocator = testing.allocator;
+    const io = std.Options.debug_io;
+
+    // `Dispatcher` opens its alert file relative to the process cwd, so the
+    // fixture lives there under a name nothing else will collide with.
+    const file_path = "zlrd-alert-concurrency.jsonl.tmp";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, file_path) catch {};
+    defer cwd.deleteFile(io, file_path) catch {};
+
+    var m = metrics.Metrics.init(0);
+    var d = try Dispatcher.init(io, .{
+        .stderr = false,
+        .file_path = file_path,
+        .webhooks = &.{},
+        .webhook_headers = &.{},
+    }, &m, false);
+    defer d.deinit();
+
+    const threads_n = 6;
+    const per_thread = 200;
+    const Worker = struct {
+        fn run(disp: *Dispatcher, id: usize) void {
+            for (0..per_thread) |i| {
+                disp.dispatch(.{
+                    .kind = .regex,
+                    .rule_id = "concurrent",
+                    .line = "a line long enough that a split would be obvious",
+                    .file_path = "worker.log",
+                    .threshold_count = 1,
+                    .threshold_window_ms = 1000,
+                    .observed_count = @intCast(id * 1000 + i),
+                }, 1_700_000_000_000);
+            }
+        }
+    };
+
+    var threads: [threads_n]std.Thread = undefined;
+    for (&threads, 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &d, id });
+    for (threads) |t| t.join();
+
+    const contents = try cwd.readFileAlloc(io, file_path, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(contents);
+
+    var lines: usize = 0;
+    var it = std.mem.splitScalar(u8, contents, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        // A merged pair would fail to parse; a stray newline would show up
+        // as an empty line between records.
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try testing.expect(parsed.value.object.contains("observed_count"));
+        lines += 1;
+    }
+    try testing.expectEqual(@as(usize, threads_n * per_thread), lines);
 }
