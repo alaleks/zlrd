@@ -196,6 +196,7 @@ pub fn build(b: *std.Build) void {
         "src/kernel/kernel.zig",
         "src/kernel/kmsg.zig",
         "src/kernel/pstore.zig",
+        "src/kernel/ebpf.zig",
     }) |path| {
         const mod = b.createModule(.{
             .root_source_file = b.path(path),

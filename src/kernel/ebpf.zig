@@ -31,15 +31,24 @@ const tracefs_root = "/sys/kernel/tracing";
 /// (each is 4 bytes after the 8-byte header).
 const ringbuf_size: usize = 256 * 1024;
 
+comptime {
+    // The consumer masks positions with `ringbuf_size - 1`, and the kernel
+    // requires the same of the map.
+    std.debug.assert(std.math.isPowerOfTwo(ringbuf_size));
+}
+
+/// `stop_fd` is an eventfd the caller signals on shutdown; pass -1 to fall
+/// back to polling `stop` on a timer.
 pub fn run(
     io: std.Io,
     sink: kernel.Sink,
     ctx: ?*anyopaque,
     stop: *std.atomic.Value(bool),
+    stop_fd: i32,
 ) !void {
     _ = io;
     if (comptime !kernel.with_ebpf or builtin.os.tag != .linux) return;
-    return runLinux(sink, ctx, stop);
+    return runLinux(sink, ctx, stop, stop_fd);
 }
 
 /// Reasonable upper bound on number of CPUs we attach to. 1024 covers any
@@ -47,7 +56,7 @@ pub fn run(
 /// (4 KiB) so we avoid an allocator dependency for startup.
 const max_cpus: usize = 1024;
 
-fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool)) !void {
+fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool), stop_fd: i32) !void {
     if (comptime builtin.os.tag != .linux) return;
 
     const linux = std.os.linux;
@@ -110,19 +119,25 @@ fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool)) 
 
     log.info("ebpf backend up; OOM tracepoint attached on {d} CPU(s)", .{attached});
 
-    var pollfd = [_]std.posix.pollfd{.{
-        .fd = map_fd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
+    // Wait on the ringbuf and the stop eventfd together so an idle agent
+    // parks indefinitely instead of waking twice a second, and shutdown does
+    // not have to wait out a timeout.
+    var pollfds: [2]std.posix.pollfd = .{
+        .{ .fd = map_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = stop_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    const nfds: usize = if (stop_fd >= 0) 2 else 1;
+    const timeout: i32 = if (stop_fd >= 0) -1 else 500;
     while (!stop.load(.monotonic)) {
-        const pn = linux.poll(&pollfd, 1, 500);
+        const pn = linux.poll(&pollfds, nfds, timeout);
         switch (std.posix.errno(pn)) {
             .SUCCESS => {},
             .INTR => continue,
             else => return,
         }
         if (pn == 0) continue;
+        if (nfds == 2 and (pollfds[1].revents & std.posix.POLL.IN) != 0) return;
+        if ((pollfds[0].revents & std.posix.POLL.IN) == 0) continue;
         consumer.drain(sink, ctx);
     }
 }
@@ -206,7 +221,7 @@ fn openTracepoint(tracepoint_id: u64, cpu: i32) !i32 {
     attr.config = tracepoint_id;
     attr.sample_period_or_freq = 1;
     attr.flags.disabled = true;
-    attr.wakeup = .{ .events = 1 };
+    attr.wakeup_events_or_watermark = 1;
 
     const rc = linux.perf_event_open(&attr, -1, cpu, -1, 0);
     if (std.posix.errno(rc) != .SUCCESS) return error.PerfEventOpen;
@@ -265,11 +280,15 @@ const RingbufConsumer = struct {
         if (std.posix.errno(producer_addr) != .SUCCESS) return error.MmapProducer;
         const producer_ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(producer_addr);
 
+        // Expose *both* copies of the data area. The kernel maps it twice
+        // back to back precisely so a record that starts near the end of the
+        // ring can still be read as one contiguous run; handing the consumer
+        // only the first copy makes every such record look out of bounds.
         const data_ptr = producer_ptr + page;
         return .{
             .consumer_page = consumer_ptr[0..page],
             .producer_pages = producer_ptr[0..producer_len],
-            .data = data_ptr[0..ringbuf_size],
+            .data = data_ptr[0 .. 2 * ringbuf_size],
         };
     }
 
@@ -298,7 +317,7 @@ const RingbufConsumer = struct {
         var cpos = consumer.load(.acquire);
         const ppos = producer.load(.acquire);
         const start = cpos;
-        cpos = drainBuffer(self.data, cpos, ppos, sink, ctx);
+        cpos = drainBuffer(self.data, ringbuf_size, cpos, ppos, sink, ctx);
         // Publish the new consumer position once at the end — on bursts this
         // collapses N atomic stores into one.
         if (cpos != start) consumer.store(cpos, .release);
@@ -310,15 +329,22 @@ const RingbufConsumer = struct {
 /// producer still writing) and the DISCARD bit (skips payload but still
 /// advances past the record). Returns the new consumer position.
 ///
-/// Without DISCARD handling, the previous implementation would wedge on
-/// the first discarded record forever because `len_raw & 0x7FFFFFFF` left
-/// bit 30 set, producing a ~1 GiB length that always failed the bounds
-/// check.
-fn drainBuffer(data: []const u8, cpos_in: u64, ppos: u64, sink: kernel.Sink, ctx: ?*anyopaque) u64 {
+/// `data` must cover both copies of the double-mapped ring — `ring_size`
+/// gives the logical size that positions are masked with. A record may start
+/// near the end of the ring and run past it; reading that linearly is the
+/// entire reason the kernel maps the area twice. Bounding the walk by the
+/// first copy instead made every wrapping record look truncated, and since
+/// the consumer position never advanced past it, the backend stalled
+/// permanently the first time the ring wrapped.
+///
+/// Without DISCARD handling, an earlier implementation wedged on the first
+/// discarded record because `len_raw & 0x7FFFFFFF` left bit 30 set,
+/// producing a ~1 GiB length that always failed the bounds check.
+fn drainBuffer(data: []const u8, ring_size: usize, cpos_in: u64, ppos: u64, sink: kernel.Sink, ctx: ?*anyopaque) u64 {
     const busy_bit: u32 = 0x80000000;
     const discard_bit: u32 = 0x40000000;
     const len_mask: u32 = 0x3FFFFFFF;
-    const mask: u64 = data.len - 1;
+    const mask: u64 = ring_size - 1;
 
     var cpos = cpos_in;
     while (cpos < ppos) {
@@ -331,7 +357,9 @@ fn drainBuffer(data: []const u8, cpos_in: u64, ppos: u64, sink: kernel.Sink, ctx
         const discarded = (len_raw & discard_bit) != 0;
         const data_len: usize = @intCast(len_raw & len_mask);
         const data_off = off + 8;
-        if (data_off + data_len > data.len) break;
+        // A record can never exceed the ring itself; anything claiming to is
+        // corrupt, and walking on would desynchronise us permanently.
+        if (data_len > ring_size or data_off + data_len > data.len) break;
 
         if (!discarded and data_len >= 4) {
             const pid_ptr: *const [4]u8 = @ptrCast(&data[data_off]);
@@ -350,6 +378,37 @@ fn drainBuffer(data: []const u8, cpos_in: u64, ppos: u64, sink: kernel.Sink, ctx
 
 const testing = std.testing;
 
+/// Test ring size. Small and a power of two, like the real one.
+const test_ring: usize = 128;
+
+/// A ring the same shape the kernel hands us: the data area mapped twice,
+/// back to back, so a record straddling the end reads contiguously.
+const TestRing = struct {
+    bytes: [test_ring * 2]u8 = undefined,
+
+    fn init() TestRing {
+        var r = TestRing{};
+        @memset(&r.bytes, 0);
+        return r;
+    }
+
+    /// Writes a record at ring position `pos`, mirroring any bytes that fall
+    /// past the end into the second copy exactly as the double mapping would.
+    fn put(self: *TestRing, pos: u64, payload: []const u8, discard: bool, busy: bool) usize {
+        var rec: [64]u8 = undefined;
+        const n = writeRingbufRecord(&rec, 0, payload, discard, busy);
+        const off: usize = @intCast(pos & (test_ring - 1));
+        for (0..n) |i| {
+            const at = off + i;
+            self.bytes[at] = rec[i];
+            // The two copies are the same physical memory.
+            if (at < test_ring) self.bytes[at + test_ring] = rec[i];
+            if (at >= test_ring) self.bytes[at - test_ring] = rec[i];
+        }
+        return n;
+    }
+};
+
 /// Writes a synthetic BPF-ringbuf record header into `buf[off..]`.
 /// `len` is the payload length; `discard` sets bit 30; `busy` sets bit 31.
 fn writeRingbufRecord(buf: []u8, off: usize, payload: []const u8, discard: bool, busy: bool) usize {
@@ -364,6 +423,7 @@ fn writeRingbufRecord(buf: []u8, off: usize, payload: []const u8, discard: bool,
 }
 
 test "drainBuffer: emits committed records and advances cpos correctly" {
+    // Doubled ring: 128 logical bytes mapped twice.
     var data: [256]u8 = undefined;
     @memset(&data, 0);
 
@@ -384,7 +444,7 @@ test "drainBuffer: emits committed records and advances cpos correctly" {
         }
     };
     Cap.n = 0;
-    const new_cpos = drainBuffer(&data, 0, r1 + r2, Cap.cb, null);
+    const new_cpos = drainBuffer(&data, data.len / 2, 0, r1 + r2, Cap.cb, null);
     try testing.expectEqual(@as(usize, 2), Cap.n);
     try testing.expectEqual(@as(u32, 1234), Cap.seen[0]);
     try testing.expectEqual(@as(u32, 5678), Cap.seen[1]);
@@ -392,6 +452,7 @@ test "drainBuffer: emits committed records and advances cpos correctly" {
 }
 
 test "drainBuffer: DISCARDed record is skipped but advances cpos" {
+    // Doubled ring: 128 logical bytes mapped twice.
     var data: [256]u8 = undefined;
     @memset(&data, 0);
 
@@ -413,13 +474,14 @@ test "drainBuffer: DISCARDed record is skipped but advances cpos" {
         }
     };
     Cap.n = 0;
-    const new_cpos = drainBuffer(&data, 0, r1 + r2, Cap.cb, null);
+    const new_cpos = drainBuffer(&data, data.len / 2, 0, r1 + r2, Cap.cb, null);
     try testing.expectEqual(@as(usize, 1), Cap.n);
     try testing.expectEqual(@as(u32, 9999), Cap.seen[0]);
     try testing.expectEqual(@as(u64, r1 + r2), new_cpos);
 }
 
 test "drainBuffer: stops at a BUSY record without advancing past it" {
+    // Doubled ring: 128 logical bytes mapped twice.
     var data: [256]u8 = undefined;
     @memset(&data, 0);
 
@@ -437,7 +499,83 @@ test "drainBuffer: stops at a BUSY record without advancing past it" {
         }
     };
     Cap.n = 0;
-    const new_cpos = drainBuffer(&data, 0, 128, Cap.cb, null);
+    const new_cpos = drainBuffer(&data, data.len / 2, 0, 128, Cap.cb, null);
     try testing.expectEqual(@as(usize, 0), Cap.n);
+    try testing.expectEqual(@as(u64, 0), new_cpos);
+}
+
+test "drainBuffer: reads a record that straddles the end of the ring" {
+    // The kernel maps the data area twice so a record starting near the end
+    // reads as one contiguous run. Bounding the walk by the first copy made
+    // every such record look truncated — and because the consumer position
+    // never advanced past it, the backend stalled for good the first time the
+    // ring wrapped.
+    var ring = TestRing.init();
+
+    var pid_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pid_bytes, 4242, .little);
+
+    // Start four bytes before the end: the 8-byte header alone crosses it.
+    const start: u64 = test_ring - 4;
+    const n = ring.put(start, &pid_bytes, false, false);
+
+    const Cap = struct {
+        var seen: u32 = 0;
+        var calls: usize = 0;
+        fn cb(_: ?*anyopaque, ev: kernel.KernelEvent) void {
+            seen = ev.pid;
+            calls += 1;
+        }
+    };
+    Cap.calls = 0;
+    Cap.seen = 0;
+
+    const new_cpos = drainBuffer(&ring.bytes, test_ring, start, start + n, Cap.cb, null);
+    try testing.expectEqual(@as(usize, 1), Cap.calls);
+    try testing.expectEqual(@as(u32, 4242), Cap.seen);
+    try testing.expectEqual(start + n, new_cpos);
+}
+
+test "drainBuffer: keeps draining across several wraps" {
+    // A stall would show up as the consumer position failing to reach the
+    // producer's.
+    var ring = TestRing.init();
+    var pid_bytes: [4]u8 = undefined;
+
+    const Cap = struct {
+        var calls: usize = 0;
+        fn cb(_: ?*anyopaque, _: kernel.KernelEvent) void {
+            calls += 1;
+        }
+    };
+    Cap.calls = 0;
+
+    var cpos: u64 = 0;
+    var ppos: u64 = 0;
+    for (0..64) |i| {
+        std.mem.writeInt(u32, &pid_bytes, @intCast(i + 1), .little);
+        const n = ring.put(ppos, &pid_bytes, false, false);
+        ppos += n;
+        cpos = drainBuffer(&ring.bytes, test_ring, cpos, ppos, Cap.cb, null);
+        try testing.expectEqual(ppos, cpos);
+    }
+    try testing.expectEqual(@as(usize, 64), Cap.calls);
+}
+
+test "drainBuffer: refuses a record longer than the ring" {
+    // Corrupt length: walking on would desynchronise the consumer for good.
+    var ring = TestRing.init();
+    std.mem.writeInt(u32, ring.bytes[0..4], @intCast(test_ring + 8), .little);
+    std.mem.writeInt(u32, ring.bytes[4..8], 0, .little);
+
+    const Cap = struct {
+        var calls: usize = 0;
+        fn cb(_: ?*anyopaque, _: kernel.KernelEvent) void {
+            calls += 1;
+        }
+    };
+    Cap.calls = 0;
+    const new_cpos = drainBuffer(&ring.bytes, test_ring, 0, 512, Cap.cb, null);
+    try testing.expectEqual(@as(usize, 0), Cap.calls);
     try testing.expectEqual(@as(u64, 0), new_cpos);
 }

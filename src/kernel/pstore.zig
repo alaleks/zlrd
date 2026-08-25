@@ -23,6 +23,9 @@ pub const taint_die_bit: u64 = 1 << 9;
 /// Maximum number of pstore filenames we'll report in the detail field.
 const max_dumps_in_detail = 4;
 
+/// Must match `KernelEvent.detail`, which is where this text ends up.
+const detail_buf_size = 128;
+
 /// Scans pstore + tainted and emits at most one `panic_prev_boot` event when
 /// the kernel reports panic evidence. `io` is reserved for symmetry with the
 /// kmsg backend; pstore reads happen via raw syscalls.
@@ -30,25 +33,25 @@ pub fn scan(io: std.Io, sink: kernel.Sink, ctx: ?*anyopaque) !void {
     _ = io;
     if (comptime builtin.os.tag != .linux) return;
 
-    var detail_buf: [128]u8 = undefined;
+    var detail_buf: [detail_buf_size]u8 = undefined;
     var detail_w: std.Io.Writer = .fixed(&detail_buf);
 
     const tainted_value = readTainted();
     const has_taint_die = (tainted_value & taint_die_bit) != 0;
 
-    var dump_count: usize = 0;
-    countPstoreDumps(&dump_count, &detail_w) catch {};
-
-    if (!has_taint_die and dump_count == 0) return;
-
-    // Only emit the `"; "` separator when we have BOTH halves to join.
-    // Previously the separator was written whenever the buffer was non-empty,
-    // producing a dangling `"dump1,dump2; "` when dumps were present but
-    // TAINT_DIE wasn't set.
+    // The taint word goes in first. It is fixed-width and the more
+    // diagnostic of the two halves, whereas dump names are long and
+    // unbounded in count: with four `dmesg-efi-<20 digits>` entries the pair
+    // overruns `detail_buf` and, in the other order, it was the taint value
+    // that silently vanished.
     if (has_taint_die) {
-        if (detail_w.buffered().len > 0) detail_w.writeAll("; ") catch {};
         detail_w.print("tainted=0x{x}", .{tainted_value}) catch {};
     }
+
+    var dump_count: usize = 0;
+    countPstoreDumps(&dump_count, &detail_w, has_taint_die);
+
+    if (!has_taint_die and dump_count == 0) return;
 
     sink(ctx, kernel.makeEvent(
         .panic_prev_boot,
@@ -73,7 +76,12 @@ fn readTainted() u64 {
 /// Counts entries in `/sys/fs/pstore/` and appends up to `max_dumps_in_detail`
 /// names into `detail_w`. Returns silently when the directory is missing
 /// (pstore not configured / mounted).
-fn countPstoreDumps(out_count: *usize, detail_w: *std.Io.Writer) !void {
+///
+/// `detail_has_prefix` says whether the writer already holds text, so the
+/// separator is only emitted when there are genuinely two halves to join.
+/// Counting continues past a full `detail_w`: the count is reported to the
+/// caller even when the names no longer fit.
+fn countPstoreDumps(out_count: *usize, detail_w: *std.Io.Writer, detail_has_prefix: bool) void {
     if (comptime builtin.os.tag != .linux) return;
     const linux = std.os.linux;
 
@@ -117,9 +125,14 @@ fn countPstoreDumps(out_count: *usize, detail_w: *std.Io.Writer) !void {
 
             out_count.* += 1;
             if (emitted < max_dumps_in_detail) {
-                if (emitted > 0) detail_w.writeAll(",") catch {};
-                detail_w.writeAll(name) catch {};
-                emitted += 1;
+                const sep: []const u8 = if (emitted > 0) "," else if (detail_has_prefix) "; " else "";
+                // Only commit the name if the whole `separator + name` fits;
+                // a half-written name would read as a real dump filename.
+                if (detail_w.buffered().len + sep.len + name.len <= detail_buf_size) {
+                    detail_w.writeAll(sep) catch {};
+                    detail_w.writeAll(name) catch {};
+                    emitted += 1;
+                }
             }
         }
     }
@@ -176,29 +189,56 @@ test "scan: no-op on non-Linux compiles cleanly" {
     try testing.expectEqual(@as(u32, 0), calls);
 }
 
-test "detail separator: emit only when both halves present" {
-    // Reproduces the bug we fixed: writeAll("; ") used to fire whenever
-    // detail_w already had bytes, producing "dump1,dump2; " when tainted
-    // was clear. Exercise the helper in isolation.
-    var buf: [128]u8 = undefined;
-    {
-        var w: std.Io.Writer = .fixed(&buf);
-        try w.writeAll("dump1,dump2");
-        const has_taint_die = false;
-        if (has_taint_die) {
-            if (w.buffered().len > 0) try w.writeAll("; ");
-            try w.print("tainted=0x{x}", .{0x200});
+/// Mirrors the assembly `scan` performs, so the join and the truncation
+/// guard can be exercised without a Linux pstore directory.
+fn buildDetail(buf: []u8, tainted: ?u64, names: []const []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    if (tainted) |t| w.print("tainted=0x{x}", .{t}) catch {};
+    var emitted: usize = 0;
+    for (names) |name| {
+        if (emitted >= max_dumps_in_detail) break;
+        const sep: []const u8 = if (emitted > 0) "," else if (tainted != null) "; " else "";
+        if (w.buffered().len + sep.len + name.len <= buf.len) {
+            w.writeAll(sep) catch {};
+            w.writeAll(name) catch {};
+            emitted += 1;
         }
-        try testing.expectEqualStrings("dump1,dump2", w.buffered());
     }
-    {
-        var w: std.Io.Writer = .fixed(&buf);
-        try w.writeAll("dump1");
-        const has_taint_die = true;
-        if (has_taint_die) {
-            if (w.buffered().len > 0) try w.writeAll("; ");
-            try w.print("tainted=0x{x}", .{0x200});
-        }
-        try testing.expectEqualStrings("dump1; tainted=0x200", w.buffered());
+    return w.buffered();
+}
+
+test "detail: taint alone, dumps alone, and both joined" {
+    var buf: [detail_buf_size]u8 = undefined;
+    try testing.expectEqualStrings("tainted=0x200", buildDetail(&buf, 0x200, &.{}));
+    // No dangling separator when there is no taint half.
+    try testing.expectEqualStrings("dump1,dump2", buildDetail(&buf, null, &.{ "dump1", "dump2" }));
+    try testing.expectEqualStrings("tainted=0x200; dump1,dump2", buildDetail(&buf, 0x200, &.{ "dump1", "dump2" }));
+}
+
+test "detail: the taint value survives a full complement of long dump names" {
+    // Real EFI dump names run ~28 characters. Four of them plus the taint
+    // word overflow the 128-byte detail field, and with the dumps written
+    // first it was the taint value — the more diagnostic half — that got
+    // dropped. Now the names are what give way.
+    var buf: [detail_buf_size]u8 = undefined;
+    const long = [_][]const u8{
+        "dmesg-efi-165234567890123001",
+        "dmesg-efi-165234567890123002",
+        "dmesg-efi-165234567890123003",
+        "dmesg-efi-165234567890123004",
+    };
+    const out = buildDetail(&buf, 0x200, &long);
+    try testing.expect(out.len <= detail_buf_size);
+    try testing.expect(std.mem.startsWith(u8, out, "tainted=0x200"));
+    // Whatever names did fit are whole, never cut mid-token.
+    var it = std.mem.tokenizeAny(u8, out["tainted=0x200".len..], ";, ");
+    while (it.next()) |name| {
+        try testing.expectEqual(@as(usize, 28), name.len);
     }
+}
+
+test "detail: caps the number of names but keeps counting them" {
+    var buf: [detail_buf_size]u8 = undefined;
+    const out = buildDetail(&buf, null, &.{ "a", "b", "c", "d", "e", "f" });
+    try testing.expectEqualStrings("a,b,c,d", out);
 }

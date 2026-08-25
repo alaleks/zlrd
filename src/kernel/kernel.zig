@@ -117,6 +117,11 @@ pub const Monitor = struct {
     stop_flag: std.atomic.Value(bool),
     threads: [max_threads]?std.Thread,
     threads_len: usize,
+    /// eventfd the backends wait on alongside their own descriptors, so they
+    /// can block indefinitely instead of ticking on a timer. -1 when the
+    /// platform has no eventfd or creation failed; backends then fall back to
+    /// a timed poll.
+    stop_fd: i32,
 
     pub fn init(io: std.Io, sink: Sink, ctx: ?*anyopaque) Monitor {
         return .{
@@ -126,6 +131,7 @@ pub const Monitor = struct {
             .stop_flag = .init(false),
             .threads = [_]?std.Thread{null} ** max_threads,
             .threads_len = 0,
+            .stop_fd = -1,
         };
     }
 
@@ -134,11 +140,28 @@ pub const Monitor = struct {
             log.info("kernel probes: unsupported on this platform, monitor is a no-op", .{});
             return;
         }
+        if (comptime is_supported) {
+            const linux = std.os.linux;
+            const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+            if (std.posix.errno(rc) == .SUCCESS) {
+                self.stop_fd = @intCast(rc);
+            } else {
+                log.debug("eventfd unavailable; backends will poll on a timer", .{});
+            }
+        }
         try linuxStart(self);
     }
 
+    /// Asks the backends to wind down. Sets the flag first so a thread that
+    /// is between waits sees it, then wakes anything parked in `poll`.
     pub fn stop(self: *Monitor) void {
         self.stop_flag.store(true, .monotonic);
+        if (comptime is_supported) {
+            if (self.stop_fd >= 0) {
+                const one: u64 = 1;
+                _ = std.os.linux.write(self.stop_fd, std.mem.asBytes(&one), @sizeOf(u64));
+            }
+        }
     }
 
     pub fn join(self: *Monitor) void {
@@ -146,6 +169,12 @@ pub const Monitor = struct {
             if (t) |th| th.join();
         }
         self.threads_len = 0;
+        if (comptime is_supported) {
+            if (self.stop_fd >= 0) {
+                _ = std.os.linux.close(self.stop_fd);
+                self.stop_fd = -1;
+            }
+        }
     }
 };
 
@@ -184,7 +213,7 @@ fn linuxStart(self: *Monitor) !void {
 fn kmsgThread(self: *Monitor, stop: *std.atomic.Value(bool)) void {
     if (comptime !is_supported) return;
     const kmsg = @import("kmsg.zig");
-    kmsg.run(self.io, self.sink, self.ctx, stop) catch |err| {
+    kmsg.run(self.io, self.sink, self.ctx, stop, self.stop_fd) catch |err| {
         log.warn("kmsg backend exited: {t}", .{err});
     };
 }
@@ -192,7 +221,7 @@ fn kmsgThread(self: *Monitor, stop: *std.atomic.Value(bool)) void {
 fn ebpfThread(self: *Monitor, stop: *std.atomic.Value(bool)) void {
     if (comptime !with_ebpf) return;
     const ebpf = @import("ebpf.zig");
-    ebpf.run(self.io, self.sink, self.ctx, stop) catch |err| {
+    ebpf.run(self.io, self.sink, self.ctx, stop, self.stop_fd) catch |err| {
         log.warn("ebpf backend exited: {t}", .{err});
     };
 }

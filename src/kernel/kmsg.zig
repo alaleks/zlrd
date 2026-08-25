@@ -2,9 +2,12 @@
 //! matches OOM-kill and segfault patterns. Linux-only — on other platforms
 //! `run` returns immediately.
 //!
-//! Allocation policy: a single 8 KiB stack buffer per read; pattern matchers
-//! never allocate. Detection latency is bounded by the poll timeout
-//! (`poll_timeout_ms`).
+//! Allocation policy: a single 16 KiB stack buffer per read; pattern matchers
+//! never allocate.
+//!
+//! The loop blocks in `poll` with no timeout when the caller supplies a stop
+//! eventfd, so an idle agent costs zero wakeups and shutdown is immediate.
+//! Without one it falls back to a `poll_timeout_ms` tick.
 //!
 //! Kmsg record format (see Documentation/ABI/testing/dev-kmsg):
 //!   `<level>,<seq>,<timestamp_us>,<flag>;<message>\n[ key=value ...]`
@@ -25,11 +28,47 @@ const read_buf_size = 16 * 1024;
 const poll_timeout_ms: i32 = 500;
 const kmsg_path = "/dev/kmsg";
 
+/// `stop_fd` is an eventfd the caller signals on shutdown; pass -1 to fall
+/// back to polling `stop` on a timer.
+/// What the drain loop does with the outcome of one `read()`.
+pub const ReadOutcome = enum {
+    /// Bytes were returned; parse them.
+    record,
+    /// Nothing left queued right now.
+    drained,
+    /// Recoverable — read again.
+    retry,
+    /// Unrecoverable; the backend gives up.
+    fatal,
+};
+
+/// Classifies a `read()` errno for the drain loop.
+///
+/// `EINVAL` is the one worth spelling out: it means the record was longer
+/// than our buffer. The kernel advances the reader's sequence number *before*
+/// it checks the length, so the oversized record is already skipped and the
+/// next read proceeds normally. Treating it as fatal — which this loop used
+/// to do — killed kernel monitoring for the life of the process over a single
+/// long line.
+pub fn classifyRead(e: std.posix.E) ReadOutcome {
+    return switch (e) {
+        .SUCCESS => .record,
+        .AGAIN => .drained,
+        // Fell behind the ring buffer; the kernel repositioned us at the
+        // oldest surviving record.
+        .PIPE => .retry,
+        .INVAL => .retry,
+        .INTR => .retry,
+        else => .fatal,
+    };
+}
+
 pub fn run(
     io: std.Io,
     sink: kernel.Sink,
     ctx: ?*anyopaque,
     stop: *std.atomic.Value(bool),
+    stop_fd: i32,
 ) !void {
     _ = io;
     if (comptime builtin.os.tag != .linux) return;
@@ -63,15 +102,20 @@ pub fn run(
     // Seek to end so we don't replay historical messages on startup.
     _ = linux.lseek(fd, 0, std.posix.SEEK.END);
 
-    var pollfd = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
+    // Watching the stop eventfd alongside kmsg lets the poll block
+    // indefinitely: an idle agent wakes zero times instead of twice a second
+    // forever, and shutdown is immediate rather than up to a timeout late.
+    var pollfds: [2]std.posix.pollfd = .{
+        .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = stop_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    const nfds: usize = if (stop_fd >= 0) 2 else 1;
+    const timeout: i32 = if (stop_fd >= 0) -1 else poll_timeout_ms;
     var buf: [read_buf_size]u8 = undefined;
+    var oversized_logged = false;
 
     while (!stop.load(.monotonic)) {
-        const pn = linux.poll(&pollfd, 1, poll_timeout_ms);
+        const pn = linux.poll(&pollfds, nfds, timeout);
         switch (std.posix.errno(pn)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -81,20 +125,25 @@ pub fn run(
             },
         }
         if (pn == 0) continue;
+        if (nfds == 2 and (pollfds[1].revents & std.posix.POLL.IN) != 0) return;
+        if ((pollfds[0].revents & std.posix.POLL.IN) == 0) continue;
 
-        while (true) {
+        // Drain everything currently queued, but keep honouring the stop
+        // flag: a kernel flooding the ring must not hold shutdown hostage.
+        while (!stop.load(.monotonic)) {
             const n = linux.read(fd, &buf, buf.len);
             const errno = std.posix.errno(n);
-            switch (errno) {
-                .SUCCESS => {},
-                .AGAIN => break,
-                .PIPE => {
-                    // We fell behind the ring buffer. Skip ahead.
-                    log.debug("kmsg reader fell behind; resyncing", .{});
+            switch (classifyRead(errno)) {
+                .record => {},
+                .drained => break,
+                .retry => {
+                    if (errno == .INVAL and !oversized_logged) {
+                        oversized_logged = true;
+                        log.warn("kmsg record exceeded the {d}-byte read buffer; skipping (logged once)", .{read_buf_size});
+                    }
                     continue;
                 },
-                .INTR => continue,
-                else => {
+                .fatal => {
                     log.warn("read failed: {s}", .{@tagName(errno)});
                     return;
                 },
@@ -255,4 +304,22 @@ test "handleRecord: ignores unrelated lines" {
     };
     handleRecord("6,1,1,-;random kernel chatter\n", Cap.cb, &calls);
     try testing.expectEqual(@as(u32, 0), calls);
+}
+
+test "classifyRead: an oversized record is skipped, not fatal" {
+    // The regression: `EINVAL` used to end the drain loop and with it the
+    // whole kmsg backend, so one over-long kernel line disabled OOM and
+    // segfault detection until the agent restarted.
+    try testing.expectEqual(ReadOutcome.retry, classifyRead(.INVAL));
+}
+
+test "classifyRead: covers the rest of the loop's outcomes" {
+    try testing.expectEqual(ReadOutcome.record, classifyRead(.SUCCESS));
+    try testing.expectEqual(ReadOutcome.drained, classifyRead(.AGAIN));
+    // Ring-buffer overrun: the kernel repositions us, so read again.
+    try testing.expectEqual(ReadOutcome.retry, classifyRead(.PIPE));
+    try testing.expectEqual(ReadOutcome.retry, classifyRead(.INTR));
+    // Anything genuinely broken still stops the backend.
+    try testing.expectEqual(ReadOutcome.fatal, classifyRead(.BADF));
+    try testing.expectEqual(ReadOutcome.fatal, classifyRead(.IO));
 }
