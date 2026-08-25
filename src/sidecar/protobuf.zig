@@ -247,6 +247,12 @@ pub const Encoder = struct {
     pub fn endMessage(self: *Encoder, pending: Pending) void {
         const body_len = self.buf.items.len - pending.body_start;
         const len_size = varintSize(body_len);
+        // `beginMessage` reserved exactly five bytes, so a body needing a
+        // longer length varint (≥ 2^35, i.e. 32 GiB) would underflow `slack`
+        // below and then wrap `items.len` — silent heap corruption in a
+        // release build. Unreachable for any real OTLP batch, but the
+        // reservation is what makes it so, and that is worth stating.
+        std.debug.assert(len_size <= 5);
         const slack = 5 - len_size;
 
         if (slack != 0) {
@@ -456,4 +462,71 @@ test "Encoder: writeVarintField / writeFixed64Field" {
     try testing.expectEqual(@as(u8, 0x11), b[3]);
     // 8 zero bytes
     for (b[4..12]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "Encoder: nested messages shrink their reserved length slot" {
+    // `beginMessage` reserves five bytes; `endMessage` back-fills a minimal
+    // varint and slides the body down. Nesting has to survive that shift:
+    // an outer message's `body_start` sits below every inner rewrite, and
+    // its length is computed from the buffer as it stands afterwards.
+    var enc = Encoder.init(testing.allocator);
+    defer enc.deinit();
+
+    const outer = try enc.beginMessage(1);
+    {
+        const inner = try enc.beginMessage(2);
+        try enc.writeStringField(1, "abc");
+        enc.endMessage(inner);
+    }
+    {
+        const inner = try enc.beginMessage(3);
+        try enc.writeVarintField(1, 300);
+        enc.endMessage(inner);
+    }
+    enc.endMessage(outer);
+
+    // field 1, LEN | len | [ field 2, LEN | 5 | (field 1, LEN | 3 | "abc") ]
+    //                      [ field 3, LEN | 3 | (field 1, VARINT | 300) ]
+    const expect = [_]u8{
+        0x0a, 12,
+        0x12, 5,
+        0x0a, 3,
+        'a',  'b',
+        'c',  0x1a,
+        3,    0x08,
+        0xac, 0x02,
+    };
+    try testing.expectEqualSlices(u8, &expect, enc.bytes());
+}
+
+test "Encoder: a body spanning the reserve boundary keeps its length exact" {
+    // 127 vs 128 bytes is where the length varint grows from one byte to
+    // two, so the shift distance changes. Both must decode back to the same
+    // body length.
+    for ([_]usize{ 126, 127, 128, 129, 16383, 16384 }) |body_len| {
+        var enc = Encoder.init(testing.allocator);
+        defer enc.deinit();
+
+        const payload = try testing.allocator.alloc(u8, body_len);
+        defer testing.allocator.free(payload);
+        @memset(payload, 'x');
+
+        const m = try enc.beginMessage(1);
+        try enc.buf.appendSlice(enc.allocator, payload);
+        enc.endMessage(m);
+
+        const out = enc.bytes();
+        // tag is one byte, then the length varint, then the body.
+        try testing.expectEqual(@as(u8, 0x0a), out[0]);
+        const len_size = varintSize(body_len);
+        try testing.expectEqual(1 + len_size + body_len, out.len);
+        // Decode the length back and check it matches.
+        var decoded: u64 = 0;
+        var shift: u6 = 0;
+        for (out[1 .. 1 + len_size]) |b| {
+            decoded |= @as(u64, b & 0x7f) << shift;
+            shift += 7;
+        }
+        try testing.expectEqual(body_len, decoded);
+    }
 }

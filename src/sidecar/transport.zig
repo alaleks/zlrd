@@ -65,7 +65,10 @@ pub const Transport = struct {
     /// slice and worked only because `agent.run` happened to keep the
     /// config alive for the full sidecar lifetime.
     base_url: []u8,
-    /// Owned headers — same lifetime reasoning as `base_url`.
+    /// Owned headers — same lifetime reasoning as `base_url`. Includes the
+    /// `Content-Encoding: gzip` entry, appended once here: every payload
+    /// goes out compressed, so rebuilding this array on each `send` only
+    /// bought an allocate/free pair per batch.
     extra_headers: []std.http.Header,
     max_retries: u8,
     max_payload_bytes: usize,
@@ -73,6 +76,16 @@ pub const Transport = struct {
     /// allocate it from scratch. Single-threaded use — the flush thread
     /// is the only caller.
     gzip_window: []u8,
+    /// Reused compressor output. A fresh `Allocating` per send re-grew the
+    /// same few tens of KiB by doubling every time; retaining it means a
+    /// steady stream of batches settles at one buffer. Same single-threaded
+    /// reasoning as `gzip_window`.
+    ///
+    /// Must be created with capacity: `flate.Compress.init` asserts its
+    /// output writer already has more than 8 bytes of buffer, so a
+    /// zero-capacity `Allocating` panics on the first compress in any
+    /// safety-checked build.
+    gzip_out: std.Io.Writer.Allocating,
 
     pub const Options = struct {
         /// Base URL like `https://collector.example.com:4318`. The `/v1/*`
@@ -96,12 +109,18 @@ pub const Transport = struct {
         const base_copy = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(base_copy);
 
-        const headers_copy = try allocator.alloc(std.http.Header, opts.headers.len);
+        // Caller headers plus the fixed Content-Encoding entry. `std` 0.16
+        // has no typed slot for it, so it rides along in the free-form list.
+        const headers_copy = try allocator.alloc(std.http.Header, opts.headers.len + 1);
         errdefer allocator.free(headers_copy);
-        @memcpy(headers_copy, opts.headers);
+        @memcpy(headers_copy[0..opts.headers.len], opts.headers);
+        headers_copy[opts.headers.len] = .{ .name = "Content-Encoding", .value = "gzip" };
 
         const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
         errdefer allocator.free(window);
+
+        var gzip_out: std.Io.Writer.Allocating = try .initCapacity(allocator, gzip_out_initial_capacity);
+        errdefer gzip_out.deinit();
 
         return .{
             .allocator = allocator,
@@ -112,6 +131,7 @@ pub const Transport = struct {
             .max_retries = opts.max_retries,
             .max_payload_bytes = opts.max_payload_bytes,
             .gzip_window = window,
+            .gzip_out = gzip_out,
         };
     }
 
@@ -120,6 +140,7 @@ pub const Transport = struct {
         self.allocator.free(self.base_url);
         self.allocator.free(self.extra_headers);
         self.allocator.free(self.gzip_window);
+        self.gzip_out.deinit();
         self.* = undefined;
     }
 
@@ -133,11 +154,11 @@ pub const Transport = struct {
             return .encoding_failed;
         };
 
+        // Borrowed from `self.gzip_out`; valid until the next `send`.
         const compressed = self.gzipCompress(payload) catch |err| {
             log.warn("sidecar: gzip failed for {s}: {t}", .{ url, err });
             return .encoding_failed;
         };
-        defer self.allocator.free(compressed);
 
         // Collectors enforce per-request size limits; refuse to send a
         // batch that's certainly going to be rejected.
@@ -147,19 +168,6 @@ pub const Transport = struct {
             });
             return .non_retryable;
         }
-
-        // `Content-Encoding: gzip` isn't a typed slot on
-        // `http.Client.Request.Headers` in std 0.16 — pass it through the
-        // free-form `extra_headers` list alongside any caller-supplied auth
-        // headers. Built once per send and freed at the end.
-        const ce_header: std.http.Header = .{ .name = "Content-Encoding", .value = "gzip" };
-        const headers_with_gzip = self.allocator.alloc(std.http.Header, self.extra_headers.len + 1) catch {
-            log.warn("sidecar: out of memory building headers", .{});
-            return .encoding_failed;
-        };
-        defer self.allocator.free(headers_with_gzip);
-        @memcpy(headers_with_gzip[0..self.extra_headers.len], self.extra_headers);
-        headers_with_gzip[self.extra_headers.len] = ce_header;
 
         var attempt: u8 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
@@ -175,7 +183,7 @@ pub const Transport = struct {
                 .headers = .{
                     .content_type = .{ .override = "application/x-protobuf" },
                 },
-                .extra_headers = headers_with_gzip,
+                .extra_headers = self.extra_headers,
             }) catch |err| {
                 if (attempt == self.max_retries) {
                     log.warn("sidecar POST {s} failed after {d} retries: {t}", .{ url, attempt, err });
@@ -198,20 +206,25 @@ pub const Transport = struct {
         return .retryable_exhausted;
     }
 
-    fn gzipCompress(self: *Transport, src: []const u8) ![]u8 {
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        errdefer aw.deinit();
+    /// Compresses `src` into the retained output buffer. The returned slice
+    /// borrows from `self` and stays valid until the next call.
+    fn gzipCompress(self: *Transport, src: []const u8) ![]const u8 {
+        self.gzip_out.clearRetainingCapacity();
         var compress = try std.compress.flate.Compress.init(
-            &aw.writer,
+            &self.gzip_out.writer,
             self.gzip_window,
             .gzip,
             .level_6,
         );
         try compress.writer.writeAll(src);
         try compress.finish();
-        return aw.toOwnedSlice();
+        return self.gzip_out.written();
     }
 };
+
+/// Starting size of the reused compressor output buffer. Must be greater
+/// than 8 — see `Transport.gzip_out`.
+const gzip_out_initial_capacity: usize = 8 * 1024;
 
 /// Longest `Signal.path()` value. Used at init to bound the URL length.
 const max_signal_path_len: usize = "/v1/metrics".len;
@@ -282,4 +295,104 @@ test "Transport.init: clones base_url and survives caller-side free" {
     // Trailing slash should have been stripped.
     try testing.expectEqualStrings("https://collector.example.com:4318", tr.base_url);
     tr.deinit();
+}
+
+/// Counts allocations so the per-send behaviour can be asserted rather than
+/// eyeballed.
+const CountingAllocator = struct {
+    child: std.mem.Allocator,
+    allocs: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, b: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(b, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, b: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.child.rawRemap(b, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, b: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(b, a, ra);
+    }
+};
+
+test "Content-Encoding is folded into the header list once, at init" {
+    var t = try Transport.init(testing.allocator, std.Options.debug_io, .{
+        .base_url = "https://collector.example.com:4318",
+        .headers = &.{.{ .name = "x-tenant", .value = "acme" }},
+    });
+    defer t.deinit();
+
+    try testing.expectEqual(@as(usize, 2), t.extra_headers.len);
+    try testing.expectEqualStrings("x-tenant", t.extra_headers[0].name);
+    try testing.expectEqualStrings("Content-Encoding", t.extra_headers[1].name);
+    try testing.expectEqualStrings("gzip", t.extra_headers[1].value);
+}
+
+test "gzipCompress reuses its buffer across calls" {
+    // A fresh `Allocating` per send re-grew the output by doubling every
+    // time. Once the buffer has settled, repeat payloads of the same size
+    // must not allocate at all.
+    var counting = CountingAllocator{ .child = testing.allocator };
+    const alloc = counting.allocator();
+
+    var t = try Transport.init(alloc, std.Options.debug_io, .{
+        .base_url = "https://collector.example.com:4318",
+        .headers = &.{},
+    });
+    defer t.deinit();
+
+    var payload: [16 * 1024]u8 = undefined;
+    for (&payload, 0..) |*c, i| c.* = @intCast('a' + (i % 26));
+
+    // First call grows the buffer.
+    const first = try t.gzipCompress(&payload);
+    try testing.expect(first.len > 0);
+
+    // Subsequent identical calls should not.
+    const before = counting.allocs;
+    for (0..8) |_| {
+        const out = try t.gzipCompress(&payload);
+        try testing.expectEqual(first.len, out.len);
+    }
+    try testing.expectEqual(before, counting.allocs);
+}
+
+test "gzipCompress output round-trips through the gzip decoder" {
+    // The buffer is reused, so a stale tail from a longer previous payload
+    // would silently corrupt a shorter one.
+    var t = try Transport.init(testing.allocator, std.Options.debug_io, .{
+        .base_url = "https://collector.example.com:4318",
+        .headers = &.{},
+    });
+    defer t.deinit();
+
+    const long = "L" ** 4096;
+    const short = "short payload";
+
+    _ = try t.gzipCompress(long);
+    const compressed = try t.gzipCompress(short);
+
+    var in: std.Io.Reader = .fixed(compressed);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var decompress = std.compress.flate.Decompress.init(&in, .gzip, &window);
+    _ = try decompress.reader.streamRemaining(&out.writer);
+    try testing.expectEqualStrings(short, out.written());
 }
