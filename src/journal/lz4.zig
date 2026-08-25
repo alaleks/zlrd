@@ -75,9 +75,10 @@ pub fn decompressBlock(src: []const u8, dst: []u8) Error!usize {
                 const b = src[sp];
                 sp += 1;
                 lit_len += b;
-                // Bound the running sum so a malformed stream with many 0xFF
-                // bytes can't overflow `usize` on 32-bit builds.
-                if (lit_len > dst.len - dp + 1) return error.Truncated;
+                // Bound the running sum against the space actually left in
+                // `dst`, so a malformed stream with a long 0xFF run can
+                // neither overflow `usize` nor spin.
+                if (lit_len > dst.len - dp) return error.Truncated;
                 if (b != 0xFF) break;
             }
         }
@@ -104,18 +105,22 @@ pub fn decompressBlock(src: []const u8, dst: []u8) Error!usize {
                 const b = src[sp];
                 sp += 1;
                 match_len += b;
-                if (match_len > dst.len - dp + 1) return error.Truncated;
+                if (match_len > dst.len - dp) return error.Truncated;
                 if (b != 0xFF) break;
             }
         }
         if (dp + match_len > dst.len) return error.Truncated;
 
-        // Byte-by-byte copy because matches with offset < match_len overlap
-        // their own output and must propagate forward (RLE-style).
         const match_src = dp - offset;
-        var i: usize = 0;
-        while (i < match_len) : (i += 1) {
-            dst[dp + i] = dst[match_src + i];
+        if (offset >= match_len) {
+            // Source and destination ranges are disjoint — the common case
+            // for real matches, and worth a vectorized copy.
+            @memcpy(dst[dp..][0..match_len], dst[match_src..][0..match_len]);
+        } else {
+            // The match overlaps its own output: the format encodes runs
+            // this way, so the copy has to propagate forward one byte at a
+            // time rather than reading a stale snapshot.
+            for (0..match_len) |i| dst[dp + i] = dst[match_src + i];
         }
         dp += match_len;
     }
@@ -211,4 +216,101 @@ test "rejects a match with zero offset" {
     const block = [_]u8{ 0x01, 0x00, 0x00 };
     var dst: [5]u8 = undefined;
     try testing.expectError(error.InvalidOffset, decompressBlock(&block, &dst));
+}
+
+test "rejects a match reaching before the start of the output" {
+    // 0 literals, match_len 4, offset 5 — but nothing has been produced yet,
+    // so the match would read from before `dst`.
+    const block = [_]u8{ 0x00, 0x05, 0x00 };
+    var dst: [8]u8 = undefined;
+    try testing.expectError(error.InvalidOffset, decompressBlock(&block, &dst));
+}
+
+test "extended match length (nibble 15 plus continuation bytes)" {
+    // Literals "ABCD", then a match with the match nibble saturated:
+    // match_len = (15 + 4) + 1 = 20, offset 4 → a 4-byte repeating run.
+    // Layout is token, literals, 2-byte offset, THEN the match-length
+    // continuation — getting that order wrong silently shifts the stream.
+    const block = [_]u8{ 0x4F, 'A', 'B', 'C', 'D', 0x04, 0x00, 0x01, 0x00 };
+    var dst: [24]u8 = undefined;
+    const n = try decompressBlock(&block, &dst);
+    try testing.expectEqual(@as(usize, 24), n);
+    try testing.expectEqualStrings("ABCD" ** 6, &dst);
+}
+
+test "overlapping match with offset 1 expands to a run" {
+    // 1 literal 'Z', match_len 7, offset 1 → each copied byte must see the
+    // byte written one step earlier, not a pre-match snapshot.
+    const block = [_]u8{ 0x13, 'Z', 0x01, 0x00, 0x00 };
+    var dst: [8]u8 = undefined;
+    const n = try decompressBlock(&block, &dst);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualStrings("ZZZZZZZZ", &dst);
+}
+
+test "disjoint match copies without overlap" {
+    // 20 literals, then match_len 4 at offset 20: source and destination
+    // ranges don't touch, which takes the bulk-copy path.
+    const lits = "0123456789abcdefghij";
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(testing.allocator);
+    try block.append(testing.allocator, 0xF0); // 15+ literals, match nibble 0
+    try block.append(testing.allocator, lits.len - 15);
+    try block.appendSlice(testing.allocator, lits);
+    try block.appendSlice(testing.allocator, &.{ 0x14, 0x00 }); // offset 20
+    try block.append(testing.allocator, 0x00); // final literals-only token
+
+    var dst: [24]u8 = undefined;
+    const n = try decompressBlock(block.items, &dst);
+    try testing.expectEqual(@as(usize, 24), n);
+    try testing.expectEqualStrings(lits ++ "0123", &dst);
+}
+
+test "literal run longer than one continuation byte round-trips" {
+    // 300 bytes forces encodeAllLiterals to emit 0xFF + remainder, and the
+    // decoder to sum across two continuation bytes.
+    var payload: [300]u8 = undefined;
+    for (&payload, 0..) |*c, i| c.* = @intCast('a' + (i % 26));
+
+    const block = try encodeAllLiterals(testing.allocator, &payload);
+    defer testing.allocator.free(block);
+
+    var dst: [300]u8 = undefined;
+    const n = try decompressBlock(block, &dst);
+    try testing.expectEqual(@as(usize, 300), n);
+    try testing.expectEqualSlices(u8, &payload, &dst);
+}
+
+test "rejects a block that decodes to fewer bytes than declared" {
+    const block = try encodeAllLiterals(testing.allocator, "abcd");
+    defer testing.allocator.free(block);
+
+    var wrapped = std.ArrayList(u8).empty;
+    defer wrapped.deinit(testing.allocator);
+    var size_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size_bytes, 10, .little); // claims 10, yields 4
+    try wrapped.appendSlice(testing.allocator, &size_bytes);
+    try wrapped.appendSlice(testing.allocator, block);
+
+    try testing.expectError(error.SizeMismatch, decompressSystemd(testing.allocator, wrapped.items));
+}
+
+test "rejects a payload too short to hold the size prefix" {
+    try testing.expectError(error.InvalidSize, decompressSystemd(testing.allocator, "short"));
+    try testing.expectError(error.InvalidSize, decompressSystemd(testing.allocator, ""));
+}
+
+test "rejects a literal run that would overrun the output buffer" {
+    // Token claims 15+ literals and the continuation says 300, but the
+    // caller only sized `dst` for 16.
+    const block = [_]u8{ 0xF0, 0xFF, 0x2A } ++ [_]u8{'x'} ** 16;
+    var dst: [16]u8 = undefined;
+    try testing.expectError(error.Truncated, decompressBlock(&block, &dst));
+}
+
+test "rejects a match that would overrun the output buffer" {
+    // 2 literals then match_len 15+4+255+... past the end of `dst`.
+    const block = [_]u8{ 0x2F, 'A', 'B', 0x02, 0x00, 0xFF, 0xFF };
+    var dst: [8]u8 = undefined;
+    try testing.expectError(error.Truncated, decompressBlock(&block, &dst));
 }

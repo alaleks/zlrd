@@ -349,7 +349,10 @@ pub const JournalSource = struct {
         try it.enableCache(self.allocator);
         defer it.disableCache(self.allocator);
 
-        var watcher = native.Watcher.init(self.io, &r, .{
+        // `path` comes from `findActiveJournalPath` and is absolute, which
+        // the inotify watch requires — a relative path would resolve against
+        // the process CWD instead of `dir`.
+        var watcher = native.Watcher.init(self.io, .{
             .dir = std.Io.Dir.cwd(),
             .path = path,
         });

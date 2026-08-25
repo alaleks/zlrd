@@ -223,8 +223,21 @@ test "incompat.supported gates accepted flags" {
     try testing.expect((incompat.supported & incompat.compressed_zstd) == 0);
 }
 
-test "endianness check: format is documented as machine-native" {
-    // The journal format is explicitly NOT portable across machines. Verify
-    // we're running little-endian (where every modern systemd target sits).
-    try testing.expectEqual(builtin.cpu.arch.endian(), .little);
+test "on-disk headers decode as little-endian" {
+    // The journal format is explicitly NOT portable across machines, and
+    // this reader takes the shortcut of casting on-disk bytes straight to
+    // `extern struct`s. That is only correct on a little-endian host — on a
+    // big-endian one the module would need byte swaps it does not have, so
+    // skip rather than report a failure the code can't act on.
+    if (comptime builtin.cpu.arch.endian() != .little) return error.SkipZigTest;
+
+    var bytes: [@sizeOf(ObjectHeader)]u8 = .{0} ** @sizeOf(ObjectHeader);
+    bytes[0] = @intFromEnum(ObjectType.entry_array);
+    // size = 0x0102 stored little-endian at offset 8.
+    bytes[8] = 0x02;
+    bytes[9] = 0x01;
+
+    const obj = std.mem.bytesAsValue(ObjectHeader, &bytes).*;
+    try testing.expectEqual(@intFromEnum(ObjectType.entry_array), obj.type);
+    try testing.expectEqual(@as(u64, 0x0102), obj.size);
 }
