@@ -45,9 +45,13 @@ pub const Glyphs = struct {
     bottom: []const u8,
     /// Horizontal stroke trailing the corners.
     rule: []const u8,
+    /// Whether non-ASCII output renders here at all. Callers outside the
+    /// JSON block — the banner, error markers — key their own symbol choices
+    /// off this rather than duplicating the detection.
+    unicode_ok: bool,
 
-    pub const unicode: Glyphs = .{ .bar = "│", .top = "╭", .bottom = "╰", .rule = "─" };
-    pub const ascii: Glyphs = .{ .bar = "|", .top = "+", .bottom = "+", .rule = "-" };
+    pub const unicode: Glyphs = .{ .bar = "│", .top = "╭", .bottom = "╰", .rule = "─", .unicode_ok = true };
+    pub const ascii: Glyphs = .{ .bar = "|", .top = "+", .bottom = "+", .rule = "-", .unicode_ok = false };
 };
 
 /// Every escape sequence the printers emit. Empty strings in `Mode.none` make

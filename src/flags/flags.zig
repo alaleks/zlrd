@@ -240,7 +240,33 @@ pub fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) P
     return parseArgsFromIter(allocator, &it);
 }
 
-pub fn printHelp() void {
+/// Writes `text` to stdout, dropping ANSI CSI sequences when `colored` is
+/// false. Filtering at write time keeps one copy of the help string in the
+/// binary instead of a coloured and a plain variant of every line.
+fn writeHelp(text: []const u8, colored: bool) void {
+    const out = std.Io.File.stdout();
+    const io = std.Options.debug_io;
+    if (colored) {
+        out.writeStreamingAll(io, text) catch {};
+        return;
+    }
+    var i: usize = 0;
+    var run_start: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
+            if (i > run_start) out.writeStreamingAll(io, text[run_start..i]) catch {};
+            i += 2;
+            while (i < text.len and text[i] != 'm') : (i += 1) {}
+            i += 1;
+            run_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if (run_start < text.len) out.writeStreamingAll(io, text[run_start..]) catch {};
+}
+
+pub fn printHelp(colored: bool) void {
     // ANSI — consistent with the rest of the codebase (GitHub Dark palette)
     const b = "\x1b[1m"; // bold  (section headers)
     const sh = "\x1b[38;2;227;179;65m"; // amber (short flags   -x)
@@ -348,14 +374,14 @@ pub fn printHelp() void {
         "  " ++ gr ++ "zlrd --output json app.log | jq ." ++ r ++ "\n" ++
         "\n";
 
-    std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, text) catch {};
+    writeHelp(text, colored);
 }
 
 /// Reader-only help. Used by `zlrd-lite`, which is built without agent /
 /// sidecar / journal / kernel code. Agent-mode flags are omitted from the
 /// listing; if the user still passes them, `main_lite.zig` prints an error
 /// pointing to the full `zlrd` binary.
-pub fn printHelpLite() void {
+pub fn printHelpLite(colored: bool) void {
     const b = "\x1b[1m";
     const sh = "\x1b[38;2;227;179;65m";
     const lo = "\x1b[38;2;88;166;255m";
@@ -417,7 +443,7 @@ pub fn printHelpLite() void {
         ar ++ "webhooks, journal, sidecar, kernel probes), install the full `zlrd` binary." ++ r ++ "\n" ++
         "\n";
 
-    std.Io.File.stdout().writeStreamingAll(std.Options.debug_io, text) catch {};
+    writeHelp(text, colored);
 }
 
 /// Mutable buffers for repeatable string-list flags (--file, agent-mode repeatables).

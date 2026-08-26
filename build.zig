@@ -11,6 +11,21 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "with_ebpf", with_ebpf);
     const build_options_mod = build_options.createModule();
 
+    // A second options module with the eBPF backend forced on, used for one
+    // extra compile of `ebpf.zig` under `zig build test`.
+    //
+    // This only bites on a Linux host: the backend's functions open with a
+    // comptime `if (os.tag != .linux) return`, after which Zig stops
+    // analysing the body, so a macOS test run cannot see inside it either
+    // way. The guarantee for everyone else is the cross-compile step in CI —
+    // `-Dtarget=…-linux -Dwith-ebpf=true` is what actually catches a break
+    // here, and the backend went un-compiled long enough to accumulate one
+    // against the 0.16 `perf_event_attr` layout.
+    const ebpf_on_options = b.addOptions();
+    ebpf_on_options.addOption([]const u8, "version", version);
+    ebpf_on_options.addOption(bool, "with_ebpf", true);
+    const ebpf_on_options_mod = ebpf_on_options.createModule();
+
     const flags_mod = b.createModule(.{
         .root_source_file = b.path("src/flags/flags.zig"),
         .target = target,
@@ -226,6 +241,37 @@ pub fn build(b: *std.Build) void {
 
     {
         const tests = b.addTest(.{ .root_module = sidecar_mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // Compile-only check of the eBPF backend with the feature enabled. See
+    // `ebpf_on_options`: meaningful on a Linux host, a no-op elsewhere.
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/kernel/ebpf.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("build_options", ebpf_on_options_mod);
+        const tests = b.addTest(.{ .root_module = mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // The two entry points carry no tests of their own, but registering them
+    // means `zig build test` type-checks them in a test build too.
+    inline for ([_][]const u8{ "src/main.zig", "src/main_lite.zig" }) |path| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("build_options", build_options_mod);
+        mod.addImport("flags", flags_mod);
+        mod.addImport("simd", simd_mod);
+        mod.addImport("regex", regex_mod);
+        if (comptime std.mem.eql(u8, path, "src/main.zig")) mod.addImport("agent", agent_mod);
+
+        const tests = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 

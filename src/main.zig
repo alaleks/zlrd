@@ -21,22 +21,40 @@ pub fn main(opts: struct {
     const allocator = opts.gpa;
     const io = opts.io;
 
+    // Resolve terminal capabilities before anything is written. stdout and
+    // stderr get separate answers on purpose: `zlrd app.log | less` leaves
+    // stderr on the terminal, and an error message there should still be
+    // legible.
+    const stdout = std.Io.File.stdout();
+    const stderr_file = std.Io.File.stderr();
+    const vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
+    const out_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stdout.isTty(io) catch false));
+    const err_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stderr_file.isTty(io) catch false));
+
     var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
-        fatal(io, parseErrorMessage(err), "run zlrd --help for usage");
+        // `--color` is unavailable when parsing is what failed, so this one
+        // path falls back to plain auto-detection.
+        const early = reader.theme_mod.resolve(err_env, .auto);
+        fatal(io, &early, parseErrorMessage(err), "run zlrd --help for usage");
         std.process.exit(1);
     };
     defer parsed_args.deinit(allocator);
 
+    const choice: reader.theme_mod.ColorChoice = switch (parsed_args.color) {
+        .auto => .auto,
+        .always => .always,
+        .never => .never,
+    };
+    const th = reader.theme_mod.resolve(out_env, choice);
+    const err_th = reader.theme_mod.resolve(err_env, choice);
+
     if (parsed_args.version) {
-        const ver_name = "\x1b[2m\x1b[38;2;88;166;255mz\x1b[38;2;63;185;80ml\x1b[38;2;227;179;65mr\x1b[38;2;248;81;73md\x1b[0m";
-        std.Io.File.stdout().writeStreamingAll(io, ver_name ++ " " ++ build_options.version ++ "\n\n") catch {};
-        std.Io.File.stdout().writeStreamingAll(io, "\x1b[4mhttps://github.com/alaleks/zlrd\x1b[0m\n\n") catch {};
-        std.Io.File.stdout().writeStreamingAll(io, "\x1b[2m⭐ Star if you like it · PRs welcome!\x1b[0m\n") catch {};
+        printVersion(io, &th);
         return;
     }
 
     if (parsed_args.help) {
-        flags.printHelp();
+        flags.printHelp(th.colored);
         return;
     }
 
@@ -58,11 +76,11 @@ pub fn main(opts: struct {
 
     if (parsed_args.files.len == 0 and !agent_journal_only) {
         discovered_files = findLogFiles(allocator, io) catch {
-            fatal(io, "could not read current directory", "check read permissions: ls -la .");
+            fatal(io, &err_th, "could not read current directory", "check read permissions: ls -la .");
             std.process.exit(1);
         };
         if (discovered_files.len == 0) {
-            fatal(io, "no *.log or *.log.gz files found in current directory", "specify a file: zlrd app.log");
+            fatal(io, &err_th, "no *.log or *.log.gz files found in current directory", "specify a file: zlrd app.log");
             std.process.exit(1);
         }
         parsed_args.files = discovered_files;
@@ -73,7 +91,7 @@ pub fn main(opts: struct {
                 var buf: [512]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "{s}: tail mode is not supported for .gz files", .{path}) catch
                     "tail mode is not supported for .gz files";
-                fatal(io, msg, "decompress first: gunzip file.log.gz");
+                fatal(io, &err_th, msg, "decompress first: gunzip file.log.gz");
                 all_ok = false;
                 continue;
             }
@@ -89,7 +107,7 @@ pub fn main(opts: struct {
                     error.AccessDenied => "check permissions or try with sudo",
                     else => null,
                 };
-                fatal(io, msg, hint);
+                fatal(io, &err_th, msg, hint);
                 all_ok = false;
             };
         }
@@ -98,47 +116,74 @@ pub fn main(opts: struct {
 
     if (parsed_args.agent_mode) {
         const exit_code = agent.run(allocator, io, parsed_args) catch |err| {
-            fatal(io, agentErrorMessage(err), agentErrorHint(err));
+            fatal(io, &err_th, agentErrorMessage(err), agentErrorHint(err));
             std.process.exit(1);
         };
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
-    // Resolve terminal capabilities once: colour depth, whether to colour at
-    // all, and whether box-drawing will render. Everything downstream reads
-    // the result instead of assuming a dark 24-bit terminal.
-    const stdout = std.Io.File.stdout();
-    const vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
-    const is_tty = vt_ok and (stdout.isTty(io) catch false);
-    const th = reader.theme_mod.resolve(
-        reader.theme_mod.fromMap(opts.environ_map, is_tty),
-        switch (parsed_args.color) {
-            .auto => .auto,
-            .always => .always,
-            .never => .never,
-        },
-    );
-
     if (!parsed_args.output_json and !parsed_args.tail_mode and th.colored) printBanner(io, &th);
     processFiles(allocator, parsed_args, &th) catch |err| {
-        fatal(io, runtimeErrorMessage(err), null);
+        fatal(io, &err_th, runtimeErrorMessage(err), null);
         std.process.exit(1);
     };
 }
 
 /// Styled fatal error. `hint` is optional follow-up line shown in muted colour.
-fn fatal(io: std.Io, msg: []const u8, hint: ?[]const u8) void {
+/// Styled fatal error. `hint` is an optional follow-up line in muted colour.
+///
+/// Takes the stderr theme rather than hard-coding escapes: error output is
+/// the most likely thing to be redirected into a file, a CI log or a bug
+/// report, and it used to emit 24-bit colour there regardless of `NO_COLOR`
+/// or whether stderr was even a terminal.
+fn fatal(io: std.Io, th: *const reader.Theme, msg: []const u8, hint: ?[]const u8) void {
     const e = std.Io.File.stderr();
-    e.writeStreamingAll(io, "\n\x1b[1;38;2;248;81;73m✗\x1b[0m  ") catch {};
+    const p = th.palette;
+    const cross = if (th.glyphs.unicode_ok) "\u{2717}" else "x";
+    const arrow = if (th.glyphs.unicode_ok) "\u{2192}" else "->";
+
+    e.writeStreamingAll(io, "\n") catch {};
+    if (th.colored) e.writeStreamingAll(io, "\x1b[1m") catch {};
+    e.writeStreamingAll(io, p.level[@intFromEnum(flags.Level.Error)]) catch {};
+    e.writeStreamingAll(io, cross) catch {};
+    e.writeStreamingAll(io, p.reset) catch {};
+    e.writeStreamingAll(io, "  ") catch {};
     e.writeStreamingAll(io, msg) catch {};
     e.writeStreamingAll(io, "\n") catch {};
     if (hint) |h| {
-        e.writeStreamingAll(io, "\x1b[38;2;139;148;158m   → ") catch {};
+        e.writeStreamingAll(io, p.muted) catch {};
+        e.writeStreamingAll(io, "   ") catch {};
+        e.writeStreamingAll(io, arrow) catch {};
+        e.writeStreamingAll(io, " ") catch {};
         e.writeStreamingAll(io, h) catch {};
-        e.writeStreamingAll(io, "\x1b[0m\n") catch {};
+        e.writeStreamingAll(io, p.reset) catch {};
+        e.writeStreamingAll(io, "\n") catch {};
     }
     e.writeStreamingAll(io, "\n") catch {};
+}
+
+/// `--version`. Same palette treatment as the banner, so `zlrd --version`
+/// piped into a file no longer carries escape bytes.
+fn printVersion(io: std.Io, th: *const reader.Theme) void {
+    const w = std.Io.File.stdout();
+    const p = th.palette;
+    var buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}{s}z{s}l{s}r{s}d{s}{s}", .{
+        p.dim,      p.json_key, p.json_bool_null, p.muted,
+        p.json_key, p.reset,    "",
+    }) catch return;
+    w.writeStreamingAll(io, name) catch {};
+    w.writeStreamingAll(io, " " ++ build_options.version ++ "\n\n") catch {};
+    if (th.colored) w.writeStreamingAll(io, "\x1b[4m") catch {};
+    w.writeStreamingAll(io, "https://github.com/alaleks/zlrd") catch {};
+    w.writeStreamingAll(io, p.reset) catch {};
+    w.writeStreamingAll(io, "\n\n") catch {};
+    w.writeStreamingAll(io, p.dim) catch {};
+    const star = if (th.glyphs.unicode_ok) "\u{2b50} Star if you like it \u{b7} PRs welcome!" else "Star if you like it - PRs welcome!";
+    w.writeStreamingAll(io, star) catch {};
+    w.writeStreamingAll(io, p.reset) catch {};
+    w.writeStreamingAll(io, "\n") catch {};
 }
 
 fn printBanner(io: std.Io, th: *const reader.Theme) void {

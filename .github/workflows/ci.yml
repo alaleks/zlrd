@@ -1,0 +1,75 @@
+# Runs on every push and pull request. Until this existed the only workflow
+# was `release.yml`, which fires on `v*` tags and merely builds binaries — so
+# `zig build test` had never run in CI at all, and neither had any build with
+# `-Dwith-ebpf=true`. Both gaps let real breakage reach the default branch.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: zig fmt --check build.zig src
+
+      - name: Unit tests
+        run: zig build test
+
+      # Safety checks are on in Debug and ReleaseSafe but compiled out of
+      # ReleaseFast, which is what ships. A bug that only trips an assert
+      # needs the first two; one that only appears under optimisation needs
+      # the last.
+      - name: Unit tests (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Unit tests (ReleaseFast)
+        run: zig build test -Doptimize=ReleaseFast
+
+  cross:
+    name: Cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-windows-gnu
+          - x86_64-macos
+          - aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      # A host build hides platform-gated code: Linux-only backends and the
+      # Windows ABI differences both go unanalysed until something targets
+      # them.
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      # The eBPF backend is Linux-only and off by default, so nothing
+      # compiles it unless a build asks for it explicitly.
+      - name: Build with eBPF
+        if: contains(matrix.target, 'linux')
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dwith-ebpf=true
