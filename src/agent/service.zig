@@ -21,6 +21,7 @@
 const std = @import("std");
 const flags = @import("flags");
 const regex = @import("regex");
+const signature = @import("signature.zig");
 
 /// Cap on retained stack trace bytes. Keeps the alert payload small enough
 /// for a single HTTP POST and protects against runaway recursive panics.
@@ -37,6 +38,11 @@ pub const default_stop_window_ms: u64 = 30_000;
 
 pub const MarkerKind = enum {
     go_panic,
+    /// Go's runtime *throw* path — `fatal error:`, `runtime: out of memory`,
+    /// the `[signal SIG…]` banner. Distinct from a panic: deferred functions
+    /// do not run and the process is already gone, so it is strictly worse
+    /// news than `go_panic` and worth telling apart downstream.
+    go_fatal,
     python_traceback,
     java_exception,
     fatal_level,
@@ -47,6 +53,7 @@ pub const MarkerKind = enum {
     pub fn label(self: MarkerKind) []const u8 {
         return switch (self) {
             .go_panic => "go_panic",
+            .go_fatal => "go_fatal",
             .python_traceback => "python_traceback",
             .java_exception => "java_exception",
             .fatal_level => "fatal_level",
@@ -97,19 +104,71 @@ pub const Detector = struct {
         if (level) |l| {
             if (l == .Fatal) return .fatal_level;
             if (l == .Panic) return .panic_level;
+            // A line carrying its own level below Error came out of a
+            // logger, so any runtime phrase in it is quoted text rather than
+            // a crash. `{"level":"info","msg":"recovered from panic: …"}`
+            // used to register as a Go panic.
+            //
+            // User-supplied patterns are deliberately still honoured: the
+            // operator asked for those explicitly.
+            if (@intFromEnum(l) < @intFromEnum(flags.Level.Error)) return self.matchCustom(line);
         }
-        // Go's runtime prints "panic: <reason>" before the stack — anchor on
-        // the marker, allow leading whitespace / level prefixes by scanning
-        // anywhere in the line.
-        if (std.mem.indexOf(u8, line, "panic:") != null) return .go_panic;
-        if (std.mem.indexOf(u8, line, "Traceback (most recent call last):") != null) return .python_traceback;
-        if (std.mem.indexOf(u8, line, "Exception in thread ") != null) return .java_exception;
+        if (runtimeMarker(line)) |m| return m;
+        if (bannerAt(line, "Traceback (most recent call last):")) return .python_traceback;
+        if (bannerAt(line, "Exception in thread ")) return .java_exception;
+        return self.matchCustom(line);
+    }
+
+    fn matchCustom(self: *const Detector, line: []const u8) ?MarkerKind {
         for (self.customs) |*re| {
             if (re.isMatch(line)) return .custom_regex;
         }
         return null;
     }
 };
+
+/// Go runtime crash banners.
+///
+/// `fatal error:` and friends were missing outright, which is the whole
+/// unrecoverable family — concurrent map writes, deadlock, stack overflow,
+/// out of memory. They are not panics: no deferred function runs and the
+/// process is already unwinding in the runtime.
+fn runtimeMarker(line: []const u8) ?MarkerKind {
+    if (bannerAt(line, "panic: ")) return .go_panic;
+    if (bannerAt(line, "fatal error: ")) return .go_fatal;
+    if (bannerAt(line, "runtime: out of memory")) return .go_fatal;
+    // Printed on the line after `panic:` for a SIGSEGV/SIGBUS. Reached on its
+    // own only when the panic line was lost; while a crash is already being
+    // collected the tracker feeds this into the trace instead.
+    if (bannerAt(line, "[signal SIG")) return .go_fatal;
+    return null;
+}
+
+/// True when `banner` starts the line, or starts the message portion of a
+/// captured line whose envelope ends in `:`, `]` or `|`.
+///
+/// The Go runtime writes its banner straight to stderr with no logger
+/// prefix, so in raw output it sits at column 0; a capture layer may put
+/// `unit[123]: ` or `2026-08-26T10:00:00Z |` in front of it. What can never
+/// precede it is an English word or a quote — and matching those is how
+/// `GET /api/panic:status`, `"panic:0 restarts:0"` and `no panic: all good`
+/// all used to be reported as crashes.
+fn bannerAt(line: []const u8, banner: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, line, i, banner)) |hit| {
+        if (hit == 0) return true;
+        // Walk back over the separating whitespace.
+        var j = hit;
+        while (j > 0 and (line[j - 1] == ' ' or line[j - 1] == '\t')) j -= 1;
+        if (j == 0) return true; // only indentation before it
+        if (j < hit) {
+            const last = line[j - 1];
+            if (last == ':' or last == ']' or last == '|') return true;
+        }
+        i = hit + 1;
+    }
+    return false;
+}
 
 /// Inline stack-trace builder. Appends lines until the continuation
 /// heuristic breaks or the byte/line cap is reached.
@@ -566,4 +625,129 @@ test "Tracker.observeInodeChange: emits restart and resets crash state" {
     try testing.expectEqual(@as(u64, 1), ev.restart_count);
     try testing.expect(t.state == .running);
     try testing.expect(!t.trace.active);
+}
+
+// ─── Go crash-banner accuracy ─────────────────────────────────────────────
+//
+// Measured against this corpus before the rewrite: precision 69%, recall
+// 55%. The whole `fatal error:` family was missing, and `panic:` matched
+// anywhere in the line, so log messages *quoting* a panic registered as
+// crashes.
+
+const GoCase = struct {
+    line: []const u8,
+    crash: bool,
+    marker: ?MarkerKind = null,
+};
+
+const go_corpus = [_]GoCase{
+    // Runtime panic banner.
+    .{ .line = "panic: runtime error: index out of range [5] with length 3", .crash = true, .marker = .go_panic },
+    .{ .line = "panic: runtime error: invalid memory address or nil pointer dereference", .crash = true, .marker = .go_panic },
+    .{ .line = "panic: assignment to entry in nil map", .crash = true, .marker = .go_panic },
+    .{ .line = "panic: close of closed channel", .crash = true, .marker = .go_panic },
+    .{ .line = "panic: interface conversion: interface {} is string, not int", .crash = true, .marker = .go_panic },
+    .{ .line = "panic: send on closed channel [recovered]", .crash = true, .marker = .go_panic },
+    .{ .line = "panic: test timed out after 10m0s", .crash = true, .marker = .go_panic },
+
+    // Runtime throw: unrecoverable, no deferred functions run.
+    .{ .line = "fatal error: concurrent map writes", .crash = true, .marker = .go_fatal },
+    .{ .line = "fatal error: all goroutines are asleep - deadlock!", .crash = true, .marker = .go_fatal },
+    .{ .line = "fatal error: out of memory", .crash = true, .marker = .go_fatal },
+    .{ .line = "fatal error: stack overflow", .crash = true, .marker = .go_fatal },
+    .{ .line = "fatal error: unexpected signal during runtime execution", .crash = true, .marker = .go_fatal },
+    .{ .line = "runtime: out of memory: cannot allocate 8192-byte block", .crash = true, .marker = .go_fatal },
+    .{ .line = "[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x45a1c2]", .crash = true, .marker = .go_fatal },
+
+    // Captured through a log envelope rather than raw stderr.
+    .{ .line = "Aug 26 10:00:00 host api[1234]: panic: runtime error: nil map", .crash = true, .marker = .go_panic },
+    .{ .line = "2026-08-26T10:00:00Z | fatal error: concurrent map read and map write", .crash = true, .marker = .go_fatal },
+    .{ .line = "  panic: leading indentation", .crash = true, .marker = .go_panic },
+
+    // Go loggers carrying the level themselves.
+    .{ .line = "{\"level\":\"fatal\",\"msg\":\"cannot bind port\"}", .crash = true, .marker = .fatal_level },
+    .{ .line = "{\"level\":\"panic\",\"msg\":\"invariant broken\"}", .crash = true, .marker = .panic_level },
+    .{ .line = "{\"level\":\"dpanic\",\"msg\":\"dev invariant\"}", .crash = true, .marker = .panic_level },
+    .{ .line = "level=fatal msg=\"migrations failed\"", .crash = true, .marker = .fatal_level },
+    .{ .line = "time=2026-08-26T10:00:00Z level=panic msg=\"bad state\"", .crash = true, .marker = .panic_level },
+    .{ .line = "2026-08-26 10:00:00 FTL shutting down", .crash = true, .marker = .fatal_level },
+
+    // Quoting a crash is not crashing.
+    .{ .line = "{\"level\":\"info\",\"msg\":\"recovered from panic: retrying request\"}", .crash = false },
+    .{ .line = "level=debug msg=\"panic: handler installed\"", .crash = false },
+    .{ .line = "2026-08-26 10:00:00 INF no panic: all good", .crash = false },
+    .{ .line = "{\"level\":\"warn\",\"msg\":\"panic:0 restarts:0\"}", .crash = false },
+    .{ .line = "{\"level\":\"info\",\"msg\":\"fatal error: none seen this hour\"}", .crash = false },
+    .{ .line = "{\"level\":\"error\",\"msg\":\"upstream 503\"}", .crash = false },
+
+    // The words in ordinary text, paths and metric names.
+    .{ .line = "GET /api/panic:status 200 4ms", .crash = false },
+    .{ .line = "POST /v1/fatal error: ignored", .crash = false },
+    .{ .line = "2026-08-26 10:00:00 user hit the panic button in the UI", .crash = false },
+    .{ .line = "2026-08-26 10:00:00 shipping fatal error handling to prod", .crash = false },
+    .{ .line = "deploy: rolled back after fatal error: see incident 42", .crash = false },
+    .{ .line = "{\"msg\":\"panic budget remaining: 3\"}", .crash = false },
+    .{ .line = "chan_panic_total 0", .crash = false },
+
+    // Stack frames on their own carry no verdict.
+    .{ .line = "goroutine 1 [running]:", .crash = false },
+    .{ .line = "main.main()", .crash = false },
+};
+
+test "Detector: Go crash corpus has no false positives or negatives" {
+    const det: Detector = .{ .customs = &.{} };
+    var wrong: usize = 0;
+    for (go_corpus) |c| {
+        const got = det.detect(c.line, signature.extractLevel(c.line));
+        if ((got != null) != c.crash) {
+            wrong += 1;
+            std.debug.print("misjudged: {s}\n  expected crash={}, got {?}\n", .{ c.line, c.crash, got });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), wrong);
+}
+
+test "Detector: Go crash corpus attributes the right marker" {
+    const det: Detector = .{ .customs = &.{} };
+    for (go_corpus) |c| {
+        const want = c.marker orelse continue;
+        const got = det.detect(c.line, signature.extractLevel(c.line));
+        try testing.expectEqual(want, got.?);
+    }
+}
+
+test "Detector: a runtime banner needs a line or envelope boundary before it" {
+    const det: Detector = .{ .customs = &.{} };
+    // Boundaries the Go runtime or a capture layer can produce.
+    for ([_][]const u8{
+        "panic: x",
+        "\tpanic: x",
+        "svc[9]: panic: x",
+        "2026-08-26T00:00:00Z | panic: x",
+    }) |line| {
+        try testing.expectEqual(MarkerKind.go_panic, det.detect(line, null).?);
+    }
+    // Anything else means the phrase is embedded in text.
+    for ([_][]const u8{
+        "recovered from panic: x",
+        "\"panic: x\"",
+        "/api/panic: x",
+        "nopanic: x",
+    }) |line| {
+        try testing.expect(det.detect(line, null) == null);
+    }
+}
+
+test "Detector: user regexes still fire on a low-severity line" {
+    // The level gate suppresses *built-in* markers on an info line; a
+    // pattern the operator asked for explicitly must still match.
+    const re = regex.Regex.compile("shard-[0-9]+ lost").?;
+    var customs = [_]regex.Regex{re};
+    var det: Detector = .{ .customs = &customs };
+    defer customs[0].deinit();
+
+    try testing.expectEqual(
+        MarkerKind.custom_regex,
+        det.detect("{\"level\":\"info\",\"msg\":\"shard-7 lost\"}", .Info).?,
+    );
 }

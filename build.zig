@@ -275,6 +275,30 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
+    // Benchmarks are opt-in: they build a fixture on disk and take a few
+    // seconds, so they do not belong in `zig build test`.
+    const bench_step = b.step("bench", "Run benchmarks");
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("bench/journal.zig"),
+            .target = target,
+            // Benchmarking a debug build measures the safety checks, not the
+            // code, so pin the mode the binary actually ships with.
+            .optimize = .ReleaseFast,
+        });
+        // A benchmark against a Debug build of the library under test would
+        // be measuring safety checks, so the journal module is rebuilt here
+        // at the same optimisation level as the benchmark itself.
+        mod.addImport("journal", b.createModule(.{
+            .root_source_file = b.path("src/journal/journal.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }));
+        const exe_bench = b.addExecutable(.{ .name = "bench-journal", .root_module = mod });
+        const run_bench = b.addRunArtifact(exe_bench);
+        bench_step.dependOn(&run_bench.step);
+    }
+
     const check = b.step("check", "Check if code compiles");
     check.dependOn(&exe.step);
     check.dependOn(&exe_lite.step);

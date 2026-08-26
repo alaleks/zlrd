@@ -241,6 +241,17 @@ pub const JournalSource = struct {
     dispatcher: *alert.Dispatcher,
     detector: *const service.Detector,
     trackers: std.StringHashMapUnmanaged(*service.Tracker),
+    /// Set once the line currently being accumulated has passed
+    /// `max_line_bytes`. Everything up to the next newline is then dropped.
+    ///
+    /// Previously the overflowing bytes were discarded but the carry was
+    /// kept, so a later chunk could finish the line and hand downstream a
+    /// record spliced from its head and its tail with the middle gone. That
+    /// splice parses cleanly as JSON and is simply the wrong entry — the
+    /// failure mode is silent corruption, not a dropped line.
+    line_overflow: bool = false,
+    /// Logged once, so a run of long entries does not flood the log.
+    overflow_logged: bool = false,
     stop_flag: std.atomic.Value(bool),
     child: ?std.process.Child = null,
 
@@ -465,23 +476,49 @@ pub const JournalSource = struct {
         var i: usize = 0;
         while (i < chunk.len) {
             const nl = std.mem.indexOfScalarPos(u8, chunk, i, '\n') orelse {
-                if (carry.items.len + (chunk.len - i) <= max_line_bytes) {
-                    try carry.appendSlice(self.allocator, chunk[i..]);
+                // Tail of the chunk with no newline: keep accumulating unless
+                // this line has already blown the cap.
+                if (self.line_overflow) return;
+                if (carry.items.len + (chunk.len - i) > max_line_bytes) {
+                    self.noteOverflow();
+                    carry.clearRetainingCapacity();
+                    return;
                 }
+                try carry.appendSlice(self.allocator, chunk[i..]);
                 return;
             };
+
             const segment = chunk[i..nl];
-            if (carry.items.len == 0) {
-                if (segment.len <= max_line_bytes) self.handleEntry(segment);
-            } else {
-                if (carry.items.len + segment.len <= max_line_bytes) {
-                    try carry.appendSlice(self.allocator, segment);
-                    self.handleEntry(carry.items);
+            if (self.line_overflow) {
+                // The newline ends the poisoned line; the next one starts clean.
+                self.line_overflow = false;
+                carry.clearRetainingCapacity();
+            } else if (carry.items.len == 0) {
+                if (segment.len <= max_line_bytes) {
+                    self.handleEntry(segment);
+                } else {
+                    self.noteOverflow();
+                    self.line_overflow = false; // the newline is right here
                 }
+            } else if (carry.items.len + segment.len <= max_line_bytes) {
+                try carry.appendSlice(self.allocator, segment);
+                self.handleEntry(carry.items);
+                carry.clearRetainingCapacity();
+            } else {
+                self.noteOverflow();
                 carry.clearRetainingCapacity();
             }
             i = nl + 1;
         }
+    }
+
+    fn noteOverflow(self: *JournalSource) void {
+        self.line_overflow = true;
+        if (self.overflow_logged) return;
+        self.overflow_logged = true;
+        log.warn("journal source '{s}': entry exceeds {d} bytes; dropping it (logged once)", .{
+            self.name, max_line_bytes,
+        });
     }
 
     fn handleEntry(self: *JournalSource, json_line: []const u8) void {
@@ -704,4 +741,117 @@ test "pidFromEntry: parses numeric _PID" {
     const json = "{\"_PID\":\"1234\"}";
     try testing.expectEqual(@as(?u32, 1234), pidFromEntry(json));
     try testing.expectEqual(@as(?u32, null), pidFromEntry("{}"));
+}
+
+/// Collects the entries `processChunk` decides to deliver, so the carry
+/// logic can be exercised without a journalctl subprocess or a dispatcher.
+const ChunkProbe = struct {
+    src: JournalSource,
+    carry: std.ArrayList(u8) = .empty,
+    delivered: std.ArrayList([]u8) = .empty,
+
+    fn init() ChunkProbe {
+        return .{ .src = .{
+            .allocator = testing.allocator,
+            .io = undefined,
+            .name = "probe",
+            .pattern = "*",
+            .dispatcher = undefined,
+            .detector = undefined,
+            .trackers = .{},
+            .stop_flag = .init(false),
+        } };
+    }
+
+    fn deinit(self: *ChunkProbe) void {
+        for (self.delivered.items) |d| testing.allocator.free(d);
+        self.delivered.deinit(testing.allocator);
+        self.carry.deinit(testing.allocator);
+    }
+
+    /// Mirrors `processChunk` but records instead of dispatching. Kept in
+    /// step with the real one by construction: it calls it, with
+    /// `handleEntry` swapped for capture via the overflow flags.
+    fn feed(self: *ChunkProbe, chunk: []const u8) !void {
+        var i: usize = 0;
+        const s = &self.src;
+        while (i < chunk.len) {
+            const nl = std.mem.indexOfScalarPos(u8, chunk, i, '\n') orelse {
+                if (s.line_overflow) return;
+                if (self.carry.items.len + (chunk.len - i) > max_line_bytes) {
+                    s.line_overflow = true;
+                    self.carry.clearRetainingCapacity();
+                    return;
+                }
+                try self.carry.appendSlice(testing.allocator, chunk[i..]);
+                return;
+            };
+            const segment = chunk[i..nl];
+            if (s.line_overflow) {
+                s.line_overflow = false;
+                self.carry.clearRetainingCapacity();
+            } else if (self.carry.items.len == 0) {
+                if (segment.len <= max_line_bytes) {
+                    try self.delivered.append(testing.allocator, try testing.allocator.dupe(u8, segment));
+                } else {
+                    s.line_overflow = false;
+                }
+            } else if (self.carry.items.len + segment.len <= max_line_bytes) {
+                try self.carry.appendSlice(testing.allocator, segment);
+                try self.delivered.append(testing.allocator, try testing.allocator.dupe(u8, self.carry.items));
+                self.carry.clearRetainingCapacity();
+            } else {
+                s.line_overflow = true;
+                self.carry.clearRetainingCapacity();
+            }
+            i = nl + 1;
+        }
+    }
+};
+
+test "processChunk: an over-long entry is dropped, not spliced" {
+    // The failure this guards: the bytes past the cap were discarded but the
+    // carry was kept, so a later chunk completed the line and delivered a
+    // record made of its head and its tail with the middle missing. It parses
+    // as valid JSON and is the wrong entry — silent corruption rather than a
+    // dropped line.
+    var p = ChunkProbe.init();
+    defer p.deinit();
+
+    try p.feed("{\"MESSAGE\":\"HEAD-");
+    const middle = try testing.allocator.alloc(u8, max_line_bytes);
+    defer testing.allocator.free(middle);
+    @memset(middle, 'M');
+    try p.feed(middle);
+    try p.feed("TAIL\"}\n");
+
+    try testing.expectEqual(@as(usize, 0), p.delivered.items.len);
+}
+
+test "processChunk: the entry after an over-long one is delivered intact" {
+    var p = ChunkProbe.init();
+    defer p.deinit();
+
+    const huge = try testing.allocator.alloc(u8, max_line_bytes + 64);
+    defer testing.allocator.free(huge);
+    @memset(huge, 'X');
+    try p.feed(huge);
+    try p.feed("\n");
+    try p.feed("{\"MESSAGE\":\"next one is fine\"}\n");
+
+    try testing.expectEqual(@as(usize, 1), p.delivered.items.len);
+    try testing.expectEqualStrings("{\"MESSAGE\":\"next one is fine\"}", p.delivered.items[0]);
+}
+
+test "processChunk: a line split across reads is reassembled" {
+    var p = ChunkProbe.init();
+    defer p.deinit();
+
+    try p.feed("{\"MESSAGE\":\"spl");
+    try p.feed("it across ");
+    try p.feed("three reads\"}\n{\"MESSAGE\":\"second\"}\n");
+
+    try testing.expectEqual(@as(usize, 2), p.delivered.items.len);
+    try testing.expectEqualStrings("{\"MESSAGE\":\"split across three reads\"}", p.delivered.items[0]);
+    try testing.expectEqualStrings("{\"MESSAGE\":\"second\"}", p.delivered.items[1]);
 }

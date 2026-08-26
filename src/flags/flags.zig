@@ -64,6 +64,11 @@ pub fn parseLevelInsensitive(s: []const u8) ?Level {
         if (eqlIgnoreCaseFast(s, "ftl")) return .Fatal;
         if (eqlIgnoreCaseFast(s, "crt")) return .Fatal;
         if (eqlIgnoreCaseFast(s, "pnc")) return .Panic;
+    } else if (eqlIgnoreCaseFast(s, "dpanic")) {
+        // zap's development-panic level: panics in dev builds, logs at error
+        // in production. Treated as a panic either way — it marks a broken
+        // invariant.
+        return .Panic;
     } else if (eqlIgnoreCaseFast(s, "warning")) {
         return .Warn;
     } else if (eqlIgnoreCaseFast(s, "critical")) {

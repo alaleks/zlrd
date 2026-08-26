@@ -26,9 +26,55 @@ pub fn extractLevel(line: []const u8) ?flags.Level {
         return null;
     }
     if (simd.findLogfmtLevel(line)) |r| {
-        return flags.parseLevelInsensitive(line[r.start..r.end]);
+        if (flags.parseLevelInsensitive(line[r.start..r.end])) |lvl| return lvl;
+    }
+    return freeStandingLevel(line);
+}
+
+/// Fallback for consoles that print the level as a bare word rather than a
+/// structured field — zerolog's console writer (`10:00:00 FTL msg`), Java's
+/// `10:00:00 [main] INFO com.foo - msg`, most hand-rolled formatters.
+///
+/// Without this the agent saw no level on those lines at all, which cost it
+/// twice: a genuine `FTL` never raised a crash, and an `INF` line quoting
+/// "panic:" had nothing to prove it was only quoting.
+///
+/// The token must be whitespace-delimited and entirely uppercase. Both
+/// halves matter, and this is deliberately stricter than the reader's
+/// equivalent: the reader only tints a line, whereas here a stray match
+/// raises a crash alert. `GET /api/panic:status` fails the delimiter test,
+/// and prose like `user hit the panic button` fails the case test — a
+/// lowercase level word standing alone in a sentence is prose essentially
+/// every time, while console loggers uppercase it essentially every time.
+fn freeStandingLevel(line: []const u8) ?flags.Level {
+    var from: usize = 0;
+    while (simd.nextAlphaToken(line, from)) |tok| {
+        from = tok.end;
+        const len = tok.end - tok.start;
+        if (len < 3 or len > 8) continue;
+        if (tok.start > 0 and !isSpace(line[tok.start - 1])) continue;
+        if (tok.end < line.len and !isLevelTrailer(line[tok.end])) continue;
+        if (!isAllUpper(line[tok.start..tok.end])) continue;
+        if (flags.parseLevelInsensitive(line[tok.start..tok.end])) |lvl| return lvl;
     }
     return null;
+}
+
+inline fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+
+/// What may follow a free-standing level: whitespace, or the `:` / `]` some
+/// formatters attach (`INFO: msg`, `WARN] msg`).
+inline fn isLevelTrailer(c: u8) bool {
+    return isSpace(c) or c == ':' or c == ']';
+}
+
+fn isAllUpper(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 'A' or c > 'Z') return false;
+    }
+    return true;
 }
 
 /// Returns true if the level should be treated as an error condition for
