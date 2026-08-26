@@ -12,13 +12,14 @@ DEFAULT_BUMP="patch"
 # -----------------------------
 usage() {
   cat <<'EOF'
-usage: ./release.sh [major|minor|patch] [-y|--yes]
+usage: ./release.sh [major|minor|patch] [-y|--yes] [--skip-checks]
 
 Creates a signed annotated tag from main/master and pushes it to origin.
 
 Options:
   major|minor|patch   Version bump type (default: patch)
   -y, --yes           Skip confirmation prompt
+      --skip-checks   Tag without running the test suite first
   -h, --help          Show this help
 EOF
 }
@@ -41,6 +42,7 @@ require_cmd() {
 # -----------------------------
 BUMP="$DEFAULT_BUMP"
 ASSUME_YES="false"
+SKIP_CHECKS="false"
 
 while (($# > 0)); do
   case "$1" in
@@ -49,6 +51,9 @@ while (($# > 0)); do
       ;;
     -y|--yes)
       ASSUME_YES="true"
+      ;;
+    --skip-checks)
+      SKIP_CHECKS="true"
       ;;
     -h|--help)
       usage
@@ -91,9 +96,17 @@ if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
   UPSTREAM_SHA="$(git rev-parse '@{u}')"
   BASE_SHA="$(git merge-base HEAD '@{u}')"
 
+  # Only "behind" used to be rejected, so a diverged or unpushed branch
+  # sailed through and tagged a commit that origin's branch does not
+  # contain — the tag push carries the objects, so nothing fails loudly,
+  # but the release is built from a commit nobody can find on main.
   if [[ "$LOCAL_SHA" != "$UPSTREAM_SHA" ]]; then
     if [[ "$LOCAL_SHA" == "$BASE_SHA" ]]; then
       die "local branch is behind $UPSTREAM_REF — pull/rebase first"
+    elif [[ "$UPSTREAM_SHA" == "$BASE_SHA" ]]; then
+      die "local branch is ahead of $UPSTREAM_REF — push first, or the tag points at a commit that is not on the remote branch"
+    else
+      die "local branch has diverged from $UPSTREAM_REF — reconcile before releasing"
     fi
   fi
 fi
@@ -134,7 +147,16 @@ esac
 # -----------------------------
 # Find last version tag
 # -----------------------------
-LAST_TAG="$(git tag --list "${PREFIX}[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1)"
+# Pick the newest tag that is exactly `<prefix>MAJOR.MINOR.PATCH`. The glob
+# alone is not enough: `v[0-9]*.[0-9]*.[0-9]*` also matches `v1.2.3-rc1`,
+# which then sorts first and fails the strict parse below — one pre-release
+# tag used to wedge every subsequent release.
+LAST_TAG=""
+while IFS= read -r candidate; do
+  [[ "$candidate" =~ ^"$PREFIX"[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+  LAST_TAG="$candidate"
+  break
+done < <(git tag --list "${PREFIX}*" --sort=-v:refname)
 
 if [[ -z "$LAST_TAG" ]]; then
   LAST_TAG="${PREFIX}0.0.0"
@@ -161,7 +183,7 @@ else
   RANGE="HEAD"
 fi
 
-COMMITS="$(git log $RANGE --pretty=format:'- %h %s')"
+COMMITS="$(git log "$RANGE" --pretty=format:'- %h %s')"
 [[ -n "$COMMITS" ]] || die "no new commits since $LAST_TAG — nothing to release"
 
 # -----------------------------
@@ -193,6 +215,27 @@ if git ls-remote --tags origin "refs/tags/${NEW_TAG}" | grep -q .; then
 fi
 
 # -----------------------------
+# Pre-flight checks
+# -----------------------------
+# The release workflow fires on the tag push and only builds; a failure
+# there leaves a published tag with no artifacts and a version number that
+# cannot be reused. Cheaper to find out here.
+if [[ "$SKIP_CHECKS" == "true" ]]; then
+  info "Skipping pre-flight checks (--skip-checks)"
+elif ! command -v zig >/dev/null 2>&1; then
+  die "zig not found — install it, or pass --skip-checks to tag anyway"
+else
+  info "Running tests..."
+  zig build test >/dev/null || die "tests failed — refusing to tag $NEW_TAG"
+  info "Building release targets..."
+  for tgt in x86_64-linux-musl aarch64-linux-musl x86_64-windows-gnu x86_64-macos aarch64-macos; do
+    zig build -Doptimize=ReleaseFast -Dtarget="$tgt" -Dversion="$NEW_TAG" >/dev/null \
+      || die "build failed for $tgt — refusing to tag $NEW_TAG"
+  done
+  info "Pre-flight checks passed"
+fi
+
+# -----------------------------
 # Preview and confirm
 # -----------------------------
 echo ""
@@ -211,13 +254,19 @@ echo "$COMMITS"
 echo ""
 
 if [[ "$ASSUME_YES" != "true" ]]; then
-  read -r -p "Create and push signed tag $NEW_TAG? [y/N] " CONFIRM
-  shopt -s nocasematch
-  if [[ "$CONFIRM" != "y" ]]; then
-    echo "Aborted."
-    exit 0
+  # Without a terminal `read` hits EOF, and `set -e` then killed the script
+  # with no output and a bare exit 1 — indistinguishable from a real failure.
+  if [[ ! -t 0 ]]; then
+    die "not running interactively — pass --yes to confirm $NEW_TAG"
   fi
-  shopt -u nocasematch
+  read -r -p "Create and push signed tag $NEW_TAG? [y/N] " CONFIRM
+  case "${CONFIRM,,}" in
+    y|yes) ;;
+    *)
+      echo "Aborted."
+      exit 0
+      ;;
+  esac
 fi
 
 # -----------------------------
