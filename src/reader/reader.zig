@@ -635,7 +635,13 @@ pub const FilterState = struct {
             return;
         }
         var match_buf: [max_search_matches]MatchRange = undefined;
-        const matches: []const MatchRange = if (self.has_search_filter)
+        // Match ranges exist only to place highlight escapes around them. In
+        // the colourless palette those escapes are empty strings, so
+        // collecting the ranges cannot change a single output byte — it only
+        // costs an O(line x term) rescan per record and, worse, pushes the
+        // line off the direct-copy path in `printStyledLine` onto the
+        // token walk. Redirected output is the common case, so gate on it.
+        const matches: []const MatchRange = if (self.has_search_filter and out.theme.colored)
             findSearchMatches(line, self.search_expr.?, &match_buf)
         else
             &.{};
@@ -1273,6 +1279,14 @@ fn buildJsonMessageKey(
 /// - collapses whitespace
 /// - replaces ISO dates with `<date>`
 /// - replaces decimal runs with `#`
+///
+/// Writes straight into the reserved buffer rather than through
+/// `ArrayList.append`. Every rule here either preserves length (lowercase) or
+/// shrinks it — `<date>` is six bytes for ten, a digit run becomes one `#`, a
+/// whitespace run becomes one space — so `line.len` is a hard upper bound on
+/// the output and one reservation up front makes each write below safe. The
+/// per-byte `try append` it replaces paid a capacity check and an error
+/// branch on every one of the input's bytes.
 fn buildNormalizedKey(
     allocator: std.mem.Allocator,
     scratch: *std.ArrayList(u8),
@@ -1280,45 +1294,51 @@ fn buildNormalizedKey(
 ) ![]const u8 {
     scratch.clearRetainingCapacity();
     try scratch.ensureUnusedCapacity(allocator, line.len);
+    const dst = scratch.allocatedSlice();
 
+    var w: usize = 0;
     var i: usize = 0;
-    var prev_space = false;
+    // Seeded true so a leading whitespace run is dropped outright, which is
+    // what the trailing `trim` used to undo with a second pass and a shift.
+    var prev_space = true;
 
     while (i < line.len) {
-        if (i + 10 <= line.len and isValidDateString(line[i .. i + 10])) {
-            try scratch.appendSlice(allocator, "<date>");
-            i += 10;
+        const c = line[i];
+
+        // A date always starts with a digit, so this check rides along with
+        // the digit branch instead of being retried at every byte.
+        if (isDigit(c)) {
+            if (i + 10 <= line.len and isValidDateString(line[i .. i + 10])) {
+                dst[w..][0..6].* = "<date>".*;
+                w += 6;
+                i += 10;
+            } else {
+                dst[w] = '#';
+                w += 1;
+                i += 1;
+                while (i < line.len and isDigit(line[i])) : (i += 1) {}
+            }
             prev_space = false;
             continue;
         }
 
-        if (isDigit(line[i])) {
-            try scratch.append(allocator, '#');
-            i += 1;
-            while (i < line.len and isDigit(line[i])) : (i += 1) {}
-            prev_space = false;
-            continue;
-        }
-
-        const c = std.ascii.toLower(line[i]);
         if (std.ascii.isWhitespace(c)) {
             if (!prev_space) {
-                try scratch.append(allocator, ' ');
+                dst[w] = ' ';
+                w += 1;
                 prev_space = true;
             }
         } else {
-            try scratch.append(allocator, c);
+            dst[w] = std.ascii.toLower(c);
+            w += 1;
             prev_space = false;
         }
-
         i += 1;
     }
 
-    const trimmed = std.mem.trim(u8, scratch.items, " ");
-    if (trimmed.len < scratch.items.len) {
-        std.mem.copyForwards(u8, scratch.items[0..trimmed.len], trimmed);
-        scratch.items.len = trimmed.len;
-    }
+    // Whitespace is collapsed above, so at most one trailing space survives.
+    if (w > 0 and dst[w - 1] == ' ') w -= 1;
+    scratch.items.len = w;
     return scratch.items;
 }
 
@@ -3303,6 +3323,64 @@ test "the colourless fast path matches the token walk byte for byte" {
 
         try std.testing.expectEqualStrings(b, a);
     }
+}
+
+test "colourless search output is identical to unfiltered output" {
+    // The optimisation in `printChecked` skips match collection when colour
+    // is off. That is only sound because the plain palette highlights with
+    // empty strings — assert the dependency directly, so giving `plain` a
+    // real `match_on` (bold or underline need no colour) fails here instead
+    // of silently dropping highlights from every redirected run.
+    try std.testing.expectEqual(@as(usize, 0), theme.Theme.plain.palette.match_on.len);
+
+    const line = "{\"level\":\"info\",\"msg\":\"needle here\"}";
+    const info = analyzeLine(line, true);
+
+    var file = [_][]const u8{"t.log"};
+    const with_search = flags.Args{ .files = &file, .tail_mode = false, .search = "needle", .num_lines = 0 };
+    const no_search = flags.Args{ .files = &file, .tail_mode = false, .num_lines = 0 };
+
+    var a = TestOut{ .th = theme.Theme.plain };
+    try a.start();
+    defer a.deinit();
+    var sa = FilterState.init(with_search, &a.out, null);
+    defer sa.deinit();
+    sa.printChecked(line, info);
+    const got_search = try a.take();
+    defer std.testing.allocator.free(got_search);
+
+    var b = TestOut{ .th = theme.Theme.plain };
+    try b.start();
+    defer b.deinit();
+    var sb = FilterState.init(no_search, &b.out, null);
+    defer sb.deinit();
+    sb.printChecked(line, info);
+    const got_plain = try b.take();
+    defer std.testing.allocator.free(got_plain);
+
+    try std.testing.expectEqualStrings(got_plain, got_search);
+}
+
+test "normalized key trims surrounding whitespace and ends on a date" {
+    // Edge cases of the direct-write rewrite: the leading run is dropped by
+    // seeding `prev_space`, the trailing one by a single decrement, and a
+    // date flush at the very end must not read past the line.
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+
+    const key = try buildAggregateKeyForLine(std.testing.allocator, &scratch, .normalized, "   \t Foo   BAR \t ");
+    try std.testing.expectEqualStrings("foo bar", key);
+
+    var s2: std.ArrayList(u8) = .empty;
+    defer s2.deinit(std.testing.allocator);
+    const key2 = try buildAggregateKeyForLine(std.testing.allocator, &s2, .normalized, "seen 2026-08-26");
+    try std.testing.expectEqualStrings("seen <date>", key2);
+
+    // A digit run too short to be a date still collapses to a single `#`.
+    var s3: std.ArrayList(u8) = .empty;
+    defer s3.deinit(std.testing.allocator);
+    const key3 = try buildAggregateKeyForLine(std.testing.allocator, &s3, .normalized, "id=12345 ok");
+    try std.testing.expectEqualStrings("id=# ok", key3);
 }
 
 test "search highlighting still takes the token walk" {

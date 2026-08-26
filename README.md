@@ -120,40 +120,41 @@ really is identical.
 
 | Tool | Time | Throughput |
 | --- | --- | --- |
-| `jq 'select(.level=="error")'` | 262 ms | 81 MB/s |
-| `zlrd -l error --output json` | **29 ms** | **731 MB/s** |
-| `grep '"level":"error"'` | 25 ms | 848 MB/s (substring, not a parse) |
+| `jq 'select(.level=="error")'` | 267 ms | 79 MB/s |
+| `zlrd -l error --output json` | **28 ms** | **757 MB/s** |
+| `grep '"level":"error"'` | 23 ms | 922 MB/s (substring, not a parse) |
 
 **Grouping repeated messages** — 17.2 MB, 160 distinct lines; all three report
 160 groups.
 
 | Tool | Time | |
 | --- | --- | --- |
-| `sort \| uniq -c \| sort -rn` | 317 ms | sorts the whole file |
-| `awk '{c[$0]++} ...'` | 271 ms | hash table — same algorithm |
-| `zlrd -a` | **27 ms** | hashes as it streams |
+| `sort \| uniq -c \| sort -rn` | 318 ms | sorts the whole file |
+| `awk '{c[$0]++} ...'` | 265 ms | hash table — same algorithm |
+| `zlrd -a` | **28 ms** | hashes as it streams |
 
 **Plain substring search** — the case `grep` is built for.
 
 | Tool | Time | |
 | --- | --- | --- |
 | `ripgrep` | 27 ms | |
-| `zlrd -s` | 41 ms | also parses each line it prints |
-| GNU `grep` | 42 ms | |
+| `zlrd -s` | **35 ms** | also parses each line it prints |
+| GNU `grep` | 41 ms | |
 
 **Where zlrd is slower**
 
-Reading a `.gz`: `gzcat \| grep` takes 37 ms, `zlrd` 92 ms. The decoder is not
+Reading a `.gz`: `gzcat \| grep` takes 38 ms, `zlrd` 87 ms. The decoder is not
 the problem — zlrd's inflate runs about 39 ms against zlib's 34 ms on the same
 data. The gap is that the shell pipeline decompresses and searches in two
 processes on two cores, while zlrd does both on one thread.
 
-Reading and rendering the whole file: `cat` 21 ms, `zlrd` 47 ms — `cat` does
+Reading and rendering the whole file: `cat` 20 ms, `zlrd` 48 ms — `cat` does
 no parsing, and zlrd formats all 400 000 records.
 
-If the question is about bytes, `grep` and `ripgrep` are the right tools and
-this table says so. zlrd earns its time when the question is about *log
-structure* — levels, time windows, repeated messages, crash markers.
+`ripgrep` is still the right tool when the question is purely about bytes.
+zlrd earns its time when the question is about *log structure* — levels, time
+windows, repeated messages, crash markers — and it no longer costs you
+throughput to ask.
 
 ---
 
