@@ -354,6 +354,12 @@ pub const JournalSource = struct {
         // multi-GB journal is past in tens of milliseconds.
         try it.seekToEnd();
 
+        // The five fields `handleNativeEntry` reads. A journald entry carries
+        // roughly twenty-five, and resolving the rest costs an arena bump
+        // and a payload copy each — together the largest item in the read
+        // profile. Keep this in step with the `e.get` calls below.
+        it.setFieldFilter(&native_fields);
+
         // Enable the DATA-object cache for live tailing — hot fields like
         // `_SYSTEMD_UNIT` are referenced by every entry of a service and
         // would otherwise hit the disk (+LZ4) once per entry.
@@ -397,6 +403,13 @@ pub const JournalSource = struct {
         }
         return false;
     }
+
+    /// Fields resolved from a native journal entry. Anything absent here is
+    /// filtered out before it is copied, so adding an `e.get` below means
+    /// adding the key here too.
+    const native_fields = [_][]const u8{
+        "MESSAGE", "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "PRIORITY", "_PID",
+    };
 
     fn handleNativeEntry(self: *JournalSource, e: *const native.Entry) void {
         const message = e.get("MESSAGE") orelse return;

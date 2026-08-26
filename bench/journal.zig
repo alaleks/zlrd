@@ -166,6 +166,13 @@ const Config = struct {
     label: []const u8,
     cache: bool,
     reuse_arena: bool,
+    /// Mirrors what the agent asks for: five fields out of the twenty-five
+    /// a journald entry carries.
+    filter: bool = false,
+};
+
+const agent_fields = [_][]const u8{
+    "MESSAGE", "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "PRIORITY", "_PID",
 };
 
 fn run(gpa: std.mem.Allocator, io: std.Io, path: []const u8, cfg: Config) !void {
@@ -180,6 +187,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, path: []const u8, cfg: Config) !void 
         var it = r.iterator();
         if (cfg.cache) try it.enableCache(gpa);
         defer if (cfg.cache) it.disableCache(gpa);
+        if (cfg.filter) it.setFieldFilter(&agent_fields);
 
         var counting = Counting{ .child = gpa };
         var scratch = std.heap.ArenaAllocator.init(counting.allocator());
@@ -235,5 +243,6 @@ pub fn main() !void {
     try run(gpa, io, path, .{ .label = "no cache, fresh arena", .cache = false, .reuse_arena = false });
     try run(gpa, io, path, .{ .label = "cache, fresh arena", .cache = true, .reuse_arena = false });
     try run(gpa, io, path, .{ .label = "cache + reused arena", .cache = true, .reuse_arena = true });
+    try run(gpa, io, path, .{ .label = "  + field filter (agent)", .cache = true, .reuse_arena = true, .filter = true });
     std.debug.print("\n", .{});
 }

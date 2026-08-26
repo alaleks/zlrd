@@ -52,7 +52,19 @@ const data_probe_bytes: usize = 512;
 /// Size of the file-read window. journald allocates the data objects a new
 /// entry introduces contiguously, immediately before the entry object
 /// itself, so a read covering one of them usually covers the rest.
-const read_window_bytes: usize = 4096;
+///
+/// Measured on a 200k-entry fixture (agent field filter, reused arena):
+///
+///     4 KiB  56 ms   3.6M entries/s
+///     8 KiB  44 ms   4.5M
+///    16 KiB  39 ms   5.2M
+///    32 KiB  35 ms   5.7M
+///    64 KiB  34 ms   5.8M
+///
+/// 16 KiB sits at the knee. Past it the gain is a few percent while every
+/// live-tail wake-up pays the larger read to deliver one entry, and the
+/// buffer is inline in `Reader`, which callers keep on the stack.
+const read_window_bytes: usize = 16 * 1024;
 
 pub const Error = error{
     InvalidMagic,
@@ -243,6 +255,30 @@ pub const Reader = struct {
         return dst[0..give];
     }
 
+    /// Like `readAtClamped`, but hands back a view into the window when the
+    /// bytes are already there instead of copying them out.
+    ///
+    /// The view is invalidated by the next read on this reader, so it suits
+    /// a caller that consumes the bytes before reading again — which the
+    /// data-object path does. `readEntry` cannot use it: it holds its probe
+    /// across the field reads that follow.
+    ///
+    /// Worth the extra contract because the copy it avoids is the full probe
+    /// width (512 bytes) for an object whose useful part is usually ~100.
+    fn peekAt(self: *Reader, pos: u64, dst: []u8) Error![]const u8 {
+        if (pos > self.file_size) return error.InvalidOffset;
+        const want = @min(dst.len, self.file_size - pos);
+        if (want == 0) return dst[0..0];
+
+        if (pos >= self.window_pos and
+            pos - self.window_pos + want <= self.window_len)
+        {
+            const from: usize = @intCast(pos - self.window_pos);
+            return self.window[from..][0..want];
+        }
+        return self.readAtClamped(pos, dst);
+    }
+
     /// Rejects an object header whose declared `size` would place the object
     /// past the end of the file. Catches corruption early — before we derive
     /// item counts or payload lengths from it — and keeps every subsequent
@@ -289,6 +325,8 @@ pub const Iterator = struct {
     /// DATA payload is referenced by every entry of that unit. Without a
     /// cache we re-read (and re-LZ4-decode) it once per entry.
     cache: ?*DataCache = null,
+    /// When set, `next` keeps only these field keys. See `setFieldFilter`.
+    field_filter: ?[]const []const u8 = null,
     /// Chain hops taken so far. Only bumps when we actually move to a
     /// different array, so a long-lived tail that re-reads its parked array
     /// on every wake-up never approaches the cap.
@@ -493,6 +531,33 @@ pub const Iterator = struct {
         self.array_index = lo;
     }
 
+    /// Restricts the fields `next` resolves to `keys`; everything else is
+    /// left out of the entry.
+    ///
+    /// Worth setting whenever the consumer reads a fixed handful of fields:
+    /// a journald entry carries ~25, and the agent looks at five of them.
+    /// Resolving the other twenty costs an arena bump and a payload copy
+    /// each — together the largest single item in the read profile.
+    ///
+    /// With the data cache enabled this compounds: data objects are
+    /// deduplicated, so an object's key never changes, and once an offset
+    /// has been rejected the object is never read again either.
+    ///
+    /// `keys` is borrowed and must outlive the iterator. `Entry.get` returns
+    /// null for anything not in the filter, so pass every key the consumer
+    /// will ask for.
+    pub fn setFieldFilter(self: *Iterator, keys: []const []const u8) void {
+        self.field_filter = keys;
+    }
+
+    inline fn wantsKey(self: *const Iterator, key: []const u8) bool {
+        const filter = self.field_filter orelse return true;
+        for (filter) |k| {
+            if (std.mem.eql(u8, k, key)) return true;
+        }
+        return false;
+    }
+
     /// Opts the iterator into a DATA-object cache. Cuts repeat reads of
     /// high-cardinality fields (`_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`,
     /// `_HOSTNAME`, …) which are referenced by every entry of a service.
@@ -555,7 +620,8 @@ pub const Iterator = struct {
             break :blk buf;
         };
 
-        for (fields, 0..) |*f, i| {
+        var kept: usize = 0;
+        for (0..n_items) |i| {
             const raw_item = items[i * item_sz ..][0..item_sz];
             // Both layouts start with the data-object offset; the non-compact
             // `EntryItem`'s trailing hash is of no use to us.
@@ -563,7 +629,10 @@ pub const Iterator = struct {
                 std.mem.readInt(u32, raw_item[0..4], .little)
             else
                 std.mem.readInt(u64, raw_item[0..8], .little);
-            f.* = try self.readDataField(a, data_offset, compact);
+            if (try self.readDataField(a, data_offset, compact)) |f| {
+                fields[kept] = f;
+                kept += 1;
+            }
         }
 
         return .{
@@ -571,7 +640,7 @@ pub const Iterator = struct {
             .realtime_us = head.realtime,
             .monotonic_us = head.monotonic,
             .boot_id = head.boot_id,
-            .fields = fields,
+            .fields = fields[0..kept],
             .arena = arena,
         };
     }
@@ -583,13 +652,20 @@ pub const Iterator = struct {
     /// The returned `Field` always borrows from `arena` — never from the
     /// cache, whose storage is recycled — so it stays valid for the whole
     /// life of the entry.
-    fn readDataField(self: *Iterator, arena: std.mem.Allocator, offset: u64, compact: bool) Error!Field {
+    /// Returns null when the field is filtered out — see `setFieldFilter`.
+    fn readDataField(self: *Iterator, arena: std.mem.Allocator, offset: u64, compact: bool) Error!?Field {
         if (self.cache) |c| {
-            if (c.get(offset)) |cached| return splitField(try arena.dupe(u8, cached));
+            switch (c.lookup(offset)) {
+                // Already known to be a field the caller does not want: no
+                // read, no decompress, no copy.
+                .skip => return null,
+                .hit => |cached| return try splitField(try arena.dupe(u8, cached)),
+                .miss => {},
+            }
         }
 
         var probe: [data_probe_bytes]u8 = undefined;
-        const got = try self.reader.readAtClamped(offset, &probe);
+        const got = try self.reader.peekAt(offset, &probe);
         if (got.len < @sizeOf(fmt.DataHead)) return error.InvalidObjectSize;
         const head = std.mem.bytesAsValue(fmt.DataHead, got[0..@sizeOf(fmt.DataHead)]).*;
 
@@ -606,6 +682,25 @@ pub const Iterator = struct {
         // Bytes of the payload the speculative read already captured.
         const probed = if (got.len > payload_start) got[payload_start..] else got[got.len..];
 
+        const shared = head.n_entries > 1;
+
+        // Decide the filter from the probe alone where possible. A field key
+        // sits at the front of the payload, so the ~440 bytes the probe
+        // already holds almost always contain it — and a payload wider than
+        // the probe would otherwise be pulled into the arena in full before
+        // anything looked at its name. Compressed payloads have to be
+        // decoded first, so they take the slower path below.
+        if (self.field_filter != null and compression == 0) {
+            if (std.mem.indexOfScalar(u8, probed, '=')) |eq| {
+                if (eq > 0 and !self.wantsKey(probed[0..eq])) {
+                    if (shared) {
+                        if (self.cache) |c| c.putSkip(offset);
+                    }
+                    return null;
+                }
+            }
+        }
+
         var raw: []const u8 = undefined;
         var raw_in_arena = false;
         if (probed.len >= payload_len) {
@@ -618,13 +713,20 @@ pub const Iterator = struct {
             raw_in_arena = true;
         }
 
-        const payload: []const u8 = switch (compression) {
-            // `raw` may still point into the stack probe buffer, which dies
-            // with this frame — the entry must own its bytes.
-            0 => if (raw_in_arena) raw else try arena.dupe(u8, raw),
-            fmt.obj_compressed_lz4 => lz4.decompressSystemd(arena, raw) catch return error.UnsupportedCompression,
+        // Decode without taking ownership yet. `view` may point into the
+        // reader's window or the stack probe — both die before the entry
+        // does — but a field the filter rejects should not cost a copy, so
+        // the key is inspected first and the bytes are claimed after.
+        var view: []const u8 = undefined;
+        var view_in_arena = raw_in_arena;
+        switch (compression) {
+            0 => view = raw,
+            fmt.obj_compressed_lz4 => {
+                view = lz4.decompressSystemd(arena, raw) catch return error.UnsupportedCompression;
+                view_in_arena = true;
+            },
             else => return error.UnsupportedCompression,
-        };
+        }
 
         // Only cache payloads the file says are shared.
         //
@@ -639,10 +741,23 @@ pub const Iterator = struct {
         // already read it, so there is nothing to guess at. A value of 1 in
         // a live file may grow later; the next miss re-reads the header and
         // admits it then.
-        if (self.cache) |c| {
-            if (head.n_entries > 1) c.put(offset, payload);
+        const probe_field = try splitField(view);
+        if (!self.wantsKey(probe_field.key)) {
+            // Remember the verdict for objects worth a slot, so the same
+            // field on every later entry costs nothing at all.
+            if (shared) {
+                if (self.cache) |c| c.putSkip(offset);
+            }
+            return null;
         }
-        return splitField(payload);
+
+        if (self.cache) |c| {
+            if (shared) c.put(offset, view);
+        }
+
+        // Wanted: the entry has to own these bytes.
+        const payload = if (view_in_arena) view else try arena.dupe(u8, view);
+        return try splitField(payload);
     }
 };
 
@@ -682,6 +797,21 @@ pub const DataCache = struct {
         offset: u64 = 0,
         start: u32 = 0,
         len: u32 = 0,
+        /// The caller's field filter rejected this object's key. Data objects
+        /// are deduplicated, so a key never changes: once rejected, the
+        /// object never has to be read again. Costs a slot but no arena
+        /// bytes — the payload is not kept.
+        skip: bool = false,
+    };
+
+    /// Outcome of a cache lookup.
+    pub const Lookup = union(enum) {
+        /// Not seen before; the caller has to read the object.
+        miss,
+        /// Seen, and its key is not one the caller asked for.
+        skip,
+        /// Seen and wanted — payload follows.
+        hit: []const u8,
     };
 
     slots: [slot_count]Slot = @splat(.{}),
@@ -695,16 +825,45 @@ pub const DataCache = struct {
         return @intCast((offset *% 0x9E3779B97F4A7C15) >> (64 - log2_slots));
     }
 
-    pub fn get(self: *const DataCache, offset: u64) ?[]const u8 {
-        if (offset == 0) return null;
+    pub fn lookup(self: *const DataCache, offset: u64) Lookup {
+        if (offset == 0) return .miss;
         var i = slotFor(offset);
         for (0..slot_count) |_| {
             const s = &self.slots[i];
-            if (s.offset == 0) return null;
-            if (s.offset == offset) return self.bytes[s.start..][0..s.len];
+            if (s.offset == 0) return .miss;
+            if (s.offset == offset) {
+                if (s.skip) return .skip;
+                return .{ .hit = self.bytes[s.start..][0..s.len] };
+            }
             i = (i + 1) & (slot_count - 1);
         }
-        return null;
+        return .miss;
+    }
+
+    /// Convenience for callers that only care about a stored payload.
+    pub fn get(self: *const DataCache, offset: u64) ?[]const u8 {
+        return switch (self.lookup(offset)) {
+            .hit => |p| p,
+            else => null,
+        };
+    }
+
+    /// Records that `offset` holds a field the caller filtered out. Only
+    /// worth remembering for objects several entries reference — a
+    /// single-use object would fill the table for one saved read, the same
+    /// trade-off `put` makes.
+    pub fn putSkip(self: *DataCache, offset: u64) void {
+        if (offset == 0) return;
+        if (self.live >= max_live) self.reset();
+        var i = slotFor(offset);
+        while (true) {
+            const s = &self.slots[i];
+            if (s.offset == 0) break;
+            if (s.offset == offset) return;
+            i = (i + 1) & (slot_count - 1);
+        }
+        self.slots[i] = .{ .offset = offset, .skip = true };
+        self.live += 1;
     }
 
     pub fn put(self: *DataCache, offset: u64, payload: []const u8) void {
@@ -2175,4 +2334,279 @@ test "an arena reset between entries is a supported iteration pattern" {
         n += 1;
     }
     try testing.expectEqual(@as(usize, entries.len), n);
+}
+
+test "field filter keeps only the requested keys" {
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    const d_msg = try b.writeDataShared("MESSAGE=hello", 100);
+    const d_unit = try b.writeDataShared("_SYSTEMD_UNIT=api.service", 100);
+    const d_pid = try b.writeDataShared("_PID=42", 100);
+    const d_noise = try b.writeDataShared("_SELINUX_CONTEXT=unconfined_u:x", 100);
+    const e = try b.writeEntry(1, 1, &.{ d_noise, d_msg, d_unit, d_noise, d_pid });
+    const arr = try b.writeEntryArray(&.{e});
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "filter.journal");
+
+    var r = try Reader.open(tio, tmp.dir, "filter.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    try it.enableCache(testing.allocator);
+    defer it.disableCache(testing.allocator);
+    it.setFieldFilter(&.{ "MESSAGE", "_PID" });
+
+    var got = (try it.next(testing.allocator)) orelse return error.Missing;
+    defer got.deinit();
+
+    try testing.expectEqual(@as(usize, 2), got.fields.len);
+    try testing.expectEqualStrings("hello", got.get("MESSAGE").?);
+    try testing.expectEqualStrings("42", got.get("_PID").?);
+    // Filtered-out keys are simply absent.
+    try testing.expect(got.get("_SYSTEMD_UNIT") == null);
+    try testing.expect(got.get("_SELINUX_CONTEXT") == null);
+}
+
+test "field filter records a skip verdict so the object is read once" {
+    // Data objects are deduplicated, so a rejected offset never has to be
+    // read again — that is where most of the saving comes from.
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    const d_msg = try b.writeDataShared("MESSAGE=x", 8);
+    const d_noise = try b.writeDataShared("_CMDLINE=/usr/bin/svc --flag", 8);
+    var entries: [8]u64 = undefined;
+    for (&entries, 0..) |*slot, i| {
+        slot.* = try b.writeEntry(@intCast(i + 1), 1, &.{ d_noise, d_msg });
+    }
+    const arr = try b.writeEntryArray(&entries);
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "skip.journal");
+
+    var r = try Reader.open(tio, tmp.dir, "skip.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    try it.enableCache(testing.allocator);
+    defer it.disableCache(testing.allocator);
+    it.setFieldFilter(&.{"MESSAGE"});
+
+    var n: usize = 0;
+    while (try it.next(testing.allocator)) |entry| {
+        var e = entry;
+        defer e.deinit();
+        try testing.expectEqual(@as(usize, 1), e.fields.len);
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, entries.len), n);
+
+    // The rejected offset is remembered; the wanted one is cached with its
+    // payload.
+    try testing.expectEqual(DataCache.Lookup.skip, it.cache.?.lookup(d_noise));
+    try testing.expect(it.cache.?.get(d_msg) != null);
+}
+
+test "no filter still yields every field" {
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+    const a1 = try b.writeData("A=1");
+    const a2 = try b.writeData("B=2");
+    const a3 = try b.writeData("C=3");
+    const e = try b.writeEntry(1, 1, &.{ a1, a2, a3 });
+    const arr = try b.writeEntryArray(&.{e});
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "nofilter.journal");
+
+    var r = try Reader.open(tio, tmp.dir, "nofilter.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    var got = (try it.next(testing.allocator)) orelse return error.Missing;
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 3), got.fields.len);
+}
+
+test "field filter works without the data cache" {
+    // Without a cache there is nowhere to record the verdict, so every
+    // object is still read — but the copy into the entry is still skipped.
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+    const d_msg = try b.writeData("MESSAGE=kept");
+    const d_other = try b.writeData("_COMM=dropped");
+    const e = try b.writeEntry(1, 1, &.{ d_other, d_msg });
+    const arr = try b.writeEntryArray(&.{e});
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "nocache.journal");
+
+    var r = try Reader.open(tio, tmp.dir, "nocache.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    it.setFieldFilter(&.{"MESSAGE"});
+
+    var got = (try it.next(testing.allocator)) orelse return error.Missing;
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 1), got.fields.len);
+    try testing.expectEqualStrings("kept", got.get("MESSAGE").?);
+}
+
+test "window-borrowed payloads survive interleaved large and small fields" {
+    // `readDataField` reads its object through `peekAt`, which hands back a
+    // slice of the reader's window instead of copying it out. That is only
+    // sound because nothing re-reads the file before the bytes are claimed —
+    // a field wide enough to need a second read must copy what it already
+    // has *first*. Mixing widths inside one entry is what exercises it.
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    var wide: [3000]u8 = undefined;
+    @memcpy(wide[0..5], "WIDE=");
+    for (wide[5..], 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+
+    const d_small1 = try b.writeDataShared("A=first", 4);
+    const d_wide = try b.writeDataShared(&wide, 4);
+    const d_small2 = try b.writeDataShared("B=second", 4);
+    var far: [2500]u8 = undefined;
+    @memcpy(far[0..5], "FAR2=");
+    for (far[5..], 0..) |*c, i| c.* = 'A' + @as(u8, @intCast(i % 26));
+    const d_far = try b.writeDataShared(&far, 4);
+
+    var entries: [4]u64 = undefined;
+    for (&entries, 0..) |*slot, i| {
+        slot.* = try b.writeEntry(@intCast(i + 1), 1, &.{ d_small1, d_wide, d_small2, d_far });
+    }
+    const arr = try b.writeEntryArray(&entries);
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "window.journal");
+
+    var r = try Reader.open(tio, tmp.dir, "window.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    try it.enableCache(testing.allocator);
+    defer it.disableCache(testing.allocator);
+
+    var n: usize = 0;
+    while (try it.next(testing.allocator)) |entry| {
+        var e = entry;
+        defer e.deinit();
+        try testing.expectEqualStrings("first", e.get("A").?);
+        try testing.expectEqualStrings("second", e.get("B").?);
+        try testing.expectEqualStrings(wide[5..], e.get("WIDE").?);
+        try testing.expectEqualStrings(far[5..], e.get("FAR2").?);
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, entries.len), n);
+}
+
+/// Totals the bytes an allocator is asked for, so a test can compare the
+/// memory two code paths demand rather than inspecting arena internals.
+const ByteCounter = struct {
+    child: std.mem.Allocator,
+    bytes: usize = 0,
+
+    fn allocator(self: *ByteCounter) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = cAlloc,
+            .resize = cResize,
+            .remap = cRemap,
+            .free = cFree,
+        } };
+    }
+    fn cAlloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ByteCounter = @ptrCast(@alignCast(ctx));
+        self.bytes += len;
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn cResize(ctx: *anyopaque, b: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *ByteCounter = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(b, a, n, ra);
+    }
+    fn cRemap(ctx: *anyopaque, b: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *ByteCounter = @ptrCast(@alignCast(ctx));
+        self.bytes += n;
+        return self.child.rawRemap(b, a, n, ra);
+    }
+    fn cFree(ctx: *anyopaque, b: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *ByteCounter = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(b, a, ra);
+    }
+};
+
+test "a filtered-out field is rejected before it is copied" {
+    // The key is read off the borrowed bytes and the payload is claimed only
+    // if the filter wants it. A bulky rejected field must therefore not show
+    // up in the memory the entries demand.
+    const tio = debug_io;
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    // Wider than `data_probe_bytes`, so without an early verdict the whole
+    // thing is pulled into the entry arena before anything reads its name.
+    var bulky: [64 * 1024]u8 = undefined;
+    @memcpy(bulky[0..7], "_BULKY=");
+    @memset(bulky[7..], 'z');
+
+    const d_msg = try b.writeDataShared("MESSAGE=kept", 8);
+    var entries: [8]u64 = undefined;
+    for (&entries, 0..) |*slot, i| {
+        // Unique, so no skip verdict can be cached: the object is re-read on
+        // every entry and has to be rejected cheaply each time.
+        const d_bulk = try b.writeDataShared(&bulky, 1);
+        slot.* = try b.writeEntry(@intCast(i + 1), 1, &.{ d_bulk, d_msg });
+    }
+    const arr = try b.writeEntryArray(&entries);
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "cheapskip.journal");
+
+    var used: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |filtered, idx| {
+        var r = try Reader.open(tio, tmp.dir, "cheapskip.journal");
+        defer r.deinit();
+        var it = r.iterator();
+        try it.enableCache(testing.allocator);
+        defer it.disableCache(testing.allocator);
+        if (filtered) it.setFieldFilter(&.{"MESSAGE"});
+
+        var counter = ByteCounter{ .child = testing.allocator };
+        var n: usize = 0;
+        while (try it.next(counter.allocator())) |entry| {
+            var e = entry;
+            defer e.deinit();
+            try testing.expectEqualStrings("kept", e.get("MESSAGE").?);
+            try testing.expectEqual(@as(usize, if (filtered) 1 else 2), e.fields.len);
+            n += 1;
+        }
+        try testing.expectEqual(@as(usize, entries.len), n);
+        used[idx] = counter.bytes;
+    }
+
+    // Eight entries each carrying a 64 KB field the filter drops: without an
+    // early verdict those bytes land in every entry's arena.
+    try testing.expect(used[1] * 2 < used[0]);
 }
