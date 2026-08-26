@@ -12,7 +12,8 @@
 
 <p align="center">
   <a href="https://github.com/alaleks/zlrd/releases"><img src="https://img.shields.io/github/v/release/alaleks/zlrd?color=blue&label=release&cacheSeconds=3600" alt="Release"></a>
-  <a href="https://github.com/alaleks/zlrd/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alaleks/zlrd/release.yml?label=build" alt="Build"></a>
+  <a href="https://github.com/alaleks/zlrd/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alaleks/zlrd/ci.yml?branch=master&label=ci" alt="CI"></a>
+  <a href="https://github.com/alaleks/zlrd/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alaleks/zlrd/release.yml?label=release" alt="Release build"></a>
   <a href="https://ziglang.org"><img src="https://img.shields.io/badge/zig-0.16.0-orange?logo=zig" alt="Zig 0.16.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="License"></a>
 </p>
@@ -43,6 +44,7 @@ stderr, files, or HTTP webhooks.
 ## Table of contents
 
 - [Highlights](#highlights)
+- [Benchmarks](#benchmarks)
 - [Installation](#installation)
 - [Reader mode](#reader-mode)
   - [Examples](#reader-examples)
@@ -85,6 +87,73 @@ stderr, files, or HTTP webhooks.
   - **kernel-level probes** (`--kernel-probes`) — OOM, segfault, prior-boot panic; eBPF when `-Dwith-ebpf=true`
   - stderr / JSONL file / HTTP webhook sinks
 - **Single static binary** — no runtime, no glibc, no surprises
+
+---
+
+## Benchmarks
+
+Reproduce with `bench/vs-tools.sh` — it generates its own fixtures and prints
+every command as it runs. Numbers below: Apple M5, 40.4 MB / 400k lines of
+mixed JSON + bracketed + logfmt, best of 5 warm runs.
+
+Two things keep this honest. Output goes to a **file, never `/dev/null`** —
+GNU grep checks for `/dev/null` and stops at the first match like `-q`, which
+is how the first draft of this table had it at 32 GB/s. And every row reports
+the **number of lines the command actually produced**, so a tool that errors
+out or matches nothing cannot hide behind a fast time.
+
+**Filtering by level — the thing zlrd is for**
+
+| Tool | Time | Errors found | |
+| --- | --- | --- | --- |
+| `grep '"level":"error"'` | 29 ms | 22 298 | matches one spelling, in one format |
+| `jq 'select(.level=="error")'` | — | **fails** | aborts on the first non-JSON line |
+| `zlrd -l error` | 43 ms | **66 787** | reads the level from all three formats |
+
+Three times the errors out of the same file. `grep` only sees the ones written
+as JSON; the other two thirds are `[ERROR]` and `level=error`.
+
+**The same task on pure JSONL, where `jq` can compete**
+
+All three emit one JSON object per matching record — 22 298 each, so the work
+really is identical.
+
+| Tool | Time | Throughput |
+| --- | --- | --- |
+| `jq 'select(.level=="error")'` | 262 ms | 81 MB/s |
+| `zlrd -l error --output json` | **29 ms** | **731 MB/s** |
+| `grep '"level":"error"'` | 25 ms | 848 MB/s (substring, not a parse) |
+
+**Grouping repeated messages** — 17.2 MB, 160 distinct lines; all three report
+160 groups.
+
+| Tool | Time | |
+| --- | --- | --- |
+| `sort \| uniq -c \| sort -rn` | 317 ms | sorts the whole file |
+| `awk '{c[$0]++} ...'` | 271 ms | hash table — same algorithm |
+| `zlrd -a` | **27 ms** | hashes as it streams |
+
+**Plain substring search** — the case `grep` is built for.
+
+| Tool | Time | |
+| --- | --- | --- |
+| `ripgrep` | 27 ms | |
+| `zlrd -s` | 41 ms | also parses each line it prints |
+| GNU `grep` | 42 ms | |
+
+**Where zlrd is slower**
+
+Reading a `.gz`: `gzcat \| grep` takes 37 ms, `zlrd` 92 ms. The decoder is not
+the problem — zlrd's inflate runs about 39 ms against zlib's 34 ms on the same
+data. The gap is that the shell pipeline decompresses and searches in two
+processes on two cores, while zlrd does both on one thread.
+
+Reading and rendering the whole file: `cat` 21 ms, `zlrd` 47 ms — `cat` does
+no parsing, and zlrd formats all 400 000 records.
+
+If the question is about bytes, `grep` and `ripgrep` are the right tools and
+this table says so. zlrd earns its time when the question is about *log
+structure* — levels, time windows, repeated messages, crash markers.
 
 ---
 
