@@ -260,8 +260,13 @@ if [[ "$ASSUME_YES" != "true" ]]; then
     die "not running interactively — pass --yes to confirm $NEW_TAG"
   fi
   read -r -p "Create and push signed tag $NEW_TAG? [y/N] " CONFIRM
-  case "${CONFIRM,,}" in
-    y|yes) ;;
+  # `${CONFIRM,,}` is bash 4+, and macOS still ships bash 3.2 as /bin/bash —
+  # which `#!/usr/bin/env bash` picks up unless Homebrew's bash is first on
+  # PATH. It parsed fine and then died with "bad substitution" at the prompt,
+  # after the full pre-flight had already run. Matching the cases directly
+  # keeps this working on 3.2 and on the macOS CI runner.
+  case "$CONFIRM" in
+    [Yy]|[Yy][Ee][Ss]) ;;
     *)
       echo "Aborted."
       exit 0
