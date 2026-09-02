@@ -83,6 +83,11 @@ pub const Palette = struct {
 
     /// Search hit. A background/foreground pair rather than a bright
     /// foreground, so it stands out regardless of the terminal's theme.
+    ///
+    /// Teal, and deliberately not in any level badge's hue. It used to be
+    /// orange, which sat between the Warn and Error badges and read as "this
+    /// line is bad" rather than "this is what you searched for" — and in the
+    /// 16-colour palette it was byte-for-byte the same escape as Warn.
     match_on: []const u8,
 
     /// Level badges, indexed by `@intFromEnum(flags.Level)`. Each entry is
@@ -139,7 +144,6 @@ pub const Theme = struct {
 //   string   #188796   4.25  4.46  3.93  3.94
 //   number   #a34bfb   4.24  4.47  3.93  3.93
 //   bool     #038f19   4.25  4.46  3.93  3.94
-//   accent   #c45e00   4.24  4.46  3.93  3.93
 //
 // All clear the 3:1 WCAG threshold for UI components on every one of them;
 // the previous GitHub-dark palette scored 1.18–3.08 against white.
@@ -181,7 +185,7 @@ const truecolor_palette: Palette = .{
     .json_number = fg(0xa34bfb),
     .json_bool_null = fg(0x038f19),
     .json_punct = esc ++ "2m",
-    .match_on = badge(0xc45e00, 0xffffff),
+    .match_on = badge(0x146b73, 0xffffff),
     .level = .{
         badge(0x595f66, 0xffffff), // Trace
         badge(0x0d5bbd, 0xffffff), // Debug
@@ -209,7 +213,7 @@ const ansi256_palette: Palette = .{
     .json_number = esc ++ "38;5;135m",
     .json_bool_null = esc ++ "38;5;28m",
     .json_punct = esc ++ "2m",
-    .match_on = esc ++ "48;5;166m" ++ esc ++ "38;5;231m",
+    .match_on = esc ++ "48;5;23m" ++ esc ++ "38;5;231m",
     .level = .{
         esc ++ "48;5;59m" ++ esc ++ "38;5;231m",
         esc ++ "48;5;25m" ++ esc ++ "38;5;231m",
@@ -238,7 +242,7 @@ const ansi16_palette: Palette = .{
     .json_number = esc ++ "35m",
     .json_bool_null = esc ++ "32m",
     .json_punct = esc ++ "2m",
-    .match_on = esc ++ "43m" ++ esc ++ "30m",
+    .match_on = esc ++ "46m" ++ esc ++ "30m",
     .level = .{
         esc ++ "100m" ++ esc ++ "97m",
         esc ++ "44m" ++ esc ++ "97m",

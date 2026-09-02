@@ -70,6 +70,93 @@ fn findLastNLinesStart(f: *OpenFile, file_size: u64, n: usize, scan_buf: []u8) !
     return 0;
 }
 
+/// How far back a filtered backfill will look before giving up and printing
+/// whatever it found. Without a bound, `-t -l fatal` on a file with no fatals
+/// would read the entire file before showing the first live line.
+const filtered_backfill_cap: u64 = 8 * 1024 * 1024;
+
+/// Offset of the first byte of the `n`-th-from-last line that passes the
+/// active filters.
+///
+/// `findLastNLinesStart` counts raw lines, which is the wrong unit once `-l`
+/// or `-s` is in play: on a busy file the last 10 lines are almost never the
+/// ones the filter wants, so `zlrd -t -l error` opened on a blank screen and
+/// stayed blank until a new error happened to arrive. The window is widened
+/// geometrically instead, so the extra passes cost about an eighth of the
+/// bytes finally kept, and it stops at the first of: `n` matches found, start
+/// of file, or `filtered_backfill_cap`.
+fn findLastNMatchingStart(
+    allocator: std.mem.Allocator,
+    f: *OpenFile,
+    file_size: u64,
+    n: usize,
+    filter_state: *formats.FilterState,
+    scan_buf: []u8,
+) !u64 {
+    // Offsets of the most recent `n` matches, oldest at `head` once it wraps.
+    const ring = try allocator.alloc(u64, n);
+    defer allocator.free(ring);
+
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(allocator);
+
+    var budget = n;
+    while (true) {
+        const start = try findLastNLinesStart(f, file_size, budget, scan_buf);
+
+        var matches: usize = 0;
+        var head: usize = 0;
+        carry.clearRetainingCapacity();
+
+        // Absolute offset of the first byte of the line being assembled.
+        var line_off = start;
+        var pos = start;
+        while (pos < file_size) {
+            const want: usize = @intCast(@min(@as(u64, scan_buf.len), file_size - pos));
+            const got = try readAt(f.fd, pos, scan_buf[0..want]);
+            if (got == 0) break;
+            const chunk = scan_buf[0..got];
+
+            var seg_start: usize = 0;
+            while (simd.findByte(chunk, seg_start, '\n')) |nl| {
+                // Fast path: a line contained entirely in this chunk needs no
+                // copy. Only a line split across chunks goes through `carry`.
+                const line = if (carry.items.len == 0) chunk[seg_start..nl] else blk: {
+                    try ensureLineCapacity(carry.items.len, nl - seg_start);
+                    try carry.appendSlice(allocator, chunk[seg_start..nl]);
+                    break :blk carry.items;
+                };
+                if (line.len > 0 and filter_state.checkLine(line) != null) {
+                    ring[head] = line_off;
+                    head = (head + 1) % n;
+                    matches += 1;
+                }
+                carry.clearRetainingCapacity();
+                seg_start = nl + 1;
+                line_off = pos + seg_start;
+            }
+
+            if (seg_start < chunk.len) {
+                try ensureLineCapacity(carry.items.len, chunk.len - seg_start);
+                try carry.appendSlice(allocator, chunk[seg_start..]);
+            }
+            pos += got;
+        }
+
+        // A final line with no trailing newline still counts — `readLastNLines`
+        // prints it too, via `flush_final_line`.
+        if (carry.items.len > 0 and filter_state.checkLine(carry.items) != null) {
+            ring[head] = line_off;
+            head = (head + 1) % n;
+            matches += 1;
+        }
+
+        if (matches >= n) return ring[head];
+        if (start == 0 or file_size - start >= filtered_backfill_cap) return start;
+        budget *|= 8;
+    }
+}
+
 /// Batch-local aggregator used by tail reads.
 /// Keeps first-seen order within one read batch and prints once per key.
 /// Uses `reader.Aggregator`'s Entry shape — single map instead of three.
@@ -144,9 +231,15 @@ const BatchAggregator = struct {
             const entry = self.entries.get(key).?;
 
             if (entry.count > 1 and !filter_state.output_json) {
-                var buf: [128]u8 = undefined;
-                const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{entry.count}) catch "[x?] ";
-                std.Io.File.stdout().writeStreamingAll(tail_io, prefix) catch {};
+                // Through the same sink as the record itself. A direct stdout
+                // write here jumped ahead of everything still buffered, so the
+                // count landed detached from the line it counted — and it hard-
+                // coded the escapes, leaking them under `--color never`.
+                if (filter_state.out) |o| {
+                    o.write(o.theme.palette.dim);
+                    o.print("[x{d}] ", .{entry.count});
+                    o.write(o.theme.palette.reset);
+                }
             }
 
             // Line + info were already validated by checkLine in processLine;
@@ -223,6 +316,13 @@ pub fn follow(
 
     if (files_len == 0) return;
 
+    // The backfill above went into `out`'s 256 KB buffer, which otherwise
+    // only drains when it fills or on `deinit` — and `deinit` never runs in
+    // follow mode, because the loop below only ends when the process is
+    // killed. Without this flush and the one per batch, `-t` printed nothing
+    // at all: not the last-N lines, not a single appended record.
+    out.flush();
+
     const carries = try allocator.alloc(std.ArrayList(u8), files_len);
     defer {
         for (carries) |*c| c.deinit(allocator);
@@ -253,9 +353,15 @@ pub fn follow(
             if (bytes_read > 0) any_read = true;
         }
 
-        if (!any_read) {
-            std.Io.sleep(tail_io, std.Io.Duration.fromMilliseconds(100), .awake) catch continue;
+        if (any_read) {
+            out.flush();
+            // Downstream went away (`| head`, pager quit). Stop rather than
+            // formatting output nobody will read until we are killed.
+            if (out.broken) return;
+            continue;
         }
+
+        std.Io.sleep(tail_io, std.Io.Duration.fromMilliseconds(100), .awake) catch continue;
     }
 }
 
@@ -282,7 +388,12 @@ pub fn readLastNLines(
 ) !u64 {
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
 
-    const read_from = try findLastNLinesStart(f, file_size, n, read_buf);
+    // With a filter on, "last n lines" has to mean n lines that survive it.
+    const filtered = filter_state.has_level_filter or filter_state.has_search_filter;
+    const read_from = if (filtered)
+        try findLastNMatchingStart(allocator, f, file_size, n, filter_state, read_buf)
+    else
+        try findLastNLinesStart(f, file_size, n, read_buf);
 
     f.position = read_from;
 
@@ -763,4 +874,114 @@ test "readToEOFInternal can flush final line without trailing newline" {
 
     try testing.expectEqual(@as(usize, 0), carry.items.len);
     try testing.expectEqual(stat.size, of.position);
+}
+
+fn makeSearchTailArgs(files: [][]const u8, num_lines: usize, search: []const u8) flags.Args {
+    return .{
+        .files = files,
+        .tail_mode = true,
+        .date = null,
+        .levels = null,
+        .search = search,
+        .num_lines = num_lines,
+        .aggregate = false,
+        .aggregate_mode = .exact,
+    };
+}
+
+/// `hit a` starts at 4 and `hit b` at 26; everything else is filler the
+/// filter drops.
+const filtered_backfill_fixture =
+    "no1\nhit a\nno2\nno3\nno4\nno5\nhit b\nno6\nno7\nno8\nno9\nno10\n";
+
+fn filteredBackfillStart(allocator: std.mem.Allocator, n: usize) !u64 {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "f.log", .data = filtered_backfill_fixture });
+
+    var file = try tmp.dir.openFile(tail_io, "f.log", .{});
+    defer file.close(tail_io);
+
+    var files_array = [_][]const u8{"f.log"};
+    const args = makeSearchTailArgs(files_array[0..], n, "hit");
+    var filter_state = formats.FilterState.init(args, null, null);
+
+    const scan_buf = try allocator.alloc(u8, READ_BUF_SIZE);
+    defer allocator.free(scan_buf);
+
+    var of = OpenFile{ .path = "f.log", .fd = file, .position = 0 };
+    const stat = try file.stat(tail_io);
+    return findLastNMatchingStart(allocator, &of, stat.size, n, &filter_state, scan_buf);
+}
+
+test "filtered backfill starts at the nth-from-last matching line" {
+    // Both matches sit outside the last `n` raw lines, which is the case the
+    // raw-line backfill got wrong: it would have started past them and shown
+    // nothing at all.
+    try testing.expectEqual(@as(u64, 26), try filteredBackfillStart(testing.allocator, 1));
+    try testing.expectEqual(@as(u64, 4), try filteredBackfillStart(testing.allocator, 2));
+}
+
+test "filtered backfill falls back to start of file when matches run out" {
+    try testing.expectEqual(@as(u64, 0), try filteredBackfillStart(testing.allocator, 5));
+}
+
+test "filtered backfill counts a final line with no trailing newline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Last line is unterminated; `readLastNLines` prints it, so it has to
+    // count here too or the window would be off by one match.
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "u.log", .data = "hit a\nno1\nhit b" });
+
+    var file = try tmp.dir.openFile(tail_io, "u.log", .{});
+    defer file.close(tail_io);
+
+    var files_array = [_][]const u8{"u.log"};
+    const args = makeSearchTailArgs(files_array[0..], 1, "hit");
+    var filter_state = formats.FilterState.init(args, null, null);
+
+    const scan_buf = try testing.allocator.alloc(u8, READ_BUF_SIZE);
+    defer testing.allocator.free(scan_buf);
+
+    var of = OpenFile{ .path = "u.log", .fd = file, .position = 0 };
+    const stat = try file.stat(tail_io);
+    const start = try findLastNMatchingStart(testing.allocator, &of, stat.size, 1, &filter_state, scan_buf);
+    try testing.expectEqual(@as(u64, 10), start);
+}
+
+test "filtered backfill reassembles lines split across scan chunks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+
+    // Filler long enough that the sole match lands mid-chunk with a tiny
+    // scan buffer, exercising the carry path.
+    const hit_off = 300;
+    try body.appendNTimes(allocator, 'x', hit_off - 1);
+    try body.append(allocator, '\n');
+    try body.appendSlice(allocator, "hit here\n");
+    try body.appendNTimes(allocator, 'y', 299);
+    try body.append(allocator, '\n');
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "c.log", .data = body.items });
+
+    var file = try tmp.dir.openFile(tail_io, "c.log", .{});
+    defer file.close(tail_io);
+
+    var files_array = [_][]const u8{"c.log"};
+    const args = makeSearchTailArgs(files_array[0..], 1, "hit");
+    var filter_state = formats.FilterState.init(args, null, null);
+
+    const scan_buf = try allocator.alloc(u8, 64);
+    var of = OpenFile{ .path = "c.log", .fd = file, .position = 0 };
+    const stat = try file.stat(tail_io);
+    const start = try findLastNMatchingStart(allocator, &of, stat.size, 1, &filter_state, scan_buf);
+    try testing.expectEqual(@as(u64, hit_off), start);
 }
