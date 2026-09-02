@@ -460,12 +460,25 @@ test "concurrent dispatch produces whole records, never interleaved" {
     const allocator = testing.allocator;
     const io = std.Options.debug_io;
 
-    // `Dispatcher` opens its alert file relative to the process cwd, so the
-    // fixture lives there under a name nothing else will collide with.
-    const file_path = "zlrd-alert-concurrency.jsonl.tmp";
+    // `Dispatcher` opens its alert file relative to the process cwd. A fixed
+    // name is not safe here: this file is imported by several modules, so the
+    // test is linked into several test binaries, and `zig build test` runs
+    // those concurrently from the same cwd. They then shared one fixture —
+    // each `Dispatcher` tracking its own `file_offset` from 0, overwriting the
+    // others' records, and each `defer deleteFile` yanking the file out from
+    // under a run still in progress. The result was a short read (e.g. 729 of
+    // 1200 lines) that looked like a lost-record race in `writeFile`, but only
+    // ever reproduced under a parallel build. A per-run name isolates them.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [128]u8 = undefined;
+    const file_path = try std.fmt.bufPrint(
+        &path_buf,
+        ".zig-cache/tmp/{s}/alerts.jsonl",
+        .{tmp.sub_path},
+    );
     const cwd = std.Io.Dir.cwd();
-    cwd.deleteFile(io, file_path) catch {};
-    defer cwd.deleteFile(io, file_path) catch {};
 
     var m = metrics.Metrics.init(0);
     var d = try Dispatcher.init(io, .{
