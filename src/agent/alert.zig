@@ -63,7 +63,13 @@ pub const Dispatcher = struct {
         var file: ?std.Io.File = null;
         var offset: u64 = 0;
         if (sinks.file_path) |path| {
-            file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+            // `read` is not for reading the file back — it widens the Windows
+            // access mask. Without it NtCreateFile grants GENERIC_WRITE only,
+            // and the `length()` below issues NtQueryInformationFile(.All),
+            // which needs FILE_READ_ATTRIBUTES and fails with AccessDenied.
+            // POSIX does not care, so the alert file sink was dead on Windows
+            // for every release until CI started running the tests there.
+            file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
             offset = try file.?.length(io);
         }
         return .{
