@@ -10,6 +10,7 @@ const gzip = @import("gzip.zig");
 const regex = @import("regex");
 const theme = @import("theme.zig");
 const civil = @import("civil.zig");
+const parallel = @import("parallel.zig");
 pub const Cutoff = civil.Cutoff;
 const jsonx = @import("jsonx.zig");
 const protox = @import("protox.zig");
@@ -40,6 +41,10 @@ pub const Out = struct {
     /// read loops poll this and stop early instead of formatting the rest of
     /// a file nobody will read.
     broken: bool = false,
+    /// When set, `flush` appends here instead of writing to `file`. The
+    /// parallel scan gives every worker its own sink, so formatting happens
+    /// on all cores while one thread writes the pieces out in order.
+    sink: ?*std.ArrayList(u8) = null,
 
     /// Large enough that a page of styled output flushes once. Colour escapes
     /// inflate a log line roughly 3–5×, so this is ~1–2k lines per syscall.
@@ -68,11 +73,17 @@ pub const Out = struct {
         if (s.len > self.buf.len - self.len) {
             self.flush();
             if (s.len > self.buf.len) {
-                // Bigger than the whole buffer: hand it straight to the file
+                // Bigger than the whole buffer: hand it straight to the sink
                 // rather than growing without bound.
-                self.file.writeStreamingAll(debug_io, s) catch {
-                    self.broken = true;
-                };
+                if (self.sink) |dst| {
+                    dst.appendSlice(self.allocator, s) catch {
+                        self.broken = true;
+                    };
+                } else {
+                    self.file.writeStreamingAll(debug_io, s) catch {
+                        self.broken = true;
+                    };
+                }
                 return;
             }
         }
@@ -102,9 +113,15 @@ pub const Out = struct {
 
     pub fn flush(self: *Out) void {
         if (self.len == 0) return;
-        self.file.writeStreamingAll(debug_io, self.buf[0..self.len]) catch {
-            self.broken = true;
-        };
+        if (self.sink) |s| {
+            s.appendSlice(self.allocator, self.buf[0..self.len]) catch {
+                self.broken = true;
+            };
+        } else {
+            self.file.writeStreamingAll(debug_io, self.buf[0..self.len]) catch {
+                self.broken = true;
+            };
+        }
         self.len = 0;
     }
 };
@@ -1131,6 +1148,162 @@ fn newestInChunk(chunk: []const u8) ?AnchorStamp {
     return null;
 }
 
+/// Smallest file worth splitting across threads. Below this the pool costs
+/// more to stand up than the scan it replaces.
+const parallel_min_bytes: u64 = 4 << 20;
+
+/// Input bytes per chunk. Small enough that peak memory stays in single-digit
+/// megabytes at any thread count, large enough that per-chunk overhead
+/// disappears against the work.
+const parallel_chunk_bytes: usize = 1 << 20;
+
+/// Threads the pool will use at most. Past this the writer, which is a single
+/// thread, becomes the bottleneck and the extra workers only add memory.
+const parallel_max_workers: usize = 8;
+
+/// One thread's worth of scanning state.
+///
+/// Everything a line needs is per-worker: its own filter state, its own
+/// expander, its own output buffer. Nothing is shared, so there is no lock on
+/// the hot path — the only synchronisation in the whole scan is handing a
+/// finished chunk to the writer.
+const ChunkWorker = struct {
+    out: Out,
+    filter_state: FilterState,
+    expander: ?JsonExpander,
+    counter: LevelCounter = .{},
+
+    fn init(
+        allocator: std.mem.Allocator,
+        args: flags.Args,
+        th: *const Theme,
+        since_cut: ?civil.Cutoff,
+    ) !ChunkWorker {
+        var w = ChunkWorker{
+            .out = try Out.init(allocator, std.Io.File.stdout(), th),
+            .filter_state = undefined,
+            .expander = if (wantsJsonExpansion(args, th))
+                try JsonExpander.init(allocator, .{})
+            else
+                null,
+        };
+        w.filter_state = FilterState.init(args, &w.out, null);
+        w.filter_state.since_cut = since_cut;
+        return w;
+    }
+
+    /// Fixes up the interior pointers that `init` could not set, because the
+    /// struct is moved into its slot after being built.
+    fn rebind(self: *ChunkWorker) void {
+        self.filter_state.out = &self.out;
+        self.filter_state.expander = if (self.expander) |*x| x else null;
+    }
+
+    fn deinit(self: *ChunkWorker) void {
+        self.filter_state.deinit();
+        if (self.expander) |*x| x.deinit();
+        self.out.deinit();
+    }
+
+    pub fn process(self: *ChunkWorker, chunk: []const u8, dst: *std.ArrayList(u8)) void {
+        self.out.sink = dst;
+        self.out.len = 0;
+        self.filter_state.beginChunk(chunk);
+
+        var start: usize = 0;
+        while (start < chunk.len) {
+            const nl = simd.findByte(chunk, start, '\n') orelse chunk.len;
+            const line = chunk[start..nl];
+            if (line.len > 0) {
+                if (self.filter_state.checkLine(line)) |ck| {
+                    if (ck.info.level) |lvl| self.counter.add(lvl);
+                    self.filter_state.printChecked(ck.line, ck.info);
+                }
+            }
+            start = nl + 1;
+        }
+        self.out.flush();
+    }
+};
+
+/// True when this run can be split across threads without changing a byte of
+/// its output.
+///
+/// Pagination is interactive and aggregation needs one map for the whole
+/// file; both stay on the serial path rather than being approximated here.
+fn parallelEligible(args: flags.Args, path: []const u8, size: u64) bool {
+    if (args.tail_mode or args.aggregate) return false;
+    if (args.num_lines > 0) return false; // pagination
+    if (gzip.isGzip(path)) return false; // not seekable
+    return size >= parallel_min_bytes;
+}
+
+fn writeChunkToOut(ctx: *anyopaque, bytes: []const u8) bool {
+    const out: *Out = @ptrCast(@alignCast(ctx));
+    out.write(bytes);
+    return !out.broken;
+}
+
+/// Scans `file` across threads. Returns false when the pool could not be set
+/// up, in which case the caller runs the serial path and nothing is lost.
+fn readParallel(
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    size: u64,
+    args: flags.Args,
+    counter: *LevelCounter,
+    out: *Out,
+    since_cut: ?civil.Cutoff,
+    chunk_bytes: usize,
+) !bool {
+    const worker_count = parallel.suggestedWorkers(size, chunk_bytes, parallel_max_workers);
+    if (worker_count < 2) return false;
+
+    var file_ctx = FileSource{ .file = file };
+    const source = parallel.Source{
+        .ctx = &file_ctx,
+        .size = size,
+        .read_at = FileSource.readAt,
+    };
+
+    const bounds = try parallel.computeBoundaries(allocator, source, chunk_bytes, max_line_bytes);
+    defer allocator.free(bounds);
+    if (bounds.len - 1 < 2) return false;
+
+    const workers = try allocator.alloc(ChunkWorker, worker_count);
+    defer allocator.free(workers);
+
+    var built: usize = 0;
+    errdefer for (workers[0..built]) |*w| w.deinit();
+    while (built < worker_count) : (built += 1) {
+        workers[built] = try ChunkWorker.init(allocator, args, out.theme, since_cut);
+    }
+    for (workers) |*w| w.rebind();
+    defer for (workers) |*w| w.deinit();
+
+    try parallel.run(ChunkWorker, allocator, source, bounds, workers, out, writeChunkToOut, .{
+        .chunk_bytes = chunk_bytes,
+        .max_line_bytes = max_line_bytes,
+    });
+
+    for (workers) |*w| {
+        for (w.counter.counts, 0..) |n, i| counter.counts[i] += n;
+        counter.total += w.counter.total;
+    }
+    return true;
+}
+
+/// Adapts a file to `parallel.Source`. Positional reads only, so every worker
+/// can read its own range without a shared cursor.
+const FileSource = struct {
+    file: std.Io.File,
+
+    fn readAt(ctx: *anyopaque, pos: u64, dst: []u8) usize {
+        const self: *FileSource = @ptrCast(@alignCast(ctx));
+        return self.file.readPositional(debug_io, &.{dst}, pos) catch 0;
+    }
+};
+
 /// Read one log file with filtering and coloured output.
 /// If aggregation is enabled, matched lines are grouped by `args.aggregate_mode`.
 /// If `args.num_lines > 0`, paginates the output; otherwise streams continuously.
@@ -1160,6 +1333,14 @@ pub fn readStreaming(
 
     const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
     defer file.close(debug_io);
+
+    if (parallelEligible(args, path, file.length(debug_io) catch 0)) {
+        const size = file.length(debug_io) catch 0;
+        // A pool that cannot be built is not an error: the serial path is
+        // still right, just slower, and a failed allocation here says the
+        // machine is in no state to run eight of them anyway.
+        if (readParallel(allocator, file, size, args, counter, out, since_cut, parallel_chunk_bytes) catch false) return;
+    }
 
     if (args.aggregate) {
         var handler = try AggregateHandler.init(allocator, args, counter, &filter_state, out, expander_ptr);
@@ -3492,6 +3673,146 @@ test "--since with no anchor filters nothing rather than everything" {
     // date. An empty log would otherwise look exactly like a broken filter.
     try std.testing.expectEqual(@as(?civil.Cutoff, null), state.since_cut);
     try std.testing.expect(state.checkLine("2019-01-01T00:00:00Z INF ancient") != null);
+}
+
+/// Builds a mixed-format fixture, runs it through both scan paths, and hands
+/// back the two outputs for comparison.
+fn bothScanPaths(
+    allocator: std.mem.Allocator,
+    args_in: flags.Args,
+    th: *const Theme,
+    lines: usize,
+    chunk_bytes: usize,
+) !struct { serial: []u8, parallel: []u8 } {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(allocator);
+    var scratch: [256]u8 = undefined;
+    for (0..lines) |i| {
+        const line = switch (i % 3) {
+            0 => try std.fmt.bufPrint(&scratch, "{{\"time\":\"2026-09-03T10:00:{d:0>2}Z\",\"level\":\"{s}\",\"msg\":\"req {d}\"}}\n", .{ i % 60, if (i % 7 == 0) "error" else "info", i }),
+            1 => try std.fmt.bufPrint(&scratch, "2026-09-03 10:00:{d:0>2} [{s}] req {d} handled\n", .{ i % 60, if (i % 7 == 0) "ERROR" else "INFO", i }),
+            else => try std.fmt.bufPrint(&scratch, "time=2026-09-03T10:00:{d:0>2}Z level={s} msg=\"req {d}\"\n", .{ i % 60, if (i % 7 == 0) "error" else "info", i }),
+        };
+        try content.appendSlice(allocator, line);
+    }
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "f.log", .data = content.items });
+
+    var args = args_in;
+    var files = [_][]const u8{"f.log"};
+    args.files = &files;
+
+    const file = try tmp.dir.openFile(debug_io, "f.log", .{});
+    defer file.close(debug_io);
+    const size = try file.length(debug_io);
+
+    // Parallel.
+    var par_buf: std.ArrayList(u8) = .empty;
+    errdefer par_buf.deinit(allocator);
+    var par_out = try Out.init(allocator, std.Io.File.stdout(), th);
+    defer par_out.deinit();
+    par_out.sink = &par_buf;
+    var par_counter = LevelCounter{};
+    const ran = try readParallel(allocator, file, size, args, &par_counter, &par_out, null, chunk_bytes);
+    try std.testing.expect(ran);
+    par_out.flush();
+
+    // Serial, through the same handler the real read path uses.
+    var ser_buf: std.ArrayList(u8) = .empty;
+    errdefer ser_buf.deinit(allocator);
+    var ser_out = try Out.init(allocator, std.Io.File.stdout(), th);
+    defer ser_out.deinit();
+    ser_out.sink = &ser_buf;
+    var expander: ?JsonExpander = if (wantsJsonExpansion(args, th))
+        try JsonExpander.init(allocator, .{})
+    else
+        null;
+    defer if (expander) |*x| x.deinit();
+    var fs = FilterState.init(args, &ser_out, if (expander) |*x| x else null);
+    defer fs.deinit();
+    var ser_counter = LevelCounter{};
+    var handler = PrintHandler{
+        .args = args,
+        .counter = &ser_counter,
+        .filter_state = &fs,
+        .out = &ser_out,
+        .paginate = false,
+    };
+    const file2 = try tmp.dir.openFile(debug_io, "f.log", .{});
+    defer file2.close(debug_io);
+    try scanLines(allocator, file2, &handler);
+    ser_out.flush();
+
+    // The level tally has to survive the split too — it is merged from one
+    // counter per worker, and a lost record there would be invisible in the
+    // bytes.
+    try std.testing.expectEqual(ser_counter.total, par_counter.total);
+    for (ser_counter.counts, par_counter.counts) |a, b| try std.testing.expectEqual(a, b);
+
+    return .{
+        .serial = try ser_buf.toOwnedSlice(allocator),
+        .parallel = try par_buf.toOwnedSlice(allocator),
+    };
+}
+
+test "the parallel scan produces exactly the serial output" {
+    const a = std.testing.allocator;
+    var files = [_][]const u8{"f.log"};
+    // Every shape the split has to survive: plain rendering, a level filter,
+    // a substring search, and JSONL for a pipeline.
+    for ([_]flags.Args{
+        .{ .files = &files },
+        .{ .files = &files, .levels = flags.levelBit(.Error) },
+        .{ .files = &files, .search = "handled" },
+        .{ .files = &files, .output_json = true },
+    }) |args| {
+        for ([_]*const Theme{ &Theme.plain, &Theme.forMode(.truecolor, theme.Glyphs.unicode) }) |th| {
+            const got = try bothScanPaths(a, args, th, 4000, 4096);
+            defer a.free(got.serial);
+            defer a.free(got.parallel);
+            try std.testing.expectEqualSlices(u8, got.serial, got.parallel);
+        }
+    }
+}
+
+test "a chunk size that yields one chunk falls back instead of splitting" {
+    const a = std.testing.allocator;
+    var files = [_][]const u8{"f.log"};
+    // `readParallel` reports false rather than standing up a pool of one, so
+    // the caller runs the serial path and nothing is duplicated.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "tiny.log", .data = "one line\n" });
+    const file = try tmp.dir.openFile(debug_io, "tiny.log", .{});
+    defer file.close(debug_io);
+
+    var out = try Out.init(a, std.Io.File.stdout(), &Theme.plain);
+    defer out.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    out.sink = &buf;
+    var counter = LevelCounter{};
+
+    var args = flags.Args{ .files = &files };
+    args.files = &files;
+    try std.testing.expect(!try readParallel(a, file, 9, args, &counter, &out, null, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "pagination and aggregation stay on the serial path" {
+    var files = [_][]const u8{"app.log"};
+    const big: u64 = 64 << 20;
+    try std.testing.expect(parallelEligible(.{ .files = &files }, "app.log", big));
+    // Pagination is interactive; aggregation needs one map for the whole file.
+    try std.testing.expect(!parallelEligible(.{ .files = &files, .num_lines = 100 }, "app.log", big));
+    try std.testing.expect(!parallelEligible(.{ .files = &files, .aggregate = true }, "app.log", big));
+    try std.testing.expect(!parallelEligible(.{ .files = &files, .tail_mode = true }, "app.log", big));
+    // Not seekable, so it cannot be split.
+    try std.testing.expect(!parallelEligible(.{ .files = &files }, "app.log.gz", big));
+    // Too small to pay for the pool.
+    try std.testing.expect(!parallelEligible(.{ .files = &files }, "app.log", 1024));
 }
 
 test "expansion never runs for --output json" {

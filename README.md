@@ -93,6 +93,8 @@ stderr, files, or HTTP webhooks.
   - **systemd-journal** sources (`--journal-unit`) with wildcards
   - **kernel-level probes** (`--kernel-probes`) — OOM, segfault, prior-boot panic; eBPF when `-Dwith-ebpf=true`
   - stderr / JSONL file / HTTP webhook sinks
+- **Parallel scan** — seekable files are split at line boundaries across
+  cores, output byte-identical to the serial path
 - **Single static binary** — no runtime, no glibc, no surprises
 
 ---
@@ -115,7 +117,7 @@ out or matches nothing cannot hide behind a fast time.
 | --- | --- | --- | --- |
 | `grep '"level":"error"'` | 32 ms | 22 298 | matches one spelling, in one format |
 | `jq 'select(.level=="error")'` | — | **fails** | aborts on the first non-JSON line |
-| `zlrd -l error` | 50 ms | **66 787** | reads the level from all three formats |
+| `zlrd -l error` | **27 ms** | **66 787** | reads the level from all three formats |
 
 Three times the errors out of the same file. `grep` only sees the ones written
 as JSON; the other two thirds are `[ERROR]` and `level=error`.
@@ -127,8 +129,8 @@ really is identical.
 
 | Tool | Time | Throughput |
 | --- | --- | --- |
-| `jq 'select(.level=="error")'` | 268 ms | 79 MB/s |
-| `zlrd -l error --output json` | **31 ms** | **684 MB/s** |
+| `jq 'select(.level=="error")'` | 269 ms | 79 MB/s |
+| `zlrd -l error --output json` | **21 ms** | **1010 MB/s** |
 | `grep '"level":"error"'` | 25 ms | 848 MB/s (substring, not a parse) |
 
 **Grouping repeated messages** — 17.2 MB, 160 distinct lines; all three report
@@ -136,15 +138,15 @@ really is identical.
 
 | Tool | Time | |
 | --- | --- | --- |
-| `sort \| uniq -c \| sort -rn` | 335 ms | sorts the whole file |
-| `awk '{c[$0]++} ...'` | 268 ms | hash table — same algorithm |
+| `sort \| uniq -c \| sort -rn` | 331 ms | sorts the whole file |
+| `awk '{c[$0]++} ...'` | 262 ms | hash table — same algorithm |
 | `zlrd -a` | **28 ms** | hashes as it streams |
 
 **Plain substring search** — the case `grep` is built for.
 
 | Tool | Time | |
 | --- | --- | --- |
-| `zlrd -s` | **37 ms** | also detects the format of each line it prints |
+| `zlrd -s` | **23 ms** | also detects the format of each line it prints |
 | GNU `grep` | 44 ms | |
 
 `ripgrep` is not in the table because it was not installed on the machine that
@@ -153,19 +155,35 @@ land near `grep` or below on a task this simple.
 
 **Where zlrd is slower**
 
-Reading a `.gz`: `gzcat \| grep` takes 39 ms, `zlrd` 87 ms. The decoder is not
+Reading a `.gz`: `gzcat \| grep` takes 39 ms, `zlrd` 92 ms. The decoder is not
 the problem — zlrd's inflate runs about 39 ms against zlib's 34 ms on the same
 data. The gap is that the shell pipeline decompresses and searches in two
 processes on two cores, while zlrd does both on one thread.
 
-Reading and rendering the whole file: `cat` 26 ms, `zlrd` 51 ms — `cat` does
-no parsing, and zlrd formats all 400 000 records.
+Reading and rendering the whole file: `cat` 25 ms, `zlrd` 34 ms — and `cat`
+does no parsing at all, while zlrd formats all 400 000 records. `wc -l`, which
+only counts newlines, takes 45 ms.
 
-Filtering by level on the mixed fixture is the one place a plain `grep` beats
-it on the clock: 32 ms against 50 ms. It is also the place `grep` returns a
-third of the errors, because it can only match one spelling of one format.
-That trade is the whole design, and it is worth stating plainly rather than
-hiding behind a fixture that flatters it.
+Compressed input is the one row left where a shell pipeline wins outright, and
+the reason is the same one that makes everything else fast: `gzcat | grep`
+decompresses and searches in two processes on two cores. A `.gz` cannot be
+split at line boundaries without decompressing it first, so the parallel scan
+has nothing to work with there.
+
+**Why the numbers above beat single-threaded tools by more than a constant**
+
+`grep`, `less`, `awk` and `jq` are single-threaded, so seven of your eight
+cores sit idle while one of them walks the file. zlrd splits a seekable input
+at line boundaries, filters and formats the pieces in parallel, and writes
+them back in the original order — the output is byte-for-byte identical to the
+serial path, which is the only version of this worth shipping.
+
+It turns itself off where it would change behaviour or cannot help: paginated
+output (`-n`), aggregation (`-a`, which needs one table for the whole file),
+`--tail`, compressed input, and files under 4 MB, where standing up the pool
+costs more than the scan. Peak memory is bounded by the pool, not the file: a
+worker blocks until the writer has taken its buffer, so at most one chunk per
+thread is ever in flight.
 
 `ripgrep` is still the right tool when the question is purely about bytes.
 zlrd earns its time when the question is about *log structure* — levels, time
@@ -957,6 +975,7 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Protobuf payloads decoded out of JSON log messages
 - [x] Crash markers for Rust and the C/C++/glibc abort family
 - [x] `--since 5m` relative time filters
+- [x] Parallel scan across line-aligned chunks
 
 Next:
 
@@ -964,7 +983,6 @@ Next:
       its template tables are the remaining half
 - [ ] Structured field filters (`--where status=500`)
 - [ ] A schema hint for protobuf payloads, so decoded fields get names
-- [ ] Parallel scan across line-aligned chunks
 
 ### Status
 

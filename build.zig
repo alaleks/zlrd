@@ -194,6 +194,7 @@ pub fn build(b: *std.Build) void {
         "src/winlog/format.zig",
         "src/winlog/evtx.zig",
         "src/reader/civil.zig",
+        "src/reader/parallel.zig",
     }) |path| {
         const mod = b.createModule(.{
             .root_source_file = b.path(path),
