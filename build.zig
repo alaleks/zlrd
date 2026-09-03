@@ -193,6 +193,7 @@ pub fn build(b: *std.Build) void {
     inline for ([_][]const u8{
         "src/winlog/format.zig",
         "src/winlog/evtx.zig",
+        "src/reader/civil.zig",
     }) |path| {
         const mod = b.createModule(.{
             .root_source_file = b.path(path),

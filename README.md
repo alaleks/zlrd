@@ -53,6 +53,7 @@ stderr, files, or HTTP webhooks.
 - [Reader mode](#reader-mode)
   - [Examples](#reader-examples)
   - [Supported log formats](#supported-log-formats)
+  - [Relative windows](#relative-windows)
   - [Aggregation modes](#aggregation-modes)
 - [Agent mode](#agent-mode)
   - [Quick start](#agent-quick-start)
@@ -112,9 +113,9 @@ out or matches nothing cannot hide behind a fast time.
 
 | Tool | Time | Errors found | |
 | --- | --- | --- | --- |
-| `grep '"level":"error"'` | 29 ms | 22 298 | matches one spelling, in one format |
+| `grep '"level":"error"'` | 32 ms | 22 298 | matches one spelling, in one format |
 | `jq 'select(.level=="error")'` | — | **fails** | aborts on the first non-JSON line |
-| `zlrd -l error` | 43 ms | **66 787** | reads the level from all three formats |
+| `zlrd -l error` | 50 ms | **66 787** | reads the level from all three formats |
 
 Three times the errors out of the same file. `grep` only sees the ones written
 as JSON; the other two thirds are `[ERROR]` and `level=error`.
@@ -126,36 +127,45 @@ really is identical.
 
 | Tool | Time | Throughput |
 | --- | --- | --- |
-| `jq 'select(.level=="error")'` | 267 ms | 79 MB/s |
-| `zlrd -l error --output json` | **28 ms** | **757 MB/s** |
-| `grep '"level":"error"'` | 23 ms | 922 MB/s (substring, not a parse) |
+| `jq 'select(.level=="error")'` | 268 ms | 79 MB/s |
+| `zlrd -l error --output json` | **31 ms** | **684 MB/s** |
+| `grep '"level":"error"'` | 25 ms | 848 MB/s (substring, not a parse) |
 
 **Grouping repeated messages** — 17.2 MB, 160 distinct lines; all three report
 160 groups.
 
 | Tool | Time | |
 | --- | --- | --- |
-| `sort \| uniq -c \| sort -rn` | 318 ms | sorts the whole file |
-| `awk '{c[$0]++} ...'` | 265 ms | hash table — same algorithm |
+| `sort \| uniq -c \| sort -rn` | 335 ms | sorts the whole file |
+| `awk '{c[$0]++} ...'` | 268 ms | hash table — same algorithm |
 | `zlrd -a` | **28 ms** | hashes as it streams |
 
 **Plain substring search** — the case `grep` is built for.
 
 | Tool | Time | |
 | --- | --- | --- |
-| `ripgrep` | 27 ms | |
-| `zlrd -s` | **35 ms** | also parses each line it prints |
-| GNU `grep` | 41 ms | |
+| `zlrd -s` | **37 ms** | also detects the format of each line it prints |
+| GNU `grep` | 44 ms | |
+
+`ripgrep` is not in the table because it was not installed on the machine that
+produced this run — the script prints its row when it is present. Expect it to
+land near `grep` or below on a task this simple.
 
 **Where zlrd is slower**
 
-Reading a `.gz`: `gzcat \| grep` takes 38 ms, `zlrd` 87 ms. The decoder is not
+Reading a `.gz`: `gzcat \| grep` takes 39 ms, `zlrd` 87 ms. The decoder is not
 the problem — zlrd's inflate runs about 39 ms against zlib's 34 ms on the same
 data. The gap is that the shell pipeline decompresses and searches in two
 processes on two cores, while zlrd does both on one thread.
 
-Reading and rendering the whole file: `cat` 20 ms, `zlrd` 48 ms — `cat` does
+Reading and rendering the whole file: `cat` 26 ms, `zlrd` 51 ms — `cat` does
 no parsing, and zlrd formats all 400 000 records.
+
+Filtering by level on the mixed fixture is the one place a plain `grep` beats
+it on the clock: 32 ms against 50 ms. It is also the place `grep` returns a
+third of the errors, because it can only match one spelling of one format.
+That trade is the whole design, and it is worth stating plainly rather than
+hiding behind a fixture that flatters it.
 
 `ripgrep` is still the right tool when the question is purely about bytes.
 zlrd earns its time when the question is about *log structure* — levels, time
@@ -288,6 +298,9 @@ zlrd -d 2024-01-01..2024-01-31 app.log
 # Time window inside one day (incident drill-down)
 zlrd -d 2024-01-20 --from 09:00 --to 09:30 app.log
 
+# The last five minutes of the log
+zlrd --since 5m app.log
+
 # Real-time follow, errors only
 zlrd -t -l error app.log
 
@@ -328,6 +341,28 @@ time=2024-01-20T12:00:00Z level=error msg="connection refused"
 
 Recognized level keys: `level`, `severity`, `lvl`. Recognized timestamp keys:
 `time`, `timestamp`, `date`.
+
+### Relative windows
+
+`--since` takes `5m`, `90s`, `2h`, `7d`, or a bare number of seconds, and
+keeps the records inside that window.
+
+The window is measured **from the newest timestamp in the input**, not from
+the wall clock. That is a deliberate departure from `journalctl --since`, and
+it buys two things. It is immune to time zones — both sides of the comparison
+come from the same log, so whatever offset its timestamps carry cancels out,
+and the machine reading the file never has to agree with the one that wrote
+it. And `zlrd --since 5m` on a log rotated last week shows the last five
+minutes *of that log*, where a wall-clock window would print nothing at all.
+
+Lines with no timestamp — stack frames, continuation lines, banners — are
+kept. They belong to the record above them, and dropping them would shred
+exactly the entries the window was opened to read.
+
+Compressed inputs are skipped when looking for the anchor: a `.gz` is not
+seekable, so its tail cannot be read without decompressing everything ahead
+of it. With only `.gz` files on the command line and nothing else to anchor
+on, `--since` does nothing rather than guessing.
 
 ### Aggregation modes
 
@@ -857,6 +892,7 @@ Tips:
 | `-d, --date`                  | `<date>`   | `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD`                            |
 | `    --from`                  | `<time>`   | Time range start (`HH:MM` or `HH:MM:SS`)                            |
 | `    --to`                    | `<time>`   | Time range end                                                      |
+| `    --since`                 | `<window>` | Last `5m` / `90s` / `2h` / `7d` of the log, from its newest record  |
 | `    --output`                | `<mode>`   | Output mode: `json` (JSONL)                                         |
 | `-t, --tail`                  |            | Follow file in real time                                            |
 | `-n, --num-lines`             | `<num>`    | Paginate N lines per page                                           |
@@ -918,12 +954,17 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Sidecar mode: gRPC streaming to a central collector
 - [x] Native `sd-journal` reader (drop the `journalctl` subprocess)
 
+- [x] Protobuf payloads decoded out of JSON log messages
+- [x] Crash markers for Rust and the C/C++/glibc abort family
+- [x] `--since 5m` relative time filters
+
 Next:
 
-- [ ] Windows event log as a source
-- [ ] `--since 5m` relative time filters
+- [ ] Windows event log as a source — the `.evtx` container reads; BinXml and
+      its template tables are the remaining half
 - [ ] Structured field filters (`--where status=500`)
 - [ ] A schema hint for protobuf payloads, so decoded fields get names
+- [ ] Parallel scan across line-aligned chunks
 
 ### Status
 

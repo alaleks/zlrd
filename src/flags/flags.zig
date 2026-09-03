@@ -121,6 +121,9 @@ pub const Args = struct {
     date: ?[]const u8 = null,
     from_time: ?[]const u8 = null,
     to_time: ?[]const u8 = null,
+    /// `--since` window in milliseconds. The cutoff itself is computed by the
+    /// reader, which anchors it on the newest timestamp in the input.
+    since_ms: ?u64 = null,
     tail_mode: bool = false,
     help: bool = false,
     version: bool = false,
@@ -205,6 +208,7 @@ pub const Args = struct {
 pub const ParseError = error{
     InvalidArgument,
     InvalidNumLines,
+    InvalidSince,
     MissingFile,
     InvalidLevel,
     InvalidAggregateMode,
@@ -218,6 +222,7 @@ pub const ParseError = error{
     MissingAggregateMode,
     MissingFromTime,
     MissingToTime,
+    MissingSince,
     MissingOutput,
     MissingListen,
     MissingMetricsToken,
@@ -302,6 +307,10 @@ pub fn printHelp(colored: bool) void {
         "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
         "      " ++ lo ++ "--to" ++ r ++
         "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
+        "      " ++ lo ++ "--since" ++ r ++
+        "            " ++ ar ++ "<window> " ++ r ++ "  Last 5m / 90s / 2h / 7d of the log\n" ++
+        "                                     " ++
+        ar ++ "relative to the newest record, not to the clock" ++ r ++ "\n" ++
         "      " ++ lo ++ "--output" ++ r ++
         "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
         ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
@@ -414,6 +423,10 @@ pub fn printHelpLite(colored: bool) void {
         "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
         "      " ++ lo ++ "--to" ++ r ++
         "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
+        "      " ++ lo ++ "--since" ++ r ++
+        "            " ++ ar ++ "<window> " ++ r ++ "  Last 5m / 90s / 2h / 7d of the log\n" ++
+        "                                     " ++
+        ar ++ "relative to the newest record, not to the clock" ++ r ++ "\n" ++
         "      " ++ lo ++ "--output" ++ r ++
         "           " ++ ar ++ "<mode>   " ++ r ++ "  Output format: " ++
         ar ++ "json" ++ r ++ "  " ++ ar ++ "(pipe to jq)" ++ r ++ "\n" ++
@@ -611,6 +624,7 @@ const ValuedFlag = enum {
     aggregate_mode,
     from_time,
     to_time,
+    since,
     output,
     color,
     listen,
@@ -639,6 +653,7 @@ const ValuedFlag = enum {
             .{ .name = "aggregate-mode", .kind = .aggregate_mode },
             .{ .name = "from", .kind = .from_time },
             .{ .name = "to", .kind = .to_time },
+            .{ .name = "since", .kind = .since },
             .{ .name = "output", .kind = .output },
             .{ .name = "color", .kind = .color },
             .{ .name = "listen", .kind = .listen },
@@ -672,6 +687,7 @@ const ValuedFlag = enum {
             .color => error.MissingColor,
             .from_time => error.MissingFromTime,
             .to_time => error.MissingToTime,
+            .since => error.MissingSince,
             .output => error.MissingOutput,
             .listen => error.MissingListen,
             .metrics_token => error.MissingMetricsToken,
@@ -780,6 +796,7 @@ fn applyValuedFlag(
         .aggregate_mode => parsed.aggregate_mode = parseAggregateMode(val) orelse return error.InvalidAggregateMode,
         .from_time => try replaceOwnedString(allocator, &parsed.from_time, val),
         .to_time => try replaceOwnedString(allocator, &parsed.to_time, val),
+        .since => parsed.since_ms = parseDurationMs(val) orelse return error.InvalidSince,
         .output => try parseOutputMode(parsed, val),
         .listen => try replaceOwnedString(allocator, &parsed.listen, val),
         .metrics_token => try replaceOwnedString(allocator, &parsed.metrics_token, val),
@@ -898,6 +915,39 @@ fn parseShortFlags(
             else => return error.UnknownArgument,
         }
     }
+}
+
+/// Parses `90s`, `5m`, `2h`, `7d` — and a bare number as seconds, because
+/// `--since 300` is what people type when they are in a hurry.
+///
+/// Returns null for anything else, including zero: a window of nothing would
+/// silently produce an empty log, which looks like a broken filter rather
+/// than a filter that matched nothing.
+pub fn parseDurationMs(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+
+    var digits_end: usize = 0;
+    while (digits_end < text.len and text[digits_end] >= '0' and text[digits_end] <= '9') digits_end += 1;
+    if (digits_end == 0) return null;
+
+    const n = std.fmt.parseInt(u64, text[0..digits_end], 10) catch return null;
+    if (n == 0) return null;
+
+    const unit = text[digits_end..];
+    const per_unit_ms: u64 = if (unit.len == 0 or std.mem.eql(u8, unit, "s"))
+        1000
+    else if (std.mem.eql(u8, unit, "ms"))
+        1
+    else if (std.mem.eql(u8, unit, "m"))
+        60 * 1000
+    else if (std.mem.eql(u8, unit, "h"))
+        60 * 60 * 1000
+    else if (std.mem.eql(u8, unit, "d"))
+        24 * 60 * 60 * 1000
+    else
+        return null;
+
+    return std.math.mul(u64, n, per_unit_ms) catch null;
 }
 
 fn parseNumLines(s: []const u8) !usize {
@@ -1701,4 +1751,43 @@ test "ValuedFlag.lookup resolves every long valued flag" {
     try testing.expect(ValuedFlag.lookup("journal-unit") != null);
     try testing.expect(ValuedFlag.lookup("nope") == null);
     try testing.expect(ValuedFlag.lookup("") == null);
+}
+
+test "parseDurationMs accepts the units people type" {
+    try testing.expectEqual(@as(?u64, 5 * 60 * 1000), parseDurationMs("5m"));
+    try testing.expectEqual(@as(?u64, 90 * 1000), parseDurationMs("90s"));
+    try testing.expectEqual(@as(?u64, 2 * 60 * 60 * 1000), parseDurationMs("2h"));
+    try testing.expectEqual(@as(?u64, 7 * 24 * 60 * 60 * 1000), parseDurationMs("7d"));
+    try testing.expectEqual(@as(?u64, 250), parseDurationMs("250ms"));
+    // A bare number is seconds, which is what gets typed in a hurry.
+    try testing.expectEqual(@as(?u64, 300 * 1000), parseDurationMs("300"));
+}
+
+test "parseDurationMs rejects what it cannot mean" {
+    try testing.expectEqual(@as(?u64, null), parseDurationMs(""));
+    try testing.expectEqual(@as(?u64, null), parseDurationMs("m"));
+    try testing.expectEqual(@as(?u64, null), parseDurationMs("5w"));
+    try testing.expectEqual(@as(?u64, null), parseDurationMs("5 m"));
+    // Zero would print an empty log, which reads as a broken filter rather
+    // than as a filter that matched nothing.
+    try testing.expectEqual(@as(?u64, null), parseDurationMs("0"));
+    try testing.expectEqual(@as(?u64, null), parseDurationMs("0m"));
+    // Overflow saturates into a rejection instead of wrapping.
+    try testing.expectEqual(@as(?u64, null), parseDurationMs("99999999999999999999d"));
+}
+
+test "--since reaches Args as milliseconds" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--since", "5m", "app.log" } };
+    var it = fake;
+    var parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 5 * 60 * 1000), parsed.since_ms);
+}
+
+test "an unparseable --since is refused at the command line" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--since", "5w", "app.log" } };
+    var it = fake;
+    try testing.expectError(error.InvalidSince, parseArgsFromIter(allocator, &it));
 }

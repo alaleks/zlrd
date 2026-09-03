@@ -9,6 +9,8 @@ const tail_reader = @import("tail.zig");
 const gzip = @import("gzip.zig");
 const regex = @import("regex");
 const theme = @import("theme.zig");
+const civil = @import("civil.zig");
+pub const Cutoff = civil.Cutoff;
 const jsonx = @import("jsonx.zig");
 const protox = @import("protox.zig");
 const debug_io = std.Options.debug_io;
@@ -561,6 +563,9 @@ pub const FilterState = struct {
     chunk_may_have_ansi: bool = true,
     /// Sink used by `printIfMatch` / `printChecked`. Null for filter-only use.
     out: ?*Out = null,
+    /// Cutoff for `--since`, set by the caller once the anchor is known.
+    /// Null when no relative window was asked for.
+    since_cut: ?civil.Cutoff = null,
     /// Null disables embedded-JSON expansion.
     expander: ?*JsonExpander = null,
     strip_buf: [filter_strip_buf_size]u8 = undefined,
@@ -600,7 +605,8 @@ pub const FilterState = struct {
             // downstream will read them. Skipping the two scans on every
             // plain-text line is pure win when neither filter is active and
             // output isn't JSON.
-            .needs_timestamps = has_date or has_time or args.output_json,
+            .needs_timestamps = has_date or has_time or args.output_json or
+                (!args.tail_mode and args.since_ms != null),
             .out = out,
             .expander = expander,
         };
@@ -651,6 +657,10 @@ pub const FilterState = struct {
 
         if (self.has_time_filter) {
             if (!matchTimeRange(info.time, self.from_time, self.to_time)) return null;
+        }
+
+        if (self.since_cut) |*cut| {
+            if (!civil.atOrAfter(info.date, info.time, cut)) return null;
         }
 
         return .{ .line = line, .info = info };
@@ -1001,7 +1011,12 @@ fn getOptimalBufferSize(file: std.Io.File) usize {
 
 /// Entry point for reading log files with filtering and coloured output.
 /// Dispatches to tail follow mode, gzip, pagination, or continuous streaming.
-pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args, th: *const Theme) !void {
+pub fn readLogs(
+    allocator: std.mem.Allocator,
+    args: flags.Args,
+    th: *const Theme,
+    since_cut: ?civil.Cutoff,
+) !void {
     if (args.tail_mode) {
         try tail_reader.follow(allocator, args, th);
         return;
@@ -1012,10 +1027,108 @@ pub fn readLogs(allocator: std.mem.Allocator, args: flags.Args, th: *const Theme
 
     var counter = LevelCounter{};
     for (args.files) |path| {
-        try readStreaming(allocator, path, args, &counter, &out);
+        try readStreaming(allocator, path, args, &counter, &out, since_cut);
         if (out.broken) return;
     }
     if (!args.output_json) counter.print(&out);
+}
+
+/// Bytes of the tail scanned when looking for the anchor timestamp. Large
+/// enough that a stack trace or a burst of untimestamped lines at the end of
+/// a file cannot hide the last real record, small enough to be one read.
+const anchor_scan_bytes: usize = 64 * 1024;
+
+/// The cutoff for `--since`: `window_ms` before the newest timestamp in the
+/// inputs.
+///
+/// Computed once for the whole run, over every file named on the command
+/// line — which is why it lives here and not inside `readLogs`. Multiple
+/// files are read one at a time, each through its own `readLogs` call, so an
+/// anchor found there would be per-file: `--since 5m app.log app.log.1` would
+/// hand back the last five minutes of *each* file, resurrecting the rotated
+/// one from last week.
+///
+/// Anchoring on the log rather than on the clock is what keeps this free of
+/// time zones — both sides of every later comparison come from the same file,
+/// so whatever offset its timestamps carry cancels out. It also means
+/// `--since 5m` on a log that was rotated last week shows the last five
+/// minutes *of that log*, instead of the empty output a wall-clock window
+/// would produce.
+///
+/// Falls back to null — no filtering — when nothing in the inputs carries a
+/// date. Silently dropping every line because no anchor could be found would
+/// look exactly like a log with nothing in it.
+pub fn sinceCutoff(files: []const []const u8, window_ms: u64) ?civil.Cutoff {
+    var best_date: ?[10]u8 = null;
+    var best_time: ?[8]u8 = null;
+    var buf: [anchor_scan_bytes]u8 = undefined;
+
+    for (files) |path| {
+        // Compressed input is not seekable, so the tail cannot be read
+        // without decompressing everything ahead of it. Skipped rather than
+        // paid for twice.
+        if (gzip.isGzip(path)) continue;
+
+        const file = std.Io.Dir.cwd().openFile(debug_io, path, .{}) catch continue;
+        defer file.close(debug_io);
+        const size = file.length(debug_io) catch continue;
+        if (size == 0) continue;
+
+        const want: usize = @intCast(@min(@as(u64, buf.len), size));
+        const pos = size - want;
+        const n = file.readPositional(debug_io, &.{buf[0..want]}, pos) catch continue;
+        if (n == 0) continue;
+
+        if (newestInChunk(buf[0..n])) |found| {
+            const better = if (best_date) |bd| blk: {
+                const order = std.mem.order(u8, &found.date, &bd);
+                if (order == .gt) break :blk true;
+                if (order == .lt) break :blk false;
+                break :blk std.mem.order(u8, &found.time, &(best_time orelse found.time)) == .gt;
+            } else true;
+            if (better) {
+                best_date = found.date;
+                best_time = found.time;
+            }
+        }
+    }
+
+    const d = best_date orelse return null;
+    const t = best_time orelse return null;
+    return civil.cutoffBefore(&d, &t, window_ms);
+}
+
+const AnchorStamp = struct { date: [10]u8, time: [8]u8 };
+
+/// Last line in `chunk` that carries both a date and a time.
+///
+/// Walks backwards because the newest record is at the end, and stops at the
+/// first hit — a log is written in order, so scanning the rest to confirm
+/// would cost a full pass to learn nothing.
+fn newestInChunk(chunk: []const u8) ?AnchorStamp {
+    var end = chunk.len;
+    while (end > 0) {
+        // The first line of the chunk may be a fragment of a longer one, so
+        // it is only considered when the chunk starts the file.
+        const start = if (std.mem.lastIndexOfScalar(u8, chunk[0..end], '\n')) |nl| nl + 1 else 0;
+        const line = std.mem.trimEnd(u8, chunk[start..end], "\r");
+        if (line.len > 0) {
+            const info = analyzeLine(line, true);
+            if (info.date) |d| {
+                if (info.time) |t| {
+                    if (d.len >= 10 and t.len >= 5) {
+                        var stamp: AnchorStamp = .{ .date = undefined, .time = "00:00:00".* };
+                        @memcpy(&stamp.date, d[0..10]);
+                        @memcpy(stamp.time[0..@min(t.len, 8)], t[0..@min(t.len, 8)]);
+                        return stamp;
+                    }
+                }
+            }
+        }
+        if (start == 0) return null;
+        end = start - 1;
+    }
+    return null;
 }
 
 /// Read one log file with filtering and coloured output.
@@ -1027,6 +1140,7 @@ pub fn readStreaming(
     args: flags.Args,
     counter: *LevelCounter,
     out: *Out,
+    since_cut: ?civil.Cutoff,
 ) !void {
     var expander: ?JsonExpander = if (wantsJsonExpansion(args, out.theme))
         try JsonExpander.init(allocator, .{})
@@ -1036,6 +1150,7 @@ pub fn readStreaming(
     const expander_ptr: ?*JsonExpander = if (expander) |*x| x else null;
 
     var filter_state = FilterState.init(args, out, expander_ptr);
+    filter_state.since_cut = since_cut;
     defer filter_state.deinit();
 
     if (gzip.isGzip(path)) {
@@ -3318,6 +3433,65 @@ test "a pattern that can match nothing does not spin" {
     var buf: [max_search_matches]MatchRange = undefined;
     const m = findRegexMatches("abc", &state.regex_list, &buf);
     try std.testing.expect(m.len <= buf.len);
+}
+
+test "newestInChunk takes the last stamped line, not the last line" {
+    // The tail of a crash is untimestamped continuation; the anchor has to
+    // walk back past it to the record those lines belong to.
+    const chunk =
+        "2026-09-03T10:00:00Z INF older\n" ++
+        "2026-09-03T10:44:05Z ERR boom\n" ++
+        "\tgoroutine 1 [running]:\n" ++
+        "\tmain.crash()\n";
+    const got = newestInChunk(chunk) orelse return error.NoAnchor;
+    try std.testing.expectEqualStrings("2026-09-03", &got.date);
+    try std.testing.expectEqualStrings("10:44:05", &got.time);
+}
+
+test "newestInChunk ignores a leading fragment of a longer line" {
+    // A chunk read from the middle of a file starts mid-line; that fragment
+    // is the one line whose parse cannot be trusted.
+    const chunk = "45Z INF fragment\n2026-09-03T10:44:05Z INF whole\n";
+    const got = newestInChunk(chunk) orelse return error.NoAnchor;
+    try std.testing.expectEqualStrings("10:44:05", &got.time);
+}
+
+test "newestInChunk reports nothing when no line carries a date" {
+    try std.testing.expectEqual(@as(?AnchorStamp, null), newestInChunk("no stamps here\nnor here\n"));
+}
+
+test "--since keeps the window and drops what precedes it" {
+    var files = [_][]const u8{"x.log"};
+    const args = flags.Args{ .files = &files, .since_ms = 5 * 60 * 1000 };
+    var state = FilterState.init(args, null, null);
+    defer state.deinit();
+    try std.testing.expect(state.needs_timestamps);
+
+    // Twenty minutes back from 00:11 lands on the previous day at 23:51 —
+    // the case a string comparison on its own gets wrong.
+    state.since_cut = civil.cutoffBefore("2026-09-04", "00:11:00", 20 * 60 * 1000);
+
+    // Inside the window, including the far side of midnight.
+    try std.testing.expect(state.checkLine("2026-09-04T00:11:00Z INF newest") != null);
+    try std.testing.expect(state.checkLine("2026-09-03T23:58:00Z INF just inside") != null);
+    // The boundary itself is inclusive.
+    try std.testing.expect(state.checkLine("2026-09-03T23:51:00Z INF boundary") != null);
+    // Outside.
+    try std.testing.expect(state.checkLine("2026-09-03T23:50:59Z INF too old") == null);
+    try std.testing.expect(state.checkLine("2026-09-02T23:59:59Z INF yesterday") == null);
+    // Untimestamped continuation stays with the record above it.
+    try std.testing.expect(state.checkLine("\tmain.crash()") != null);
+}
+
+test "--since with no anchor filters nothing rather than everything" {
+    var files = [_][]const u8{"x.log"};
+    const args = flags.Args{ .files = &files, .since_ms = 60 * 1000 };
+    var state = FilterState.init(args, null, null);
+    defer state.deinit();
+    // `findSinceCutoff` returns null when nothing in the input carries a
+    // date. An empty log would otherwise look exactly like a broken filter.
+    try std.testing.expectEqual(@as(?civil.Cutoff, null), state.since_cut);
+    try std.testing.expect(state.checkLine("2019-01-01T00:00:00Z INF ancient") != null);
 }
 
 test "expansion never runs for --output json" {

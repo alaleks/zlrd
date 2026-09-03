@@ -253,19 +253,28 @@ fn processFiles(
     if (parsed_args.tail_mode) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        try reader.readLogs(arena.allocator(), parsed_args, th);
+        try reader.readLogs(arena.allocator(), parsed_args, th, null);
         return;
     }
+
+    // The `--since` anchor is found here, over the whole file list, because
+    // the loop below hands `readLogs` one file at a time. Computed down there
+    // it would be per-file, and a rotated log would show its own last five
+    // minutes as if they were recent.
+    const since_cut = if (parsed_args.since_ms) |window|
+        reader.sinceCutoff(parsed_args.files, window)
+    else
+        null;
 
     if (parsed_args.files.len == 1) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        try reader.readLogs(arena.allocator(), parsed_args, th);
+        try reader.readLogs(arena.allocator(), parsed_args, th, since_cut);
         return;
     }
 
     for (parsed_args.files) |file_path| {
-        try processFileWithArena(allocator, file_path, parsed_args, th);
+        try processFileWithArena(allocator, file_path, parsed_args, th, since_cut);
     }
 }
 
@@ -274,6 +283,7 @@ fn processFileWithArena(
     file_path: []const u8,
     parsed_args: flags.Args,
     th: *const reader.Theme,
+    since_cut: ?reader.Cutoff,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(base_allocator);
     defer arena.deinit();
@@ -282,7 +292,7 @@ fn processFileWithArena(
     var single_file_args = parsed_args;
     single_file_args.files = single_file[0..];
 
-    try reader.readLogs(arena.allocator(), single_file_args, th);
+    try reader.readLogs(arena.allocator(), single_file_args, th, since_cut);
 }
 
 fn parseErrorMessage(err: anyerror) []const u8 {
@@ -303,6 +313,8 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.MissingAggregateMode => "missing value for --aggregate-mode",
         error.MissingFromTime => "missing value for --from",
         error.MissingToTime => "missing value for --to",
+        error.MissingSince => "missing value for --since",
+        error.InvalidSince => "invalid --since window (expected 5m, 90s, 2h, 7d)",
         error.MissingOutput => "missing value for --output",
         error.MissingListen => "missing value for --listen",
         error.MissingMetricsToken => "missing value for --metrics-token",
