@@ -45,6 +45,15 @@ pub const MarkerKind = enum {
     go_fatal,
     python_traceback,
     java_exception,
+    /// Rust's `thread '…' panicked at …`. The reason is printed on the line
+    /// *after* the banner, which is why the trace builder is allowed one
+    /// free-form line for this marker.
+    rust_panic,
+    /// The C/C++/glibc abort family — an uncaught exception reaching
+    /// `terminate`, a smashed stack, a double free, or a signal the shell
+    /// reported with a core dump. Different runtimes, same meaning: the
+    /// process died where it stood.
+    native_abort,
     fatal_level,
     panic_level,
     custom_regex,
@@ -56,6 +65,8 @@ pub const MarkerKind = enum {
             .go_fatal => "go_fatal",
             .python_traceback => "python_traceback",
             .java_exception => "java_exception",
+            .rust_panic => "rust_panic",
+            .native_abort => "native_abort",
             .fatal_level => "fatal_level",
             .panic_level => "panic_level",
             .custom_regex => "custom_regex",
@@ -141,7 +152,38 @@ fn runtimeMarker(line: []const u8) ?MarkerKind {
     // own only when the panic line was lost; while a crash is already being
     // collected the tracker feeds this into the trace instead.
     if (bannerAt(line, "[signal SIG")) return .go_fatal;
+    if (rustPanic(line)) return .rust_panic;
+    if (nativeAbort(line)) return .native_abort;
     return null;
+}
+
+/// Rust's panic banner. Both spellings carry `' panicked at `: the current
+/// one puts the location on the banner and the reason on the next line,
+/// the pre-1.72 one quoted the reason inline.
+fn rustPanic(line: []const u8) bool {
+    if (!bannerAt(line, "thread '")) return false;
+    return std.mem.indexOf(u8, line, "' panicked at ") != null;
+}
+
+/// Abort banners from the C/C++ runtimes and from the shell that reaped the
+/// process. Each one is a fixed phrase no application prints by accident;
+/// the bare signal names are deliberately not here, because "segmentation
+/// fault" shows up in prose and only the `(core dumped)` suffix makes it a
+/// report of something that actually happened.
+fn nativeAbort(line: []const u8) bool {
+    const banners = [_][]const u8{
+        "terminate called ",
+        "*** stack smashing detected ***",
+        "double free or corruption",
+        "free(): invalid pointer",
+        "malloc(): corrupted top size",
+        "Segmentation fault (core dumped)",
+        "Aborted (core dumped)",
+    };
+    for (banners) |b| {
+        if (bannerAt(line, b)) return true;
+    }
+    return false;
 }
 
 /// True when `banner` starts the line, or starts the message portion of a
@@ -161,10 +203,13 @@ fn bannerAt(line: []const u8, banner: []const u8) bool {
         var j = hit;
         while (j > 0 and (line[j - 1] == ' ' or line[j - 1] == '\t')) j -= 1;
         if (j == 0) return true; // only indentation before it
-        if (j < hit) {
-            const last = line[j - 1];
-            if (last == ':' or last == ']' or last == '|') return true;
-        }
+        // The delimiter counts whether or not a space follows it. Requiring
+        // one missed every capture layer that writes `…Z|panic: boom` or
+        // `unit[7]:panic: boom` without padding, and gained nothing: the
+        // false positives this guards against — `/api/panic: x`, `"panic: 0`
+        // — are rejected by the delimiter set itself, not by the spacing.
+        const last = line[j - 1];
+        if (last == ':' or last == ']' or last == '|') return true;
         i = hit + 1;
     }
     return false;
@@ -178,18 +223,25 @@ pub const StackTraceBuilder = struct {
     lines: u8 = 0,
     active: bool = false,
     started_at_ms: i64 = 0,
+    /// Accept one arbitrary line as the first entry of the trace. Rust puts
+    /// the panic reason on the line after the banner, flush-left, so the
+    /// continuation heuristic would end the trace before capturing the one
+    /// line that says what actually went wrong.
+    free_first: bool = false,
 
     pub fn start(self: *StackTraceBuilder, now_ms: i64) void {
         self.used = 0;
         self.lines = 0;
         self.active = true;
         self.started_at_ms = now_ms;
+        self.free_first = false;
     }
 
     pub fn reset(self: *StackTraceBuilder) void {
         self.used = 0;
         self.lines = 0;
         self.active = false;
+        self.free_first = false;
     }
 
     /// Tries to append `line` as a continuation of the trace. Returns true
@@ -207,7 +259,7 @@ pub const StackTraceBuilder = struct {
         // separator so the trace below it still gets captured.
         if (line.len == 0 and self.used == 0) return true;
 
-        if (!isTraceLine(line)) {
+        if (!isTraceLine(line) and !(self.free_first and self.used == 0)) {
             self.active = false;
             return false;
         }
@@ -248,6 +300,9 @@ pub fn isTraceLine(line: []const u8) bool {
     if (std.mem.startsWith(u8, line, "[signal ")) return true;
     if (std.mem.startsWith(u8, line, "Caused by:")) return true;
     if (std.mem.startsWith(u8, line, "0x")) return true;
+    // Rust prints these flush-left under a panic.
+    if (std.mem.startsWith(u8, line, "note: ")) return true;
+    if (std.mem.startsWith(u8, line, "stack backtrace:")) return true;
     return false;
 }
 
@@ -436,6 +491,7 @@ pub const Tracker = struct {
         self.pending_pid = extractPid(line);
         self.crash_count += 1;
         self.trace.start(now_ms);
+        self.trace.free_first = marker == .rust_panic;
         return null;
     }
 
@@ -489,6 +545,79 @@ test "Detector: custom regex" {
     var det: Detector = .{ .customs = &re };
     try testing.expectEqual(MarkerKind.custom_regex, det.detect("uh oops happened", null).?);
     try testing.expectEqual(@as(?MarkerKind, null), det.detect("nothing here", null));
+}
+
+test "bannerAt accepts an envelope delimiter with no trailing space" {
+    // Capture layers that pad their delimiter were already handled; these
+    // are the same envelopes written tight, which used to be missed.
+    try testing.expect(bannerAt("2026-08-26T10:00:00Z|panic: boom", "panic: "));
+    try testing.expect(bannerAt("unit[7]:panic: boom", "panic: "));
+    try testing.expect(bannerAt("unit[7]: panic: boom", "panic: "));
+
+    // The delimiter set is still what rejects prose, so these stay negative.
+    try testing.expect(!bannerAt("GET /api/panic: status", "panic: "));
+    try testing.expect(!bannerAt("no panic: all good", "panic: "));
+    try testing.expect(!bannerAt("\"panic: 0 restarts: 0\"", "panic: "));
+}
+
+test "detect recognises Rust panics in both spellings" {
+    const d = Detector{ .customs = &.{} };
+    // Current form: location on the banner, reason on the next line.
+    try testing.expectEqual(MarkerKind.rust_panic, d.detect("thread 'main' panicked at src/main.rs:4:5:", null).?);
+    // Pre-1.72 form: reason quoted inline.
+    try testing.expectEqual(
+        MarkerKind.rust_panic,
+        d.detect("thread 'tokio-worker-1' panicked at 'index out of bounds', src/lib.rs:9:1", null).?,
+    );
+    // Behind a capture envelope.
+    try testing.expectEqual(
+        MarkerKind.rust_panic,
+        d.detect("api[912]: thread 'main' panicked at src/main.rs:4:5:", null).?,
+    );
+    // Prose about panicking is not a panic.
+    try testing.expectEqual(@as(?MarkerKind, null), d.detect("worker thread 'main' panicked earlier, recovered", null));
+}
+
+test "detect recognises the native abort family" {
+    const d = Detector{ .customs = &.{} };
+    for ([_][]const u8{
+        "terminate called after throwing an instance of 'std::runtime_error'",
+        "*** stack smashing detected ***: terminated",
+        "double free or corruption (out)",
+        "Segmentation fault (core dumped)",
+        "Aborted (core dumped)",
+    }) |line| {
+        try testing.expectEqual(MarkerKind.native_abort, d.detect(line, null).?);
+    }
+
+    // A bare signal name in prose is not a report that anything died.
+    try testing.expectEqual(@as(?MarkerKind, null), d.detect("guarding against Segmentation fault in the parser", null));
+}
+
+test "a Rust panic captures the reason printed under it" {
+    var b = StackTraceBuilder{};
+    b.start(0);
+    b.free_first = true;
+
+    try testing.expect(b.feed("index out of bounds: the len is 3 but the index is 7"));
+    try testing.expect(b.feed("note: run with `RUST_BACKTRACE=1` to display a backtrace"));
+    try testing.expect(b.feed("stack backtrace:"));
+    try testing.expect(b.feed("   0: rust_begin_unwind"));
+    // Back to the ordinary heuristic once the trace is under way.
+    try testing.expect(!b.feed("2026-08-26 10:00:01 INF next request"));
+
+    try testing.expect(std.mem.indexOf(u8, b.slice(), "index out of bounds") != null);
+    try testing.expect(std.mem.indexOf(u8, b.slice(), "rust_begin_unwind") != null);
+}
+
+test "the free-form allowance applies to the first line only" {
+    var b = StackTraceBuilder{};
+    b.start(0);
+    b.free_first = true;
+
+    try testing.expect(b.feed("the reason"));
+    // Second unindented line is an ordinary log line again.
+    try testing.expect(!b.feed("unrelated log line"));
 }
 
 test "isTraceLine: continuation patterns" {

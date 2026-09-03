@@ -18,6 +18,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="License"></a>
 </p>
 
+<p align="center">
+  <img src=".github/demo.gif" alt="zlrd filtering a mixed-format log in the terminal" width="900"/>
+</p>
+
 ---
 
 ## Why zlrd
@@ -64,6 +68,8 @@ stderr, files, or HTTP webhooks.
   - [Production deployment](#production-deployment)
 - [CLI reference](#cli-reference)
 - [Roadmap](#roadmap)
+  - [Status](#status)
+  - [Prior art](#prior-art)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -563,11 +569,24 @@ You can also add custom regex patterns with `--crash-marker '<regex>'`
 
 | Language / shape  | Marker pattern                                |
 | ----------------- | --------------------------------------------- |
-| Go                | line contains `panic:`                        |
-| Python            | line contains `Traceback (most recent call last):` |
-| Java / Kotlin     | line contains `Exception in thread `          |
+| Go — panic        | `panic: `                                     |
+| Go — runtime throw | `fatal error: `, `runtime: out of memory`, `[signal SIG…]` |
+| Rust              | `thread '…' panicked at ` (both the current and pre-1.72 spellings) |
+| Python            | `Traceback (most recent call last):`          |
+| Java / Kotlin     | `Exception in thread `                        |
+| C / C++ / glibc   | `terminate called `, `*** stack smashing detected ***`, `double free or corruption`, `free(): invalid pointer`, `malloc(): corrupted top size` |
+| Reaped by the shell | `Segmentation fault (core dumped)`, `Aborted (core dumped)` |
 | JSON / logfmt     | detected `level=fatal` or `level=panic`       |
 | User-defined      | `--crash-marker '<regex>'`                    |
+
+A marker only counts when it **starts the line**, or starts the message part
+of a captured line whose envelope ends in `:`, `]` or `|` — so
+`unit[7]: panic: boom` is a crash and `GET /api/panic: status`,
+`no panic: all good` and `"panic: 0 restarts: 0"` are not. A line that carries
+its own level below `error` is never a crash either, however runtime-looking
+its text: `{"level":"info","msg":"recovered from panic: …"}` came out of a
+logger, not out of a dying process. Custom `--crash-marker` patterns are
+exempt from that last rule — you asked for them explicitly.
 
 #### Stack-trace capture
 
@@ -617,7 +636,7 @@ Heuristic for "trace continuation":
 | Field           | Notes                                                                          |
 | --------------- | ------------------------------------------------------------------------------ |
 | `kind`          | `service_crash` · `service_stop` · `service_restart`                           |
-| `marker`        | `go_panic` · `python_traceback` · `java_exception` · `fatal_level` · `panic_level` · `custom_regex` · `systemd_signal` |
+| `marker`        | `go_panic` · `go_fatal` · `rust_panic` · `python_traceback` · `java_exception` · `native_abort` · `fatal_level` · `panic_level` · `custom_regex` · `systemd_signal` |
 | `pid`           | Parsed from `"pid":N`, `pid=N`, or `[N]:` if present in the trigger line       |
 | `crash_count`   | Cumulative crashes seen for this service since agent start                     |
 | `restart_count` | Cumulative restarts (inode changes) seen for this service                      |
@@ -899,11 +918,39 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Sidecar mode: gRPC streaming to a central collector
 - [x] Native `sd-journal` reader (drop the `journalctl` subprocess)
 
+Next:
+
+- [ ] Windows event log as a source
+- [ ] `--since 5m` relative time filters
+- [ ] Structured field filters (`--where status=500`)
+- [ ] A schema hint for protobuf payloads, so decoded fields get names
+
+### Status
+
+Used daily by its author against production logs, with a test suite that runs
+on Linux, macOS and Windows. The reader interface is stable; agent-mode flags
+may still move before 2.0. If something breaks on a log format you have,
+[open an issue with the line that broke it](https://github.com/alaleks/zlrd/issues)
+— that is how most of the format handling here got written.
+
+### Prior art
+
+`lnav` is the richest terminal log viewer there is, and if you want SQL over
+your logs, use it. `angle-grinder` is excellent at aggregation pipelines.
+zlrd is smaller than both on purpose: one static binary, no runtime, no
+configuration, and the same tool doubles as the metrics endpoint and alert
+watcher for the box it is already sitting on.
+
 ---
 
 ## Contributing
 
-Bug reports and pull requests are welcome.
+Bug reports and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the build, test and style rules, and
+[CLA.md](CLA.md) for the contributor agreement you sign once on your first
+pull request.
+
+The short version:
 
 - `zig build test` — all tests must pass; new functionality should ship with tests.
 - `zig fmt src/` — keep formatting consistent.
