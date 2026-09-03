@@ -1,7 +1,12 @@
 # Demo recording for the README, driven by VHS (github.com/charmbracelet/vhs).
 #
 #   brew install vhs
-#   ./make-fixture.sh && vhs demo.tape
+#   cd demo && ./make-fixture.sh && vhs demo.tape
+#
+# Run it from this directory. `Output` below is resolved against the working
+# directory, not against the tape, so recording from anywhere else drops the
+# GIF outside the repository — which is exactly how the committed one drifted
+# out of date without anybody noticing.
 #
 # The tape is committed rather than only the GIF so the demo can be
 # regenerated when the output changes, instead of quietly drifting out of date
@@ -22,7 +27,7 @@ Set Theme "Builtin Dark"
 Set TypingSpeed 40ms
 
 Hide
-Type "cd demo && clear"
+Type "clear"
 Enter
 Show
 
