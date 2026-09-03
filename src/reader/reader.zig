@@ -680,7 +680,17 @@ pub const FilterState = struct {
         // costs an O(line x term) rescan per record and, worse, pushes the
         // line off the direct-copy path in `printStyledLine` onto the
         // token walk. Redirected output is the common case, so gate on it.
-        const matches: []const MatchRange = if (self.has_search_filter and out.theme.colored)
+        // `has_search_filter` and `has_regex` are mutually exclusive — `init`
+        // clears the former when a pattern compiles — so both have to be
+        // consulted here, exactly as `checkLine` does.
+        const matches: []const MatchRange = if (!out.theme.colored)
+            &.{}
+        else if (self.has_regex)
+            // The literal splitter cannot find `5\d\d` in a line, so every
+            // regex search printed without a single highlight — the filter
+            // matched and the printer had nothing to mark.
+            findRegexMatches(line, &self.regex_list, &match_buf)
+        else if (self.has_search_filter)
             findSearchMatches(line, self.search_expr.?, &match_buf)
         else
             &.{};
@@ -1563,25 +1573,52 @@ fn findSearchMatches(line: []const u8, expr: []const u8, buf: []MatchRange) []Ma
             }
         }
     }
-    // Sort and deduplicate overlapping ranges
-    if (count > 1) {
-        std.mem.sort(MatchRange, buf[0..count], {}, struct {
-            fn lt(_: void, a: MatchRange, b: MatchRange) bool {
-                return a.start < b.start;
+    return mergeMatches(buf, count);
+}
+
+/// Collects the ranges matched by every pattern in `list`, so a regex search
+/// highlights the same bytes it selected the line for.
+///
+/// Terms are AND-ed by the filter, and each contributes its own occurrences;
+/// the ranges are merged afterwards exactly as the literal path merges its.
+fn findRegexMatches(line: []const u8, list: *const regex.RegexList, buf: []MatchRange) []MatchRange {
+    var count: usize = 0;
+    for (list.regexes[0..list.count]) |*re| {
+        var from: usize = 0;
+        while (from <= line.len) {
+            const m = re.findFrom(line, from) orelse break;
+            if (count < buf.len) {
+                buf[count] = .{ .start = m.start, .end = m.end };
+                count += 1;
             }
-        }.lt);
-        var j: usize = 1;
-        for (buf[1..count]) |m| {
-            if (m.start >= buf[j - 1].end) {
-                buf[j] = m;
-                j += 1;
-            } else if (m.end > buf[j - 1].end) {
-                buf[j - 1].end = m.end;
-            }
+            // A pattern like `a*` matches the empty string; without this the
+            // scan would sit on one position forever.
+            from = if (m.end > m.start) m.end else m.start + 1;
+            if (count == buf.len) break;
         }
-        return buf[0..j];
     }
-    return buf[0..count];
+    return mergeMatches(buf, count);
+}
+
+/// Sorts by position and merges overlaps, leaving ranges the printer can walk
+/// in one pass.
+fn mergeMatches(buf: []MatchRange, count: usize) []MatchRange {
+    if (count <= 1) return buf[0..count];
+    std.mem.sort(MatchRange, buf[0..count], {}, struct {
+        fn lt(_: void, a: MatchRange, b: MatchRange) bool {
+            return a.start < b.start;
+        }
+    }.lt);
+    var j: usize = 1;
+    for (buf[1..count]) |m| {
+        if (m.start >= buf[j - 1].end) {
+            buf[j] = m;
+            j += 1;
+        } else if (m.end > buf[j - 1].end) {
+            buf[j - 1].end = m.end;
+        }
+    }
+    return buf[0..j];
 }
 
 /// Returns true if `line[pos..]` starts with `needle`, case-insensitive.
@@ -3238,6 +3275,49 @@ test "a nested JSON value keeps its verbatim form on the line" {
 
     try std.testing.expect(std.mem.indexOf(u8, got, "...") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"id\": 5") != null);
+}
+
+test "a regex search highlights what it matched" {
+    var files = [_][]const u8{"x.log"};
+    const args = flags.Args{ .files = &files, .search = "5\\d\\d" };
+    var state = FilterState.init(args, null, null);
+    defer state.deinit();
+    // `init` clears has_search_filter for a regex; the printer must still
+    // find ranges, which is what this whole path exists for.
+    try std.testing.expect(state.has_regex);
+    try std.testing.expect(!state.has_search_filter);
+
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findRegexMatches("request served in 512ms", &state.regex_list, &buf);
+    try std.testing.expectEqual(@as(usize, 1), m.len);
+    try std.testing.expectEqual(@as(usize, 18), m[0].start);
+    try std.testing.expectEqual(@as(usize, 21), m[0].end);
+}
+
+test "regex highlighting collects every occurrence and merges overlaps" {
+    var files = [_][]const u8{"x.log"};
+    const args = flags.Args{ .files = &files, .search = "\\d\\d" };
+    var state = FilterState.init(args, null, null);
+    defer state.deinit();
+
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findRegexMatches("a 12 b 34", &state.regex_list, &buf);
+    try std.testing.expectEqual(@as(usize, 2), m.len);
+    try std.testing.expectEqual(@as(usize, 2), m[0].start);
+    try std.testing.expectEqual(@as(usize, 7), m[1].start);
+}
+
+test "a pattern that can match nothing does not spin" {
+    var files = [_][]const u8{"x.log"};
+    // `x*` matches the empty string at every position; the scan has to make
+    // progress anyway.
+    const args = flags.Args{ .files = &files, .search = "x*" };
+    var state = FilterState.init(args, null, null);
+    defer state.deinit();
+
+    var buf: [max_search_matches]MatchRange = undefined;
+    const m = findRegexMatches("abc", &state.regex_list, &buf);
+    try std.testing.expect(m.len <= buf.len);
 }
 
 test "expansion never runs for --output json" {

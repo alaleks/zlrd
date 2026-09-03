@@ -191,6 +191,20 @@ pub fn build(b: *std.Build) void {
     }
 
     inline for ([_][]const u8{
+        "src/winlog/format.zig",
+        "src/winlog/evtx.zig",
+    }) |path| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const tests = b.addTest(.{ .root_module = mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    inline for ([_][]const u8{
         "src/journal/format.zig",
         "src/journal/lz4.zig",
         "src/journal/reader.zig",

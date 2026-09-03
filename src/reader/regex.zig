@@ -1,8 +1,13 @@
 //! Pure-Zig ERE regex engine (case-insensitive, no libc).
 //! Supports: . * + ? | ^ $ [...] (...) \d \w \s and their inverses.
-//! Returns true/false only — no sub-match capture.
+//! Reports whether a pattern matches, and where — `findFrom` returns the
+//! byte range of the leftmost match so the printer can highlight it. There is
+//! still no sub-group capture; the range covers the whole match.
 
 const std = @import("std");
+
+/// Byte range of a whole-pattern match within the searched text.
+pub const Match = struct { start: usize, end: usize };
 
 pub const Regex = struct {
     pattern: []const u8,
@@ -17,6 +22,16 @@ pub const Regex = struct {
     /// Returns true if any substring of `text` matches the pattern.
     pub fn isMatch(self: *const Regex, text: []const u8) bool {
         return matchAnywhere(self.pattern, text);
+    }
+
+    /// Leftmost match at or after `from`, as a byte range.
+    ///
+    /// Filtering only ever needed a yes/no answer, so that is all the engine
+    /// used to expose — and highlighting silently did nothing for any search
+    /// the regex path claimed. `matchFrom` already computed the end offset
+    /// internally; this hands it back instead of discarding it.
+    pub fn findFrom(self: *const Regex, text: []const u8, from: usize) ?Match {
+        return findAnywhere(self.pattern, text, from);
     }
 
     pub fn deinit(self: *Regex) void {
@@ -83,6 +98,33 @@ fn matchAnywhere(pattern: []const u8, text: []const u8) bool {
         if (matchFrom(pattern, text, i) != null) return true;
     }
     return false;
+}
+
+/// Leftmost match of `pattern` in `text` at or after `from`.
+///
+/// Alternation is resolved by position first and length second, which is what
+/// a reader expects to see highlighted: the earliest thing that matched, and
+/// when two branches start together, the one that covers more of the line.
+fn findAnywhere(pattern: []const u8, text: []const u8, from: usize) ?Match {
+    if (topAlt(pattern)) |pipe| {
+        const a = findAnywhere(pattern[0..pipe], text, from);
+        const b = findAnywhere(pattern[pipe + 1 ..], text, from);
+        const x = a orelse return b;
+        const y = b orelse return x;
+        if (y.start < x.start) return y;
+        if (y.start == x.start and y.end > x.end) return y;
+        return x;
+    }
+    if (pattern.len > 0 and pattern[0] == '^') {
+        if (from > 0) return null;
+        const end = matchFrom(pattern[1..], text, 0) orelse return null;
+        return .{ .start = 0, .end = end };
+    }
+    var i: usize = from;
+    while (i <= text.len) : (i += 1) {
+        if (matchFrom(pattern, text, i)) |end| return .{ .start = i, .end = end };
+    }
+    return null;
 }
 
 /// Match `pattern` starting at `text[start]`.
