@@ -10,6 +10,7 @@ const gzip = @import("gzip.zig");
 const regex = @import("regex");
 const theme = @import("theme.zig");
 const jsonx = @import("jsonx.zig");
+const protox = @import("protox.zig");
 const debug_io = std.Options.debug_io;
 
 pub const Theme = theme.Theme;
@@ -461,6 +462,10 @@ const filter_strip_buf_size: usize = 16 * 1024;
 /// read loop.
 pub const JsonExpander = struct {
     limits: jsonx.Limits = .{},
+    /// Bounds for the protobuf fallback. Separate from `limits` because the
+    /// two formats need different ceilings — field numbers and wire nesting
+    /// have nothing to do with JSON depth or brace counts.
+    proto_limits: protox.Limits = .{},
     /// Un-escape target for JSON carried as a string value. Sized to the
     /// largest region `limits` will expand, so a payload that passes
     /// validation always fits.
@@ -488,13 +493,29 @@ pub const JsonExpander = struct {
         jsonx.writeBlock(out, out.theme, span.slice(line), self.limits);
     }
 
-    /// Expands JSON carried as an escaped string value of a JSON log line.
-    /// Silently does nothing when the value turns out not to be JSON after
-    /// decoding — the compact line already showed it verbatim.
+    /// Expands a payload carried as an escaped string value of a JSON log
+    /// line — nested JSON, or protobuf wire bytes.
+    ///
+    /// JSON is tried first: it is the cheaper check and the unambiguous one.
+    /// Protobuf only gets a look when the value failed to be JSON, and then
+    /// only after a second un-escape pass, because the two need different
+    /// byte semantics for `\uXXXX` (see `protox.unescapeBytes`). Both passes
+    /// reuse the same scratch, so the fallback costs no memory.
+    ///
+    /// Silently does nothing when the value turns out to be neither — the
+    /// compact line already showed it verbatim.
     pub fn expandEscaped(self: *JsonExpander, out: *Out, value: []const u8) void {
-        const decoded = jsonx.unescape(self.scratch, value) orelse return;
-        if (jsonx.validate(decoded, self.limits) == null) return;
-        jsonx.writeBlock(out, out.theme, decoded, self.limits);
+        if (jsonx.unescape(self.scratch, value)) |decoded| {
+            if (jsonx.validate(decoded, self.limits) != null) {
+                jsonx.writeBlock(out, out.theme, decoded, self.limits);
+                return;
+            }
+        }
+
+        if (!protox.looksLikeBinary(value)) return;
+        const raw = protox.unescapeBytes(self.scratch, value) orelse return;
+        const start = protox.find(raw, self.proto_limits) orelse return;
+        protox.writeBlock(out, out.theme, raw[start..], self.proto_limits);
     }
 };
 
@@ -1778,8 +1799,11 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
             writeRangeHighlighted(out, line, body, end, search_matches);
             out.write(p.quote_close);
 
+            // A value worth expanding below the line: nested JSON, or bytes
+            // that only a JSON encoder could have produced — the `\u00XX`
+            // runs of an embedded protobuf payload.
             if (!is_key and expand != null and nested == null and
-                jsonx.looksLikeNestedObject(str, .{}))
+                (jsonx.looksLikeNestedObject(str, .{}) or protox.looksLikeBinary(str)))
             {
                 nested = str;
             }
