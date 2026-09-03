@@ -493,6 +493,24 @@ pub const JsonExpander = struct {
         jsonx.writeBlock(out, out.theme, span.slice(line), self.limits);
     }
 
+    /// Length of the escaped prefix worth printing for a value that carries a
+    /// protobuf payload — the human sentence in front of the bytes.
+    ///
+    /// Null when there is nothing to hide, which is the common case: either
+    /// the value holds no payload, or it holds nested JSON, which stays
+    /// verbatim on the line because it is already readable there.
+    ///
+    /// Without this the compact line keeps a run of `\u00XX` escapes that
+    /// nobody can read and that the block underneath has already decoded —
+    /// the same bytes twice, once unreadably.
+    pub fn payloadPrefix(self: *JsonExpander, value: []const u8) ?usize {
+        if (jsonx.looksLikeNestedObject(value, self.limits)) return null;
+        if (!protox.looksLikeBinary(value)) return null;
+        const raw = protox.unescapeBytes(self.scratch, value) orelse return null;
+        const start = protox.find(raw, self.proto_limits) orelse return null;
+        return protox.escapedPrefixLen(value, start);
+    }
+
     /// Expands a payload carried as an escaped string value of a JSON log
     /// line — nested JSON, or protobuf wire bytes.
     ///
@@ -1795,8 +1813,23 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
             var j = end + 1;
             while (j < line.len and line[j] == ' ') : (j += 1) {}
             const is_key = j < line.len and line[j] == ':';
+            // A payload's escapes are noise on the compact line — the block
+            // below decodes them. Print the sentence in front of them and
+            // mark the cut, so the record stays one readable line.
+            var value_end = end;
+            if (!is_key and nested == null) {
+                if (expand) |x| {
+                    if (x.payloadPrefix(str)) |cut| value_end = body + cut;
+                }
+            }
+
             out.write(if (is_key) p.json_key_open else p.json_string_open);
-            writeRangeHighlighted(out, line, body, end, search_matches);
+            writeRangeHighlighted(out, line, body, value_end, search_matches);
+            if (value_end != end) {
+                out.write(p.dim);
+                out.write(if (out.theme.glyphs.unicode_ok) "…" else "...");
+                out.write(p.reset);
+            }
             out.write(p.quote_close);
 
             // A value worth expanding below the line: nested JSON, or bytes
@@ -3169,6 +3202,42 @@ test "a brace that is not JSON is left alone" {
         defer std.testing.allocator.free(got);
         try std.testing.expect(std.mem.indexOf(u8, got, "+-") == null);
     }
+}
+
+test "a protobuf payload is decoded below the line and cut out of it" {
+    const line = "{\"level\":\"info\",\"message\":" ++
+        "\"Handle: \\u000a\\u0015\\u000a\\u000ccleanup_time\\u0012\\u000510:45\"}";
+    const got = try renderLine(line, true);
+    defer std.testing.allocator.free(got);
+
+    // The sentence survives, the escapes it was carrying do not.
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"Handle: ...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "u000a") == null);
+    // …because the block below now says what was actually sent.
+    try std.testing.expect(std.mem.indexOf(u8, got, "1: \"cleanup_time\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "2: \"10:45\"") != null);
+}
+
+test "a damaged payload leaves the line exactly as it was" {
+    // Same shape, but the length prefixes disagree with the contents. Nothing
+    // trustworthy can be decoded, so nothing is hidden either.
+    const line = "{\"level\":\"info\",\"message\":" ++
+        "\"Handle: \\u000a\\u001c\\u000a\\u0013cleanup_time\\u0012\\u000510:45\"}";
+    const got = try renderLine(line, true);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "u001c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "+-") == null);
+}
+
+test "a nested JSON value keeps its verbatim form on the line" {
+    // Only protobuf payloads get cut; JSON is readable where it stands.
+    const line = "{\"level\":\"info\",\"body\":\"{\\\"id\\\":5,\\\"n\\\":\\\"x\\\"}\"}";
+    const got = try renderLine(line, true);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "...") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"id\": 5") != null);
 }
 
 test "expansion never runs for --output json" {

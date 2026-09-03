@@ -256,6 +256,47 @@ fn opensPlausibly(src: []const u8, limits: Limits) bool {
     };
 }
 
+/// Bytes a human sentence ends with before an appended payload. Anything
+/// else means the offset lands mid-word, which is prose rather than a tag.
+inline fn isSeparator(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\n', '\r', ':', '=', ',', '|', '>' => true,
+        else => false,
+    };
+}
+
+/// Length of the escaped prefix of `src` that decodes to exactly
+/// `decoded_len` bytes, or null if no boundary lines up.
+///
+/// The printer works in escaped coordinates (it writes bytes of the original
+/// line) while `find` reports an offset into the decoded payload, so one of
+/// the two has to be translated. Re-walking the escape rules is cheaper than
+/// having `unescapeBytes` record a position per output byte, and it needs
+/// only the lengths, never the values.
+pub fn escapedPrefixLen(src: []const u8, decoded_len: usize) ?usize {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        if (out == decoded_len) return i;
+        if (src[i] != '\\') {
+            i += 1;
+            out += 1;
+            continue;
+        }
+        if (i + 1 >= src.len) return null;
+        if (src[i + 1] != 'u') {
+            i += 2;
+            out += 1;
+            continue;
+        }
+        if (i + 6 > src.len) return null;
+        const cp = std.fmt.parseInt(u16, src[i + 2 .. i + 6], 16) catch return null;
+        i += 6;
+        out += if (cp < 0x100) 1 else (std.unicode.utf8CodepointSequenceLength(cp) catch return null);
+    }
+    return if (out == decoded_len) i else null;
+}
+
 /// Offset of the protobuf payload inside `src`, or null if there isn't one.
 ///
 /// Handles the common `"Handle: " ++ payload` shape by looking for the tag
@@ -268,14 +309,28 @@ pub fn find(src: []const u8, limits: Limits) ?usize {
     // ordinary messages. Requiring at least one binary byte is what keeps
     // this from firing on normal logs.
     const ctl = firstBinaryByte(src) orelse return null;
-
-    // Search backwards from the first binary byte, and take the first offset
-    // that parses. Direction matters: prose parses as fields far more often
-    // than intuition suggests — "andle: …" is a valid field 12 fixed64 — so
-    // scanning forwards would happily anchor inside the text prefix and print
-    // nonsense. The latest offset that still parses is the one that keeps the
-    // most text as text.
     const lo = ctl -| back_window;
+
+    // Preferred anchor: the earliest offset that parses *and* sits right after
+    // a separator. A payload is appended to a human sentence — "Handle: " —
+    // so its first byte follows a space or a colon, never the middle of a
+    // word. That single constraint rules out the prose offsets, which lets us
+    // scan forwards and keep the OUTERMOST message: anchoring later would
+    // silently drop a level of nesting and print the inner fields as if they
+    // were top-level.
+    var i = lo;
+    while (i <= ctl) : (i += 1) {
+        if (i != 0 and !isSeparator(src[i - 1])) continue;
+        const rest = src[i..];
+        if (rest.len >= limits.min_bytes and
+            opensPlausibly(rest, limits) and validate(rest, limits)) return i;
+    }
+
+    // Fallback for payloads that follow no separator: take the latest offset
+    // that parses. Direction matters here — prose parses as fields far more
+    // often than intuition suggests ("andle: …" is a valid field 12 fixed64),
+    // so scanning forwards without the separator rule would anchor inside the
+    // text. The latest match keeps the most text as text.
     var start = ctl;
     while (true) : (start -= 1) {
         const rest = src[start..];
@@ -514,6 +569,44 @@ test "opensPlausibly rejects a fixed-width opening field" {
     // field 1, LEN and field 1, varint both open real messages.
     try testing.expect(opensPlausibly("\x0a\x02ab", .{}));
     try testing.expect(opensPlausibly("\x08\x01", .{}));
+}
+
+/// A payload whose inner message is itself a valid anchor. Without the
+/// separator rule the scan settles on the inner one and the outer level is
+/// silently lost.
+const wrapped = "HandleSystemConfigUpdate: \x0a$\x0a\x1cpoller_cleanup_records_count\x12\x04true";
+
+test "find keeps the outermost message when the inner one also parses" {
+    // 26 is the byte after "…Update: "; 28 is the inner message, which parses
+    // just as cleanly and would drop a level of nesting.
+    try testing.expectEqual(@as(?usize, 26), find(wrapped, .{}));
+}
+
+test "writeBlock keeps the wrapper of a nested payload" {
+    var sink = TestSink{ .allocator = testing.allocator };
+    defer sink.deinit();
+
+    const start = find(wrapped, .{}) orelse return error.NotFound;
+    writeBlock(&sink, &theme.Theme.plain, wrapped[start..], .{});
+
+    const expected =
+        "  +-\n" ++
+        "  | 1 {\n" ++
+        "  |   1: \"poller_cleanup_records_count\"\n" ++
+        "  |   2: \"true\"\n" ++
+        "  | }\n" ++
+        "  +-\n";
+    try testing.expectEqualStrings(expected, sink.buf.items);
+}
+
+test "escapedPrefixLen maps a decoded offset back onto the escaped bytes" {
+    // "Handle: " is eight decoded bytes and eight escaped ones.
+    try testing.expectEqual(@as(?usize, 8), escapedPrefixLen("Handle: \\u000a\\u0015", 8));
+    // Escapes ahead of the boundary make the two coordinates diverge:
+    // `\n` is two escaped bytes for one decoded byte.
+    try testing.expectEqual(@as(?usize, 3), escapedPrefixLen("a\\nb", 2));
+    // A boundary that lands mid-escape has no answer.
+    try testing.expectEqual(@as(?usize, null), escapedPrefixLen("\\u0041", 2));
 }
 
 test "validate rejects plain prose" {
