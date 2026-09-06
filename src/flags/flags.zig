@@ -148,12 +148,27 @@ pub const Args = struct {
     alert_stderr: bool = false,
     alert_file: ?[]const u8 = null,
     alert_webhooks: []const []const u8 = &.{},
+    /// Chat destinations. Unlike `--alert-webhook` these get a body shaped
+    /// for the service on the other end; see src/notify/.
+    alert_slack: []const []const u8 = &.{},
+    alert_discord: []const []const u8 = &.{},
+    /// `<bot-token>:<chat-id>` pairs, not URLs — the URL is derived.
+    alert_telegram: []const []const u8 = &.{},
     webhook_headers: []const []const u8 = &.{},
     alert_exit_on_alert: bool = false,
     kernel_probes: bool = false,
     services: []const []const u8 = &.{},
     crash_markers: []const []const u8 = &.{},
     journal_units: []const []const u8 = &.{},
+    /// Where the agent keeps state that has to survive a restart. Null means
+    /// "the platform default", which `main.zig` resolves from the
+    /// environment; `no_state` turns the file off entirely.
+    state_path: ?[]const u8 = null,
+    no_state: bool = false,
+
+    /// `zlrd status` — print the state file and exit. A mode, like
+    /// `--agent`, and reachable both as a subcommand and as `--status`.
+    status_mode: bool = false,
 
     // Sidecar mode flags. See src/sidecar/ for the implementation.
     sidecar_url: ?[]const u8 = null,
@@ -183,6 +198,13 @@ pub const Args = struct {
         allocator.free(self.alert_regexes);
         for (self.alert_webhooks) |s| allocator.free(s);
         allocator.free(self.alert_webhooks);
+        for (self.alert_slack) |s| allocator.free(s);
+        allocator.free(self.alert_slack);
+        for (self.alert_discord) |s| allocator.free(s);
+        allocator.free(self.alert_discord);
+        for (self.alert_telegram) |s| allocator.free(s);
+        allocator.free(self.alert_telegram);
+        if (self.state_path) |s| allocator.free(s);
         for (self.webhook_headers) |s| allocator.free(s);
         allocator.free(self.webhook_headers);
         for (self.services) |s| allocator.free(s);
@@ -231,7 +253,11 @@ pub const ParseError = error{
     MissingAlertSilence,
     MissingAlertFile,
     MissingAlertWebhook,
+    MissingAlertSlack,
+    MissingAlertDiscord,
+    MissingAlertTelegram,
     MissingWebhookHeader,
+    MissingState,
     MissingService,
     MissingCrashMarker,
     MissingJournalUnit,
@@ -355,8 +381,18 @@ pub fn printHelp(colored: bool) void {
         "       " ++ ar ++ "<path>   " ++ r ++ "  Sink: append JSONL alerts to file\n" ++
         "      " ++ lo ++ "--alert-webhook" ++ r ++
         "    " ++ ar ++ "<url>    " ++ r ++ "  Sink: POST JSON alert to URL  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-slack" ++ r ++
+        "      " ++ ar ++ "<url>    " ++ r ++ "  Sink: Slack incoming webhook  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-discord" ++ r ++
+        "    " ++ ar ++ "<url>    " ++ r ++ "  Sink: Discord webhook  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--alert-telegram" ++ r ++
+        "   " ++ ar ++ "<t:chat> " ++ r ++ "  Sink: Telegram bot  " ++ ar ++ "<bot-token>:<chat-id>  (repeatable)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--webhook-header" ++ r ++
         "   " ++ ar ++ "<K: V>   " ++ r ++ "  Extra header for webhooks  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--state" ++ r ++
+        "            " ++ ar ++ "<path>   " ++ r ++ "  State file that survives restarts  " ++ ar ++ "(default: XDG state dir)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--no-state" ++ r ++
+        "                        Keep no state on disk\n" ++
         "      " ++ lo ++ "--alert-exit" ++ r ++
         "                      Exit non-zero on first alert\n" ++
         "      " ++ lo ++ "--kernel-probes" ++ r ++
@@ -367,6 +403,10 @@ pub fn printHelp(colored: bool) void {
         "     " ++ ar ++ "<regex>  " ++ r ++ "  Extra crash pattern  " ++ ar ++ "(repeatable, ext: built-in set)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--journal-unit" ++ r ++
         "     " ++ ar ++ "<N=PAT>  " ++ r ++ "  Track systemd journal unit (glob ok)  " ++ ar ++ "(repeatable, Linux)" ++ r ++ "\n" ++
+        "\n" ++
+        b ++ "Status" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd status" ++ r ++
+        "                        What crashed, how often, and when  " ++ ar ++ "(reads the state file)" ++ r ++ "\n" ++
         "\n" ++
         b ++ "Sidecar mode (OTLP/HTTP)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--sidecar" ++ r ++
@@ -386,6 +426,8 @@ pub fn printHelp(colored: bool) void {
         "  " ++ gr ++ "zlrd -t -l error app.log" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd -a -m normalized app.log" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd --output json app.log | jq ." ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd --agent --metrics-token=$T --alert-telegram=$BOT:$CHAT app.log" ++ r ++ "\n" ++
+        "  " ++ gr ++ "zlrd status" ++ r ++ "\n" ++
         "\n";
 
     writeHelp(text, colored);
@@ -470,6 +512,9 @@ const ParseBuffers = struct {
     files: std.ArrayList([]const u8),
     alert_regexes: std.ArrayList([]const u8),
     alert_webhooks: std.ArrayList([]const u8),
+    alert_slack: std.ArrayList([]const u8),
+    alert_discord: std.ArrayList([]const u8),
+    alert_telegram: std.ArrayList([]const u8),
     webhook_headers: std.ArrayList([]const u8),
     services: std.ArrayList([]const u8),
     crash_markers: std.ArrayList([]const u8),
@@ -481,6 +526,9 @@ const ParseBuffers = struct {
             .files = try std.ArrayList([]const u8).initCapacity(allocator, 4),
             .alert_regexes = .empty,
             .alert_webhooks = .empty,
+            .alert_slack = .empty,
+            .alert_discord = .empty,
+            .alert_telegram = .empty,
             .webhook_headers = .empty,
             .services = .empty,
             .crash_markers = .empty,
@@ -493,6 +541,9 @@ const ParseBuffers = struct {
         freeStringList(allocator, &self.files);
         freeStringList(allocator, &self.alert_regexes);
         freeStringList(allocator, &self.alert_webhooks);
+        freeStringList(allocator, &self.alert_slack);
+        freeStringList(allocator, &self.alert_discord);
+        freeStringList(allocator, &self.alert_telegram);
         freeStringList(allocator, &self.webhook_headers);
         freeStringList(allocator, &self.services);
         freeStringList(allocator, &self.crash_markers);
@@ -504,6 +555,9 @@ const ParseBuffers = struct {
         parsed.files = try self.files.toOwnedSlice(allocator);
         parsed.alert_regexes = try self.alert_regexes.toOwnedSlice(allocator);
         parsed.alert_webhooks = try self.alert_webhooks.toOwnedSlice(allocator);
+        parsed.alert_slack = try self.alert_slack.toOwnedSlice(allocator);
+        parsed.alert_discord = try self.alert_discord.toOwnedSlice(allocator);
+        parsed.alert_telegram = try self.alert_telegram.toOwnedSlice(allocator);
         parsed.webhook_headers = try self.webhook_headers.toOwnedSlice(allocator);
         parsed.services = try self.services.toOwnedSlice(allocator);
         parsed.crash_markers = try self.crash_markers.toOwnedSlice(allocator);
@@ -531,7 +585,17 @@ fn parseArgsFromIter(
     // users pass files whose names look like flags.
     var positional_only = false;
 
+    // `zlrd status`, spelled as a subcommand because that is how the command
+    // reads out loud and how every tool with one spells it. Only the first
+    // argument is eligible, so a file that happens to be called `status`
+    // still works everywhere else on the line — and `./status` or
+    // `-- status` reaches it even in first position.
+    var first = true;
+
     while (it.next()) |arg| {
+        const at_front = first;
+        first = false;
+
         if (positional_only) {
             try appendFile(allocator, &bufs.files, arg);
             continue;
@@ -539,6 +603,11 @@ fn parseArgsFromIter(
 
         if (std.mem.eql(u8, arg, "--")) {
             positional_only = true;
+            continue;
+        }
+
+        if (at_front and std.mem.eql(u8, arg, "status")) {
+            parsed.status_mode = true;
             continue;
         }
 
@@ -633,6 +702,10 @@ const ValuedFlag = enum {
     alert_regex,
     alert_silence,
     alert_file,
+    alert_slack,
+    alert_discord,
+    alert_telegram,
+    state,
     alert_webhook,
     webhook_header,
     service,
@@ -663,6 +736,10 @@ const ValuedFlag = enum {
             .{ .name = "alert-silence", .kind = .alert_silence },
             .{ .name = "alert-file", .kind = .alert_file },
             .{ .name = "alert-webhook", .kind = .alert_webhook },
+            .{ .name = "alert-slack", .kind = .alert_slack },
+            .{ .name = "alert-discord", .kind = .alert_discord },
+            .{ .name = "alert-telegram", .kind = .alert_telegram },
+            .{ .name = "state", .kind = .state },
             .{ .name = "webhook-header", .kind = .webhook_header },
             .{ .name = "service", .kind = .service },
             .{ .name = "crash-marker", .kind = .crash_marker },
@@ -695,6 +772,10 @@ const ValuedFlag = enum {
             .alert_regex => error.MissingAlertRegex,
             .alert_silence => error.MissingAlertSilence,
             .alert_file => error.MissingAlertFile,
+            .alert_slack => error.MissingAlertSlack,
+            .alert_discord => error.MissingAlertDiscord,
+            .alert_telegram => error.MissingAlertTelegram,
+            .state => error.MissingState,
             .alert_webhook => error.MissingAlertWebhook,
             .webhook_header => error.MissingWebhookHeader,
             .service => error.MissingService,
@@ -715,6 +796,7 @@ fn isBoolLongFlag(flag: []const u8) bool {
     const names = [_][]const u8{
         "tail",         "aggregate",  "agent",         "alert-first-seen",
         "alert-stderr", "alert-exit", "kernel-probes", "no-expand-json",
+        "no-state",     "status",
     };
     for (names) |n| if (std.mem.eql(u8, flag, n)) return true;
     return false;
@@ -776,6 +858,14 @@ fn parseLongFlag(
         parsed.no_expand_json = true;
         return;
     }
+    if (std.mem.eql(u8, flag, "no-state")) {
+        parsed.no_state = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "status")) {
+        parsed.status_mode = true;
+        return;
+    }
 
     return error.UnknownArgument;
 }
@@ -805,6 +895,10 @@ fn applyValuedFlag(
         .alert_silence => try replaceOwnedString(allocator, &parsed.alert_silence, val),
         .alert_file => try replaceOwnedString(allocator, &parsed.alert_file, val),
         .alert_webhook => try appendString(allocator, &bufs.alert_webhooks, val),
+        .alert_slack => try appendString(allocator, &bufs.alert_slack, val),
+        .alert_discord => try appendString(allocator, &bufs.alert_discord, val),
+        .alert_telegram => try appendString(allocator, &bufs.alert_telegram, val),
+        .state => try replaceOwnedString(allocator, &parsed.state_path, val),
         .webhook_header => try appendString(allocator, &bufs.webhook_headers, val),
         .service => try appendString(allocator, &bufs.services, val),
         .crash_marker => try appendString(allocator, &bufs.crash_markers, val),
@@ -1790,4 +1884,110 @@ test "an unparseable --since is refused at the command line" {
     const fake = FakeIter{ .argv = &.{ "zlrd", "--since", "5w", "app.log" } };
     var it = fake;
     try testing.expectError(error.InvalidSince, parseArgsFromIter(allocator, &it));
+}
+
+test "chat sinks are repeatable and land in their own lists" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{
+        "zlrd",
+        "--alert-slack=https://hooks.slack.com/services/T/B/x",
+        "--alert-discord",
+        "https://discord.com/api/webhooks/1/y",
+        "--alert-telegram=123456:AAH-token:-1001234567890",
+        "--alert-telegram=123456:AAH-token:@ops",
+        "app.log",
+    } };
+    var it = fake;
+    var parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), parsed.alert_slack.len);
+    try testing.expectEqual(@as(usize, 1), parsed.alert_discord.len);
+    try testing.expectEqual(@as(usize, 2), parsed.alert_telegram.len);
+    try testing.expectEqualStrings("123456:AAH-token:@ops", parsed.alert_telegram[1]);
+    // The raw webhook list stays untouched — these are different sinks, not
+    // a different spelling of the same one.
+    try testing.expectEqual(@as(usize, 0), parsed.alert_webhooks.len);
+}
+
+test "a chat flag with no value is named in the error" {
+    const allocator = testing.allocator;
+    inline for ([_]struct { flag: []const u8, want: ParseError }{
+        .{ .flag = "--alert-slack", .want = error.MissingAlertSlack },
+        .{ .flag = "--alert-discord", .want = error.MissingAlertDiscord },
+        .{ .flag = "--alert-telegram", .want = error.MissingAlertTelegram },
+        .{ .flag = "--state", .want = error.MissingState },
+    }) |case| {
+        const fake = FakeIter{ .argv = &.{ "zlrd", case.flag } };
+        var it = fake;
+        try testing.expectError(case.want, parseArgsFromIter(allocator, &it));
+    }
+}
+
+test "--state and --no-state reach Args" {
+    const allocator = testing.allocator;
+    {
+        const fake = FakeIter{ .argv = &.{ "zlrd", "--state", "/var/lib/zlrd/state.json", "app.log" } };
+        var it = fake;
+        var parsed = try parseArgsFromIter(allocator, &it);
+        defer parsed.deinit(allocator);
+        try testing.expectEqualStrings("/var/lib/zlrd/state.json", parsed.state_path.?);
+        try testing.expect(!parsed.no_state);
+    }
+    {
+        const fake = FakeIter{ .argv = &.{ "zlrd", "--no-state", "app.log" } };
+        var it = fake;
+        var parsed = try parseArgsFromIter(allocator, &it);
+        defer parsed.deinit(allocator);
+        try testing.expect(parsed.no_state);
+        try testing.expect(parsed.state_path == null);
+    }
+}
+
+test "status is a subcommand, but only in first position" {
+    const allocator = testing.allocator;
+    {
+        const fake = FakeIter{ .argv = &.{ "zlrd", "status" } };
+        var it = fake;
+        var parsed = try parseArgsFromIter(allocator, &it);
+        defer parsed.deinit(allocator);
+        try testing.expect(parsed.status_mode);
+        try testing.expectEqual(@as(usize, 0), parsed.files.len);
+    }
+    {
+        // A file that happens to be called `status` is still a file, and
+        // `zlrd -l error status` must not silently become a mode switch.
+        const fake = FakeIter{ .argv = &.{ "zlrd", "-l", "error", "status" } };
+        var it = fake;
+        var parsed = try parseArgsFromIter(allocator, &it);
+        defer parsed.deinit(allocator);
+        try testing.expect(!parsed.status_mode);
+        try testing.expectEqual(@as(usize, 1), parsed.files.len);
+        try testing.expectEqualStrings("status", parsed.files[0]);
+    }
+    {
+        // And `--` is the escape hatch for the first position.
+        const fake = FakeIter{ .argv = &.{ "zlrd", "--", "status" } };
+        var it = fake;
+        var parsed = try parseArgsFromIter(allocator, &it);
+        defer parsed.deinit(allocator);
+        try testing.expect(!parsed.status_mode);
+        try testing.expectEqualStrings("status", parsed.files[0]);
+    }
+}
+
+test "--status is accepted as the long-flag spelling of the subcommand" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--status" } };
+    var it = fake;
+    var parsed = try parseArgsFromIter(allocator, &it);
+    defer parsed.deinit(allocator);
+    try testing.expect(parsed.status_mode);
+}
+
+test "--no-state=true is rejected rather than silently toggled" {
+    const allocator = testing.allocator;
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--no-state=true", "app.log" } };
+    var it = fake;
+    try testing.expectError(error.InvalidArgument, parseArgsFromIter(allocator, &it));
 }

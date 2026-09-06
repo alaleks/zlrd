@@ -4,6 +4,9 @@
 
 const std = @import("std");
 const flags = @import("flags");
+const notify = @import("notify");
+
+const log = std.log.scoped(.zlrd_agent);
 
 pub const default_listen = "127.0.0.1:9100";
 
@@ -34,6 +37,7 @@ pub const ParseError = error{
     MissingMetricsToken,
     InvalidBatchSize,
     InvalidSidecarUrl,
+    InvalidTelegramTarget,
 };
 
 pub const ServiceSpec = struct {
@@ -52,13 +56,64 @@ pub const JournalSpec = struct {
 pub const SinkConfig = struct {
     stderr: bool,
     file_path: ?[]const u8,
-    webhooks: []const []const u8,
+    /// Every outbound destination, raw and templated alike. `notify.Kind`
+    /// decides which body each one receives.
+    webhooks: []notify.Target,
     webhook_headers: []HeaderSpec,
 
     pub fn hasAny(self: SinkConfig) bool {
         return self.stderr or self.file_path != null or self.webhooks.len > 0;
     }
 };
+
+/// Builds the destination list from the four sink flags.
+///
+/// Order is `--alert-webhook` first, then Slack, Discord and Telegram, so the
+/// list reads the way the command line did. A Telegram entry owns its URL —
+/// the operator gives a bot token and the endpoint is derived from it — which
+/// is why the targets are freed through `Target.deinit` rather than a plain
+/// `free` of the slice.
+fn buildTargets(allocator: std.mem.Allocator, args: flags.Args) (ParseError || error{OutOfMemory})![]notify.Target {
+    const total = args.alert_webhooks.len + args.alert_slack.len +
+        args.alert_discord.len + args.alert_telegram.len;
+    const targets = try allocator.alloc(notify.Target, total);
+
+    var n: usize = 0;
+    errdefer {
+        for (targets[0..n]) |*t| t.deinit(allocator);
+        allocator.free(targets);
+    }
+
+    for (args.alert_webhooks) |url| {
+        // A Slack or Discord URL here receives the raw payload and is
+        // rejected with a 400 that only ever appears in the agent's own log.
+        // Say so at startup instead, while someone is still looking.
+        if (notify.looksTemplated(url)) |kind| {
+            log.warn("--alert-webhook {s} looks like a {t} endpoint; --alert-{t} sends a body it accepts", .{
+                url, kind, kind,
+            });
+        }
+        targets[n] = .{ .kind = .raw, .url = url };
+        n += 1;
+    }
+    for (args.alert_slack) |url| {
+        targets[n] = .{ .kind = .slack, .url = url };
+        n += 1;
+    }
+    for (args.alert_discord) |url| {
+        targets[n] = .{ .kind = .discord, .url = url };
+        n += 1;
+    }
+    for (args.alert_telegram) |spec| {
+        targets[n] = notify.parseTelegram(allocator, spec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidTelegramTarget => return error.InvalidTelegramTarget,
+        };
+        n += 1;
+    }
+
+    return targets;
+}
 
 /// Sidecar export config. `enabled = url != null`. Defaults: 5s flush, 1024
 /// batch. Headers are pre-parsed `Name: Value` pairs.
@@ -89,6 +144,8 @@ pub const AgentConfig = struct {
 
     pub fn deinit(self: *AgentConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.regex_rules);
+        for (self.sinks.webhooks) |*t| t.deinit(allocator);
+        allocator.free(self.sinks.webhooks);
         allocator.free(self.sinks.webhook_headers);
         allocator.free(self.services);
         allocator.free(self.journal_units);
@@ -125,6 +182,12 @@ pub const AgentConfig = struct {
         errdefer allocator.free(regex_rules);
         for (args.alert_regexes, 0..) |spec, i| {
             regex_rules[i] = try parseRegexRuleSpec(spec);
+        }
+
+        const targets = try buildTargets(allocator, args);
+        errdefer {
+            for (targets) |*t| t.deinit(allocator);
+            allocator.free(targets);
         }
 
         const headers = try allocator.alloc(HeaderSpec, args.webhook_headers.len);
@@ -165,7 +228,7 @@ pub const AgentConfig = struct {
 
         // Default sink: if the user enabled agent mode but specified no sink at all,
         // emit alerts to stderr so the process is never silently producing them.
-        const any_sink = args.alert_stderr or args.alert_file != null or args.alert_webhooks.len > 0;
+        const any_sink = args.alert_stderr or args.alert_file != null or targets.len > 0;
         const stderr_enabled = args.alert_stderr or !any_sink;
 
         return .{
@@ -178,7 +241,7 @@ pub const AgentConfig = struct {
             .sinks = .{
                 .stderr = stderr_enabled,
                 .file_path = args.alert_file,
-                .webhooks = args.alert_webhooks,
+                .webhooks = targets,
                 .webhook_headers = headers,
             },
             .alert_exit = args.alert_exit_on_alert,

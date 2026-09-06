@@ -59,6 +59,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Chat-app alert bodies (Telegram / Slack / Discord). Standalone: no
+    // imports, no I/O — `webhook.zig` still owns delivery.
+    const notify_mod = b.createModule(.{
+        .root_source_file = b.path("src/notify/notify.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Calendar arithmetic, shared by the reader's `--since` and the status
+    // table's UTC stamps.
+    const civil_mod = b.createModule(.{
+        .root_source_file = b.path("src/reader/civil.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Agent state that outlives the process, plus its `zlrd status` renderer.
+    const state_mod = b.createModule(.{
+        .root_source_file = b.path("src/state/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const journal_mod = b.createModule(.{
         .root_source_file = b.path("src/journal/journal.zig"),
         .target = target,
@@ -76,6 +99,8 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("kernel", kernel_mod);
     agent_mod.addImport("sidecar", sidecar_mod);
     agent_mod.addImport("journal", journal_mod);
+    agent_mod.addImport("notify", notify_mod);
+    agent_mod.addImport("state", state_mod);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -87,6 +112,10 @@ pub fn build(b: *std.Build) void {
     root_mod.addImport("agent", agent_mod);
     root_mod.addImport("simd", simd_mod);
     root_mod.addImport("regex", regex_mod);
+    root_mod.addImport("state", state_mod);
+    // `src/state/status.zig` is compiled into the root module and imports
+    // both of these by module name.
+    root_mod.addImport("civil", civil_mod);
 
     const exe = b.addExecutable(.{
         .name = "zlrd",
@@ -107,6 +136,7 @@ pub fn build(b: *std.Build) void {
     lite_root_mod.addImport("flags", flags_mod);
     lite_root_mod.addImport("simd", simd_mod);
     lite_root_mod.addImport("regex", regex_mod);
+    lite_root_mod.addImport("civil", civil_mod);
 
     const exe_lite = b.addExecutable(.{
         .name = "zlrd-lite",
@@ -156,6 +186,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("flags", flags_mod);
         mod.addImport("simd", simd_mod);
         mod.addImport("regex", regex_mod);
+        mod.addImport("civil", civil_mod);
 
         const tests = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);
@@ -185,15 +216,37 @@ pub fn build(b: *std.Build) void {
         mod.addImport("kernel", kernel_mod);
         mod.addImport("sidecar", sidecar_mod);
         mod.addImport("journal", journal_mod);
+        mod.addImport("notify", notify_mod);
+        mod.addImport("state", state_mod);
 
         const tests = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
+    const civil_tests = b.addTest(.{ .root_module = civil_mod });
+    test_step.dependOn(&b.addRunArtifact(civil_tests).step);
+
+    const notify_tests = b.addTest(.{ .root_module = notify_mod });
+    test_step.dependOn(&b.addRunArtifact(notify_tests).step);
+
+    const state_tests = b.addTest(.{ .root_module = state_mod });
+    test_step.dependOn(&b.addRunArtifact(state_tests).step);
+
+    // The status renderer needs both the state module (so its snapshot type
+    // matches the one `main.zig` passes) and `civil` for the UTC stamps.
+    const status_mod = b.createModule(.{
+        .root_source_file = b.path("src/state/status.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    status_mod.addImport("state", state_mod);
+    status_mod.addImport("civil", civil_mod);
+    const status_tests = b.addTest(.{ .root_module = status_mod });
+    test_step.dependOn(&b.addRunArtifact(status_tests).step);
+
     inline for ([_][]const u8{
         "src/winlog/format.zig",
         "src/winlog/evtx.zig",
-        "src/reader/civil.zig",
         "src/reader/parallel.zig",
     }) |path| {
         const mod = b.createModule(.{

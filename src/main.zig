@@ -3,6 +3,8 @@ const flags = @import("flags");
 const agent = @import("agent");
 const reader = @import("reader/reader.zig");
 const gzip = @import("reader/gzip.zig");
+const state = @import("state");
+const status = @import("state/status.zig");
 const build_options = @import("build_options");
 
 pub fn main(opts: struct {
@@ -55,6 +57,28 @@ pub fn main(opts: struct {
 
     if (parsed_args.help) {
         flags.printHelp(th.colored);
+        return;
+    }
+
+    // Where the agent keeps what has to survive a restart. Resolved here
+    // rather than inside the agent because it depends on the environment,
+    // and because `zlrd status` needs the very same answer.
+    const state_path: ?[]u8 = if (parsed_args.no_state) null else if (parsed_args.state_path) |p|
+        allocator.dupe(u8, p) catch null
+    else
+        state.defaultPath(allocator, .{
+            .zlrd_state = opts.environ_map.get("ZLRD_STATE"),
+            .xdg_state_home = opts.environ_map.get("XDG_STATE_HOME"),
+            .home = opts.environ_map.get("HOME"),
+            .local_app_data = opts.environ_map.get("LOCALAPPDATA"),
+        }) catch null;
+    defer if (state_path) |p| allocator.free(p);
+
+    if (parsed_args.status_mode) {
+        // Before the file discovery below, which would fail out of a
+        // directory with no logs in it — `zlrd status` reads one file and it
+        // is never a log.
+        printStatus(allocator, io, &th, &err_th, state_path);
         return;
     }
 
@@ -115,7 +139,7 @@ pub fn main(opts: struct {
     }
 
     if (parsed_args.agent_mode) {
-        const exit_code = agent.run(allocator, io, parsed_args) catch |err| {
+        const exit_code = agent.run(allocator, io, parsed_args, state_path) catch |err| {
             fatal(io, &err_th, agentErrorMessage(err), agentErrorHint(err));
             std.process.exit(1);
         };
@@ -127,6 +151,57 @@ pub fn main(opts: struct {
     processFiles(allocator, parsed_args, &th) catch |err| {
         fatal(io, &err_th, runtimeErrorMessage(err), null);
         std.process.exit(1);
+    };
+}
+
+/// `zlrd status` — what the agent recorded, for the morning after.
+///
+/// Opens the store read-only in the sense that matters: no saver thread is
+/// started, so nothing here can write over what a running agent is keeping.
+fn printStatus(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    th: *const reader.Theme,
+    err_th: *const reader.Theme,
+    state_path: ?[]const u8,
+) void {
+    const path = state_path orelse {
+        fatal(io, err_th, "--no-state leaves nothing for status to read", "drop --no-state, or pass --state <path>");
+        return;
+    };
+
+    var store = state.Store.open(allocator, io, path) catch |err| {
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ path, @errorName(err) }) catch "cannot read the state file";
+        fatal(io, err_th, msg, "the agent writes this file; run zlrd --agent first");
+        return;
+    };
+    defer store.deinit();
+
+    var buf: [16 * 1024]u8 = undefined;
+    var fw = std.Io.File.stdout().writer(io, &buf);
+    status.render(
+        &fw.interface,
+        store.snapshot(),
+        statusStyle(th),
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
+    ) catch {};
+    fw.interface.flush() catch {};
+}
+
+/// Adapts the resolved terminal theme to the handful of escapes the status
+/// table needs. `src/state/` has no other reason to know what a terminal is,
+/// so the palette is handed to it rather than imported by it.
+fn statusStyle(th: *const reader.Theme) status.Style {
+    if (!th.colored) return .plain;
+    const p = th.palette;
+    return .{
+        .reset = p.reset,
+        .dim = p.dim,
+        .muted = p.muted,
+        .bad = p.level[@intFromEnum(flags.Level.Error)],
+        .rule = if (th.glyphs.unicode_ok) th.glyphs.rule else "-",
+        .none = if (th.glyphs.unicode_ok) "\u{2014}" else "-",
     };
 }
 

@@ -9,7 +9,9 @@ const tail_reader = @import("tail.zig");
 const gzip = @import("gzip.zig");
 const regex = @import("regex");
 const theme = @import("theme.zig");
-const civil = @import("civil.zig");
+// By module name, not by path: `src/state/status.zig` needs the same
+// calendar code, and a file can belong to only one module inside a binary.
+const civil = @import("civil");
 const parallel = @import("parallel.zig");
 pub const Cutoff = civil.Cutoff;
 const jsonx = @import("jsonx.zig");

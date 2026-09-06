@@ -15,6 +15,7 @@ const metrics = @import("metrics.zig");
 const rules = @import("rules.zig");
 const service = @import("service.zig");
 const signature = @import("signature.zig");
+const state = @import("state");
 
 const log = std.log.scoped(.zlrd_watcher);
 
@@ -157,6 +158,19 @@ pub const Watcher = struct {
         self.allocator.free(self.read_buf);
         self.allocator.free(self.crash_regexes);
         self.* = undefined;
+    }
+
+    /// Adopts each tracked service's counters from the state file, so the
+    /// totals an alert reports span every run rather than this one.
+    ///
+    /// Called before `run`, while no other thread is touching the trackers.
+    pub fn seedTrackers(self: *Watcher, store: *state.Store) void {
+        for (self.files) |*f| {
+            if (f.tracker) |*t| {
+                const c = store.counts(t.name);
+                t.seed(c.crash, c.restart);
+            }
+        }
     }
 
     pub fn requestStop(self: *Watcher) void {

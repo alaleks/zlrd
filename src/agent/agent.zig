@@ -7,6 +7,7 @@
 const std = @import("std");
 const flags = @import("flags");
 const kernel = @import("kernel");
+const state = @import("state");
 
 pub const config = @import("config.zig");
 pub const metrics = @import("metrics.zig");
@@ -19,6 +20,10 @@ pub const webhook = @import("webhook.zig");
 pub const journal = @import("journal.zig");
 pub const service = @import("service.zig");
 pub const exporter = @import("exporter.zig");
+
+/// Re-exported so `main.zig` can open the same store for `zlrd status`
+/// without importing the package twice under two names.
+pub const store = state;
 
 const log = std.log.scoped(.zlrd_agent);
 
@@ -35,10 +40,16 @@ pub const RunError = error{
 /// Runs agent mode until `--alert-exit` fires or the process receives a stop
 /// signal. The return value is non-zero iff the agent should exit with a
 /// non-zero status (i.e. an alert fired in `--alert-exit` mode).
+///
+/// `state_path` is where bookkeeping that must survive a restart is kept, or
+/// null for `--no-state`. It arrives already resolved because the default
+/// depends on the environment, and reading the environment is the caller's
+/// job — the agent should not be reaching for `$HOME` on its own.
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     args: flags.Args,
+    state_path: ?[]const u8,
 ) !u8 {
     if (args.files.len == 0 and args.journal_units.len == 0) return error.NoFiles;
 
@@ -52,6 +63,24 @@ pub fn run(
 
     var dispatcher = try alert.Dispatcher.init(io, cfg.sinks, &m, cfg.alert_exit);
     defer dispatcher.deinit();
+
+    // Durable state, wired in before anything can fire. A store that cannot
+    // be opened is reported and skipped: the agent's job is watching logs,
+    // and an unwritable state directory should not stop it from doing that.
+    var store_storage: ?state.Store = null;
+    defer if (store_storage) |*st| st.deinit();
+    if (state_path) |path| {
+        if (state.Store.open(allocator, io, path)) |opened| {
+            store_storage = opened;
+            const st = &store_storage.?;
+            st.start() catch |err| log.warn("state saver did not start: {t}", .{err});
+            dispatcher.setStore(st);
+            rs.attachStore(st) catch |err| log.warn("state: seeding first-seen failed: {t}", .{err});
+            log.info("state at {s}", .{path});
+        } else |err| {
+            log.warn("state {s}: {t}; continuing without it", .{ path, err });
+        }
+    }
 
     var sender_storage: ?webhook.Sender = null;
     defer if (sender_storage) |*s| s.deinit();
@@ -111,6 +140,7 @@ pub fn run(
 
     var w = try watcher.Watcher.init(allocator, io, &m, &rs, &dispatcher, &cfg, args.files);
     defer w.deinit();
+    if (store_storage) |*st| w.seedTrackers(st);
 
     const server_thread = try std.Thread.spawn(.{}, runServer, .{&srv});
     // Shut the listener down and join before `srv.deinit()` runs. As a
@@ -166,6 +196,7 @@ pub fn run(
             &dispatcher,
             &w.detector,
         );
+        if (store_storage) |*st| js.setStore(st);
         try journals.append(allocator, js);
         const th = std.Thread.spawn(.{}, runJournal, .{js}) catch |err| {
             log.warn("failed to spawn journal thread for '{s}': {t}", .{ spec.name, err });

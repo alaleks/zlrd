@@ -11,6 +11,7 @@ const regex = @import("regex");
 const config = @import("config.zig");
 const metrics = @import("metrics.zig");
 const signature = @import("signature.zig");
+const state = @import("state");
 
 const buckets_per_window = 8;
 
@@ -126,6 +127,11 @@ pub const RuleSet = struct {
     /// a single time instead of on every subsequent error line.
     seen_capped: bool,
     silence_window_ms: ?u64,
+    /// Where novel signatures are persisted, when state is enabled. Without
+    /// it the set is rebuilt from nothing on every start, and every error the
+    /// agent already reported announces itself as new all over again — the
+    /// second-loudest source of alert noise after a flapping service.
+    store: ?*state.Store = null,
 
     /// Constructs a RuleSet from a parsed AgentConfig. Owns the `regexes`
     /// slice and `seen` map; takes a borrowed slice of regex specs.
@@ -156,6 +162,7 @@ pub const RuleSet = struct {
             .seen = .empty,
             .seen_capped = false,
             .silence_window_ms = cfg.silence_window_ms,
+            .store = null,
         };
     }
 
@@ -164,6 +171,20 @@ pub const RuleSet = struct {
         self.allocator.free(self.regexes);
         self.seen.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Attaches the state store and adopts the signatures it carries, so a
+    /// restart does not re-alert on errors previous runs already reported.
+    ///
+    /// Called before the watcher starts, while nothing else can touch the
+    /// map, which is why it takes no lock.
+    pub fn attachStore(self: *RuleSet, store: *state.Store) !void {
+        self.store = store;
+        if (!self.seen_enabled) return;
+        for (store.signatureSlice()) |sig| {
+            if (self.seen.count() >= max_seen_signatures) break;
+            try self.seen.put(self.allocator, sig, {});
+        }
     }
 
     /// Returns true if any rules need silence checking.
@@ -241,6 +262,7 @@ pub const RuleSet = struct {
             }
             const gop = try self.seen.getOrPut(self.allocator, sig);
             if (!gop.found_existing) {
+                if (self.store) |st| st.recordSignature(sig);
                 out[n] = .{
                     .kind = .first_seen,
                     .rule_id = "first_seen",
@@ -547,4 +569,52 @@ test "first_seen: a signature already known still resolves at the cap" {
     const before = rs.seen.count();
     try testing.expectEqual(@as(usize, 0), try rs.observe(io, line, .Error, "app.log", 2000, &fired));
     try testing.expectEqual(before, rs.seen.count());
+}
+
+test "first_seen: a signature carried over from a previous run does not re-alert" {
+    const allocator = testing.allocator;
+    const io = std.Options.debug_io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/state.json", .{tmp.sub_path});
+
+    var args = flags.Args{};
+    args.metrics_token = "t";
+    args.alert_first_seen = true;
+
+    const line = "ERROR upstream refused the connection";
+    var fired: [4]Fired = undefined;
+
+    // First run: novel, so it alerts, and the signature is persisted.
+    {
+        var store = try state.Store.open(allocator, io, path);
+        defer store.deinit();
+        var cfg = try config.AgentConfig.fromArgs(allocator, args);
+        defer cfg.deinit(allocator);
+        var rs = try RuleSet.init(allocator, cfg);
+        defer rs.deinit();
+        try rs.attachStore(&store);
+
+        try testing.expectEqual(@as(usize, 1), try rs.observe(io, line, .Error, "app.log", 1000, &fired));
+        store.flush();
+    }
+
+    // Second run, same error: the agent has already reported it, and saying
+    // so again on every restart is exactly the noise that gets an alerting
+    // integration muted.
+    {
+        var store = try state.Store.open(allocator, io, path);
+        defer store.deinit();
+        var cfg = try config.AgentConfig.fromArgs(allocator, args);
+        defer cfg.deinit(allocator);
+        var rs = try RuleSet.init(allocator, cfg);
+        defer rs.deinit();
+        try rs.attachStore(&store);
+
+        try testing.expectEqual(@as(usize, 0), try rs.observe(io, line, .Error, "app.log", 2000, &fired));
+        // And something genuinely new still gets through.
+        try testing.expectEqual(@as(usize, 1), try rs.observe(io, "ERROR disk quota exceeded", .Error, "app.log", 2001, &fired));
+    }
 }

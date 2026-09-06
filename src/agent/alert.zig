@@ -12,6 +12,8 @@ const config = @import("config.zig");
 const metrics = @import("metrics.zig");
 const rules = @import("rules.zig");
 const kernel = @import("kernel");
+const notify = @import("notify");
+const state = @import("state");
 const service = @import("service.zig");
 
 /// Hooks set by the watcher / main loop so this file does not have to depend
@@ -53,6 +55,10 @@ pub const Dispatcher = struct {
     webhook_sender: ?WebhookSender,
     webhook_ctx: ?*anyopaque,
     sidecar_sink: ?SidecarSink,
+    /// Durable bookkeeping, when `--no-state` did not turn it off. The
+    /// dispatcher is the single point every kind of event passes through,
+    /// which makes it the one place the store has to be wired into.
+    store: ?*state.Store,
 
     pub fn init(
         io: std.Io,
@@ -84,6 +90,7 @@ pub const Dispatcher = struct {
             .webhook_sender = null,
             .webhook_ctx = null,
             .sidecar_sink = null,
+            .store = null,
         };
     }
 
@@ -94,6 +101,10 @@ pub const Dispatcher = struct {
 
     pub fn setSidecarSink(self: *Dispatcher, sink: SidecarSink) void {
         self.sidecar_sink = sink;
+    }
+
+    pub fn setStore(self: *Dispatcher, store: *state.Store) void {
+        self.store = store;
     }
 
     pub fn deinit(self: *Dispatcher) void {
@@ -126,9 +137,35 @@ pub const Dispatcher = struct {
 
         if (self.sinks.stderr) self.writeStderr(payload);
         if (self.file != null) self.writeFile(payload, sync_to_disk);
-        if (self.webhook_sender) |send| {
-            for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
-        }
+        self.fanOut(payload, .{
+            .event = switch (event.kind) {
+                .crash => .service_crash,
+                .stop => .service_stop,
+                .restart => .service_restart,
+            },
+            .subject = event.service_name,
+            .source = event.file_path,
+            .marker = event.marker,
+            .detail = event.detail,
+            .trace = event.stack_trace,
+            .pid = event.pid,
+            .crash_count = event.crash_count,
+            .restart_count = event.restart_count,
+        });
+        if (self.store) |st| st.record(.{
+            .ts_ms = now_ms,
+            .kind = rule_kind.label(),
+            .subject = event.service_name,
+            .source = event.file_path,
+            .detail = event.detail,
+            .marker = event.marker,
+            .trace = event.stack_trace,
+            // The tracker owns these for the life of the process; it was
+            // seeded from the store at startup, so they already include
+            // everything previous runs saw.
+            .counts = .{ .crash = event.crash_count, .restart = event.restart_count },
+            .durable = sync_to_disk,
+        });
         if (self.sidecar_sink) |sink| sink.record_service(sink.ctx, event, now_ms);
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
@@ -147,13 +184,32 @@ pub const Dispatcher = struct {
         var buf: [512]u8 = undefined;
         const payload = kernel.formatEventJson(&buf, event, now_ms) catch return;
 
+        const comm = event.comm[0..event.comm_len];
+        const detail = event.detail[0..event.detail_len];
+
         if (self.sinks.stderr) self.writeStderr(payload);
         // Every kernel event is durability-critical — the next instant may
         // be a panic that takes the box down.
         if (self.file != null) self.writeFile(payload, true);
-        if (self.webhook_sender) |send| {
-            for (self.sinks.webhooks) |url| send(self.webhook_ctx, url, payload);
-        }
+        self.fanOut(payload, .{
+            .event = switch (event.kind) {
+                .oom => .kernel_oom,
+                .segfault => .kernel_segfault,
+                .panic_prev_boot => .kernel_panic,
+            },
+            .subject = comm,
+            .source = event.source.label(),
+            .detail = detail,
+            .pid = event.pid,
+        });
+        if (self.store) |st| st.record(.{
+            .ts_ms = now_ms,
+            .kind = rule_kind.label(),
+            .subject = comm,
+            .source = event.source.label(),
+            .detail = detail,
+            .durable = true,
+        });
         if (self.sidecar_sink) |sink| sink.record_kernel(sink.ctx, event, now_ms);
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
     }
@@ -174,13 +230,56 @@ pub const Dispatcher = struct {
         // rates on slow filesystems (NFS, etc.).
         if (self.sinks.stderr) self.writeStderr(payload);
         if (self.file != null) self.writeFile(payload, false);
-        if (self.webhook_sender) |send| {
-            for (self.sinks.webhooks) |url| {
-                send(self.webhook_ctx, url, payload);
-            }
-        }
+        self.fanOut(payload, .{
+            .event = switch (fired.kind) {
+                .error_rate => .error_rate,
+                .regex => .regex,
+                .first_seen => .first_seen,
+                .silence => .silence,
+                // Lifecycle and kernel kinds arrive through their own
+                // entry points and never reach a `Fired`.
+                else => .error_rate,
+            },
+            .subject = fired.rule_id,
+            .source = fired.file_path,
+            .detail = fired.line,
+            .observed = fired.observed_count,
+            .threshold = fired.threshold_count,
+            .window_ms = fired.threshold_window_ms,
+        });
+        if (self.store) |st| st.record(.{
+            .ts_ms = now_ms,
+            .kind = fired.kind.label(),
+            .subject = fired.rule_id,
+            .source = fired.file_path,
+            .detail = fired.line,
+        });
         if (self.sidecar_sink) |sink| sink.record_fired(sink.ctx, fired, now_ms);
         if (self.alert_exit) self.exit_flag.store(true, .monotonic);
+    }
+
+    /// POSTs to every configured destination: the raw JSON payload to the
+    /// ones that want a collector's document, and a rendered message to the
+    /// ones that are a chat app.
+    ///
+    /// Rendering happens here, on the thread that produced the event, rather
+    /// than in the sender: `webhook.Sender` queues `(url, body)` pairs and
+    /// copies both, so a body that is already final costs it nothing new and
+    /// the queue stays unaware that templating exists at all.
+    fn fanOut(self: *Dispatcher, payload: []const u8, view: notify.Alert) void {
+        const send = self.webhook_sender orelse return;
+        var body: [notify.max_body_bytes]u8 = undefined;
+        for (self.sinks.webhooks) |target| {
+            if (target.kind == .raw) {
+                send(self.webhook_ctx, target.url, payload);
+                continue;
+            }
+            const rendered = notify.render(&body, target, view) catch |err| {
+                std.log.scoped(.zlrd_alert).warn("{t} body for {s}: {t}", .{ target.kind, target.url, err });
+                continue;
+            };
+            send(self.webhook_ctx, target.url, rendered);
+        }
     }
 
     /// Writes one alert record to stderr.

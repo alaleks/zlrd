@@ -395,6 +395,18 @@ pub const Tracker = struct {
         };
     }
 
+    /// Adopts the counters a previous run left behind.
+    ///
+    /// Without this the numbers in an alert describe the current process
+    /// rather than the service: an operator reading "crashes: 1" after a
+    /// third crash overnight has been told something false, and the agent
+    /// restarting — which is exactly what happens when the box it watches
+    /// reboots — is what resets them.
+    pub fn seed(self: *Tracker, crash_count: u64, restart_count: u64) void {
+        self.crash_count = crash_count;
+        self.restart_count = restart_count;
+    }
+
     /// Feed a log line. Returns a `ServiceEvent` only when one is ready to
     /// dispatch — crashes are delayed slightly so the trace can be captured;
     /// see `tick` for the timeout path.

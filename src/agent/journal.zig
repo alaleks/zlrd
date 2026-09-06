@@ -30,6 +30,7 @@ const native = @import("journal");
 const alert = @import("alert.zig");
 const config = @import("config.zig");
 const service = @import("service.zig");
+const state = @import("state");
 
 const log = std.log.scoped(.zlrd_journal);
 
@@ -254,6 +255,10 @@ pub const JournalSource = struct {
     overflow_logged: bool = false,
     stop_flag: std.atomic.Value(bool),
     child: ?std.process.Child = null,
+    /// State store, when one is configured. Units appear here lazily — the
+    /// first line from a unit is what creates its tracker — so the counters
+    /// are adopted at that moment rather than up front.
+    store: ?*state.Store = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -273,6 +278,10 @@ pub const JournalSource = struct {
             .trackers = .empty,
             .stop_flag = .init(false),
         };
+    }
+
+    pub fn setStore(self: *JournalSource, store: *state.Store) void {
+        self.store = store;
     }
 
     pub fn deinit(self: *JournalSource) void {
@@ -616,6 +625,10 @@ pub const JournalSource = struct {
             return null;
         };
         ptr.* = service.Tracker.initJournal(self.name, owned_path, now_ms);
+        if (self.store) |st| {
+            const c = st.counts(self.name);
+            ptr.seed(c.crash, c.restart);
+        }
         self.trackers.put(self.allocator, key, ptr) catch {
             self.allocator.free(owned_path);
             self.allocator.destroy(ptr);

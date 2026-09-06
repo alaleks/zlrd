@@ -144,7 +144,14 @@ fn isAgentModeRequested(args: flags.Args) bool {
     if (args.alert_stderr) return true;
     if (args.alert_file != null) return true;
     if (args.alert_webhooks.len > 0) return true;
+    if (args.alert_slack.len > 0) return true;
+    if (args.alert_discord.len > 0) return true;
+    if (args.alert_telegram.len > 0) return true;
     if (args.webhook_headers.len > 0) return true;
+    // `--state` and `zlrd status` read and write the agent's own bookkeeping,
+    // which this build has nothing to write.
+    if (args.state_path != null) return true;
+    if (args.status_mode) return true;
     if (args.alert_exit_on_alert) return true;
     if (args.kernel_probes) return true;
     if (args.services.len > 0) return true;

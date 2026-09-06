@@ -61,10 +61,12 @@ stderr, files, or HTTP webhooks.
   - [HTTP API](#http-api)
   - [Alert rules](#alert-rules)
   - [Alert sinks](#alert-sinks)
+  - [Chat alerts: Telegram, Slack, Discord](#chat-alerts-telegram-slack-discord)
   - [Service crash tracking](#service-crash-tracking)
   - [systemd journal sources](#systemd-journal-sources)
   - [Kernel-level probes](#kernel-level-probes)
   - [Webhook integration](#webhook-integration)
+  - [State that survives a restart](#state-that-survives-a-restart)
   - [Prometheus scrape config](#prometheus-scrape-config)
   - [Production deployment](#production-deployment)
 - [CLI reference](#cli-reference)
@@ -93,6 +95,8 @@ stderr, files, or HTTP webhooks.
   - **systemd-journal** sources (`--journal-unit`) with wildcards
   - **kernel-level probes** (`--kernel-probes`) — OOM, segfault, prior-boot panic; eBPF when `-Dwith-ebpf=true`
   - stderr / JSONL file / HTTP webhook sinks
+  - **native Telegram, Slack and Discord messages** — no templating proxy
+  - **state that survives a restart**, and `zlrd status` to read it
 - **Parallel scan** — seekable files are split at line boundaries across
   cores, output byte-identical to the serial path
 - **Single static binary** — no runtime, no glibc, no surprises
@@ -569,6 +573,9 @@ produces one JSON payload that's pushed to all enabled sinks.
 | `--alert-stderr`         | stderr                     | One JSON document per line. Pipes cleanly into systemd journal.   |
 | `--alert-file <path>`    | append-only JSONL          | Opened with append semantics; safe across rotations.              |
 | `--alert-webhook <url>`  | HTTP POST                  | `Content-Type: application/json`. Repeatable for fan-out.         |
+| `--alert-telegram <t:c>` | Telegram bot message       | `<bot-token>:<chat-id>`. Rendered, not raw JSON. Repeatable.      |
+| `--alert-slack <url>`    | Slack incoming webhook     | Rendered as a mrkdwn block. Repeatable.                           |
+| `--alert-discord <url>`  | Discord webhook            | Rendered as a coloured embed. Repeatable.                         |
 | `--webhook-header <K:V>` | extra header on every POST | Use for `Authorization`, signing, or custom routing. Repeatable.  |
 | `--alert-exit`           | process exits non-zero     | Useful in CI / one-shot use cases. Combines with other sinks.     |
 
@@ -598,6 +605,67 @@ never silently swallowed.
 | `threshold`      | The configured `{count, window_ms}` of the rule                        |
 | `observed_count` | How many events were in the window when the rule latched              |
 | `line`           | The triggering log line (omitted for `silence`)                        |
+
+### Chat alerts: Telegram, Slack, Discord
+
+These three take a message, not a document. Pointing `--alert-webhook` at a
+Slack URL gets a `400` back, because what Slack wants is `{"text": ...}` and
+what it received was the alert payload — which is why the usual answer is a
+small templating proxy in front of the webhook.
+
+zlrd renders the three bodies itself instead. Same alert, same rules, same
+everything else; only the shape of the POST differs, and there is nothing new
+to deploy or keep running:
+
+```bash
+# Telegram: the bot token, then the chat id, separated by a colon.
+# Group and channel ids are negative; a public channel can be @name.
+zlrd --agent --metrics-token=$TOKEN \
+     --service api=/var/log/api.log \
+     --alert-telegram="$BOT_TOKEN:$CHAT_ID" \
+     /var/log/api.log
+
+# Slack and Discord take the incoming-webhook URL as printed by the app.
+zlrd --agent --metrics-token=$TOKEN \
+     --alert-slack="https://hooks.slack.com/services/T00/B00/xxxx" \
+     --alert-discord="https://discord.com/api/webhooks/123/xxxx" \
+     app.log
+```
+
+A crash arrives looking like this — headline, where it came from, the first
+line of the panic, then the trace in a code block:
+
+    🔴 api crashed
+    go_panic · /var/log/api.log · pid 4192
+    panic: runtime error: invalid memory address or nil pointer dereference
+
+        goroutine 1 [running]:
+        main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+                /src/api/server.go:142 +0x24
+
+    crashes: 3 · restarts: 1
+
+Details worth knowing:
+
+- **The colour is the level colour.** A Discord embed is tinted with the same
+  red, amber, blue and green the reader paints levels with, so an alert in a
+  channel matches the line that produced it in the terminal.
+- **Long traces are cut, not dropped.** Each service caps a message
+  (Telegram 4096 characters, Slack 3000 per block, Discord 2000). The
+  headline, source and first line always survive; the trace is trimmed with a
+  `…` where it stops.
+- **Log text can't break the formatting.** A line containing `<b>`, `*bold*`
+  or a stray backtick is escaped for the channel it is going to before it is
+  escaped for JSON, so a hostile log line renders as text.
+- **Telegram needs both halves.** `--alert-telegram` splits on the *last*
+  colon because a bot token contains one of its own. A chat id is all digits
+  (negative for groups) or `@channelusername`; anything else is rejected at
+  startup rather than POSTing into the void for the life of the process.
+- **`--webhook-header` applies to all of them**, so leave it off unless a
+  proxy in between needs it — none of the three services do.
+
+The raw `--alert-webhook` sink is unchanged and still sends the documented
+payload, so a chat channel and a collector can run side by side.
 
 ### Service crash tracking
 
@@ -813,14 +881,83 @@ zlrd --agent --metrics-token=$TOKEN \
 
 `--webhook-header` is **repeatable** and applies to **all** configured webhooks.
 
-#### Slack / Discord (templated)
+#### Chat apps
 
-Slack and Discord webhooks expect a specific body shape (`{"text": "..."}`),
-so the raw `zlrd` payload won't render as a message. The simplest route is to
-front them with a tiny templating proxy that consumes the `zlrd` payload and
-emits the channel-specific format. The raw payload itself is stable and
-documented in [Alert payload schema](#alert-payload-schema), so the proxy
-stays trivial.
+Telegram, Slack and Discord are handled natively — see
+[Chat alerts](#chat-alerts-telegram-slack-discord). They do not go through
+`--alert-webhook` and need no proxy in front.
+
+Passing one of their URLs to `--alert-webhook` anyway is caught at startup
+with a line naming the flag you probably wanted, because the alternative is a
+`400` visible only in the agent's own log.
+
+### State that survives a restart
+
+The agent keeps a small file with what it has to remember between runs:
+per-service crash and restart counts, the most recent crash with its trace,
+a ring of recent events, and the first-seen signature set.
+
+Without it, restarting the agent — which is what happens when the box it
+watches reboots — loses two things quietly. The counters go back to zero, so
+"crashes: 1" in an alert describes the current process rather than the
+service. And the first-seen set empties, so every error it had already
+reported announces itself as new all over again.
+
+`zlrd status` reads that file. It is the answer to "something broke
+overnight, what was it", and it needs nothing running:
+
+```console
+$ zlrd status
+state /var/lib/zlrd/state.json
+
+SERVICE  CRASHES  RESTARTS  LAST CRASH
+api            3         1  4h ago   go_panic
+worker         0         2  -
+
+last crash api · 4h ago (2026-09-06 03:12:44 UTC)
+  panic: runtime error: invalid memory address or nil pointer dereference
+  goroutine 1 [running]:
+  main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+      /src/api/server.go:142 +0x24
+
+recent
+  4h ago     service_crash   api      panic: runtime error: invalid memory...
+  6h ago     error_rate      app.log  ERROR upstream timed out
+```
+
+Times are shown twice on purpose: "4h ago" is the question actually being
+asked and needs no time zone to be true, and the absolute stamp beside it is
+UTC, labelled, so it can be matched against a log line without guessing whose
+clock it came from.
+
+Where the file lives, in order:
+
+| Source                       | Path                                     |
+| ---------------------------- | ---------------------------------------- |
+| `--state <path>`             | exactly that                             |
+| `$ZLRD_STATE`                | exactly that                             |
+| `$XDG_STATE_HOME`            | `$XDG_STATE_HOME/zlrd/state.json`        |
+| `$HOME`                      | `~/.local/state/zlrd/state.json`         |
+| Windows                      | `%LOCALAPPDATA%\zlrd\state.json`         |
+
+Under systemd, `StateDirectory=zlrd` plus `Environment=ZLRD_STATE=/var/lib/zlrd/state.json`
+puts it somewhere a `DynamicUser=` service can write. `--no-state` turns the
+file off entirely.
+
+Notes:
+
+- **Crashes are written through immediately**; everything else is coalesced
+  and flushed a couple of times a second, because a busy rule fires far more
+  often than a state file deserves to be rewritten.
+- **Writes are atomic** — an unnamed file renamed over the target — so a
+  crash mid-write leaves the previous state readable rather than a truncated
+  document.
+- **It is bounded**: 64 recent events, 64 services, 4096 signatures, a 4 KiB
+  trace. It is a state file, not a second log.
+- **It never blocks the watcher.** A corrupt or unwritable file is reported
+  once and then ignored; the agent goes on watching logs.
+- **It is plain JSON**, so `zlrd status` is a convenience, not the only way
+  in: `jq . /var/lib/zlrd/state.json` works too.
 
 ### Prometheus scrape config
 
@@ -865,6 +1002,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/zlrd/env
+# `DynamicUser` gets its own /var/lib/zlrd through StateDirectory; without
+# this the agent falls back to $HOME, which such a service does not have.
+StateDirectory=zlrd
+Environment=ZLRD_STATE=/var/lib/zlrd/state.json
 ExecStart=/usr/local/bin/zlrd --agent \
   --listen=127.0.0.1:9100 \
   --metrics-token=${ZLRD_METRICS_TOKEN} \
@@ -873,8 +1014,7 @@ ExecStart=/usr/local/bin/zlrd --agent \
   --alert-first-seen \
   --alert-silence=300s \
   --alert-file=/var/log/zlrd/alerts.jsonl \
-  --alert-webhook=${ZLRD_WEBHOOK_URL} \
-  --webhook-header=Authorization:\ Bearer\ ${ZLRD_WEBHOOK_TOKEN} \
+  --alert-telegram=${ZLRD_TELEGRAM} \
   /var/log/app.log /var/log/gateway.log
 Restart=on-failure
 RestartSec=5s
@@ -895,6 +1035,8 @@ Tips:
   and feed it to both the agent and the scrape config.
 - Send the JSONL alert log to your existing log pipeline; it pairs nicely
   with `zlrd` itself (`zlrd --output json /var/log/zlrd/alerts.jsonl`).
+- `zlrd status` reads `/var/lib/zlrd/state.json` directly, so it answers
+  "what happened overnight" without the unit having to be running.
 
 ---
 
@@ -933,8 +1075,20 @@ Tips:
 | `    --alert-stderr`          |            | Sink: JSON to stderr                                                         |
 | `    --alert-file`            | `<path>`   | Sink: append JSONL                                                           |
 | `    --alert-webhook`         | `<url>`    | Sink: POST JSON — repeatable                                                 |
+| `    --alert-telegram`        | `<t:chat>` | Sink: Telegram bot, `<bot-token>:<chat-id>` — repeatable                      |
+| `    --alert-slack`           | `<url>`    | Sink: Slack incoming webhook — repeatable                                    |
+| `    --alert-discord`         | `<url>`    | Sink: Discord webhook — repeatable                                           |
 | `    --webhook-header`        | `<K: V>`   | Extra header for all webhooks — repeatable                                   |
+| `    --state`                 | `<path>`   | State file that survives restarts — default: XDG state dir                   |
+| `    --no-state`              |            | Keep no state on disk                                                        |
 | `    --alert-exit`            |            | Exit non-zero on first alert                                                 |
+
+### Status
+
+| Command                       | Description                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `zlrd status`                 | What crashed, how often, and when — reads the state file                     |
+| `zlrd --status`               | Same thing, spelled as a flag (so it can follow `--state`)                   |
 
 ### Service / kernel options
 
@@ -976,6 +1130,8 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Crash markers for Rust and the C/C++/glibc abort family
 - [x] `--since 5m` relative time filters
 - [x] Parallel scan across line-aligned chunks
+- [x] Native Telegram / Slack / Discord alert bodies (no templating proxy)
+- [x] Durable agent state and `zlrd status`
 
 Next:
 
