@@ -93,11 +93,27 @@ fn matchAnywhere(pattern: []const u8, text: []const u8) bool {
     if (pattern.len > 0 and pattern[0] == '^') {
         return matchFrom(pattern[1..], text, 0) != null;
     }
+    // A leading `.*` or `.+` already reaches every position the rest of the
+    // pattern could start at — its backtrack walks the whole line — so the
+    // outer loop below would repeat that entire search once per starting
+    // offset. Doing it once instead is what separates linear from quadratic
+    // on the commonest prefix there is.
+    if (leadingDotStar(pattern)) return matchFrom(pattern, text, 0) != null;
+
     var i: usize = 0;
     while (i <= text.len) : (i += 1) {
         if (matchFrom(pattern, text, i) != null) return true;
     }
     return false;
+}
+
+/// True when `pattern` opens with `.*` or `.+`.
+///
+/// `.?` does not qualify: it reaches at most one position past its start, so
+/// a single attempt would miss matches further along.
+fn leadingDotStar(pattern: []const u8) bool {
+    return pattern.len >= 2 and pattern[0] == '.' and
+        (pattern[1] == '*' or pattern[1] == '+');
 }
 
 /// Leftmost match of `pattern` in `text` at or after `from`.
@@ -120,6 +136,14 @@ fn findAnywhere(pattern: []const u8, text: []const u8, from: usize) ?Match {
         const end = matchFrom(pattern[1..], text, 0) orelse return null;
         return .{ .start = 0, .end = end };
     }
+    // Same shortcut as `matchAnywhere`. The leftmost match of a pattern that
+    // opens with `.*` or `.+` starts exactly where the search does, because
+    // the repetition absorbs whatever precedes the rest of the pattern.
+    if (leadingDotStar(pattern)) {
+        const end = matchFrom(pattern, text, from) orelse return null;
+        return .{ .start = from, .end = end };
+    }
+
     var i: usize = from;
     while (i <= text.len) : (i += 1) {
         if (matchFrom(pattern, text, i)) |end| return .{ .start = i, .end = end };
@@ -159,8 +183,32 @@ fn matchFrom(pattern: []const u8, text: []const u8, start: usize) ?usize {
     return tp;
 }
 
+/// True when `atom_pat` consumes exactly one byte whenever it matches.
+///
+/// Every atom does except a group: `.`, a literal, a class, and an escape all
+/// advance by one. A group's width depends on what is inside it, so only it
+/// has to be re-walked to find out where a shorter repetition ends.
+fn isFixedWidthAtom(atom_pat: []const u8) bool {
+    return atom_pat.len > 0 and atom_pat[0] != '(';
+}
+
 /// Greedy repetition of `atom_pat`, then match `rest`. min ∈ {0,1}.
 /// For `?`, max is 1; for `*`/`+`, max is unbounded.
+///
+/// Backtracking gives up one repetition at a time, and the position after
+/// `count` of them used to be recovered by replaying the atom `count` times
+/// from `start`. That made one repetition quadratic in its own length, and
+/// `matchAnywhere` then multiplied it by every starting position: `.*` at the
+/// front of a pattern turned into cubic work in the length of the line.
+///
+/// It measured the way that sounds. `zlrd -s '.*zzz'` against a single 2 KB
+/// line took 4.8 seconds, and `-s 'x.*y'` 4.6 — not adversarial patterns, the
+/// ordinary ones. Under `--alert-regex` the same shape stalls the agent's
+/// watcher thread, which keeps answering `/metrics` while it has stopped
+/// reading logs entirely.
+///
+/// For an atom of fixed width the position after `count` repetitions is just
+/// arithmetic, which is what the replay was recomputing.
 fn matchRepeat(
     atom_pat: []const u8,
     rest: []const u8,
@@ -177,6 +225,8 @@ fn matchRepeat(
         count += 1;
     }
 
+    const fixed_width = isFixedWidthAtom(atom_pat);
+
     // Backtrack from count down to min
     while (true) {
         if (count >= min) {
@@ -184,11 +234,15 @@ fn matchRepeat(
         }
         if (count == 0) return null;
         count -= 1;
-        // Re-scan from start to find position after `count` matches
-        tp = start;
-        var k: usize = 0;
-        while (k < count) : (k += 1) {
-            tp = matchAtom(atom_pat, text, tp) orelse return null;
+        if (fixed_width) {
+            tp = start + count;
+        } else {
+            // A group: replay it to find where `count` repetitions end.
+            tp = start;
+            var k: usize = 0;
+            while (k < count) : (k += 1) {
+                tp = matchAtom(atom_pat, text, tp) orelse return null;
+            }
         }
     }
 }
@@ -471,4 +525,77 @@ test "RegexList: single pattern with alternation" {
 
 test "RegexList.compile cleans up when term limit is exceeded" {
     try testing.expect(RegexList.compile("a&b&c&d&e&f&g&h&i") == null);
+}
+
+test "a repetition backtracks in linear time, not quadratic" {
+    // `.*` followed by something that never matches is the worst case for a
+    // backtracking engine, and the shape most people actually type. Replaying
+    // the atom from the start on every backtrack step made this cubic in the
+    // length of the line: 4.8 seconds for one 2 KB line, measured.
+    var text: [4096]u8 = undefined;
+    @memset(&text, 'x');
+
+    for ([_][]const u8{ ".*zzz", ".+zzz", "x.*y", "x.+y", "[a-z]*zzz" }) |pattern| {
+        var re = Regex.compile(pattern).?;
+        defer re.deinit();
+        try testing.expect(!re.isMatch(&text));
+    }
+}
+
+test "a leading .* still finds every match the slow path would" {
+    // The single-start shortcut is only sound because the repetition's own
+    // backtrack already visits every position; these are the cases that
+    // would expose it if it did not.
+    const cases = [_]struct { pattern: []const u8, text: []const u8, want: bool }{
+        .{ .pattern = ".*abc", .text = "xxxabc", .want = true },
+        .{ .pattern = ".*abc", .text = "abc", .want = true },
+        .{ .pattern = ".*abc", .text = "xxxab", .want = false },
+        .{ .pattern = ".+abc", .text = "xabc", .want = true },
+        // `.+` must consume at least one byte, so a match at offset 0 alone
+        // is not enough.
+        .{ .pattern = ".+abc", .text = "abc", .want = false },
+        .{ .pattern = ".*", .text = "", .want = true },
+        .{ .pattern = ".*x", .text = "", .want = false },
+        .{ .pattern = ".*b.*d", .text = "abcd", .want = true },
+        .{ .pattern = "q|.*abc", .text = "zzabc", .want = true },
+    };
+    for (cases) |c| {
+        var re = Regex.compile(c.pattern).?;
+        defer re.deinit();
+        try testing.expectEqual(c.want, re.isMatch(c.text));
+    }
+}
+
+test "findFrom reports the same span with the shortcut as without" {
+    var re = Regex.compile(".*abc").?;
+    defer re.deinit();
+    const m = re.findFrom("xxabcyy", 0).?;
+    // `.*` is greedy but backtracks to the leftmost overall match, which
+    // starts where the search did and ends after `abc`.
+    try testing.expectEqual(@as(usize, 0), m.start);
+    try testing.expectEqual(@as(usize, 5), m.end);
+
+    try testing.expect(re.findFrom("nope", 0) == null);
+
+    var plus = Regex.compile(".+abc").?;
+    defer plus.deinit();
+    const p = plus.findFrom("xabc", 0).?;
+    try testing.expectEqual(@as(usize, 0), p.start);
+    try testing.expectEqual(@as(usize, 4), p.end);
+}
+
+test "a group repetition still replays correctly when it backtracks" {
+    // A group is the one atom whose width varies, so it keeps the replay
+    // path — these check that path did not rot when the fixed-width one was
+    // split out of it.
+    var re = Regex.compile("(ab)*abc").?;
+    defer re.deinit();
+    try testing.expect(re.isMatch("ababc"));
+    try testing.expect(re.isMatch("abc"));
+    try testing.expect(!re.isMatch("ababab"));
+
+    var alt = Regex.compile("(a|bb)+c").?;
+    defer alt.deinit();
+    try testing.expect(alt.isMatch("abbac"));
+    try testing.expect(!alt.isMatch("abba"));
 }

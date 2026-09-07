@@ -410,6 +410,13 @@ pub fn nextAlphaToken(line: []const u8, from: usize) ?struct { start: usize, end
 ///
 /// The caller decides how to interpret the name; `OK` means success.
 pub fn findGrpcCode(line: []const u8) ?struct { start: usize, end: usize } {
+    // No `=`, no `code = <NAME>`. Worth one clean vectorised pass up front
+    // because of who calls this: every line whose level was not found
+    // structurally, which is dominated by `<timestamp> [LEVEL] message` —
+    // a shape that carries no `=` at all but does carry several `c`s, and
+    // each of those restarts the scan below and pays a comparison.
+    if (findByte(line, 0, '=') == null) return null;
+
     const needle = "code";
     var i: usize = 0;
     // Gated on a vectorised scan for `c` rather than
