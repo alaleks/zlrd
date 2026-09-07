@@ -410,7 +410,7 @@ fn parseErrorMessage(err: anyerror) []const u8 {
 fn agentErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.NoFiles => "agent mode requires at least one file",
-        error.MissingMetricsToken => "agent mode requires --metrics-token <secret>",
+        error.MissingMetricsToken => "--listen needs --metrics-token <secret>",
         error.InvalidListenAddress, error.InvalidAddress, error.InvalidPort => "invalid --listen address",
         error.InvalidThresholdSpec => "invalid threshold spec (expected N/Ws, e.g. 10/60s)",
         error.InvalidDuration => "invalid duration (expected Nms, Ns, Nm, or Nh)",
@@ -429,8 +429,8 @@ fn agentErrorMessage(err: anyerror) []const u8 {
 
 fn agentErrorHint(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.NoFiles => "pass at least one file: zlrd --agent --metrics-token secret app.log",
-        error.MissingMetricsToken => "generate one and export it: --metrics-token=$(openssl rand -hex 16)",
+        error.NoFiles => "pass at least one file: zlrd --agent --service api=app.log app.log",
+        error.MissingMetricsToken => "generate one: --metrics-token=$(openssl rand -hex 16), or drop --listen",
         error.InvalidThresholdSpec => "example: --alert-error-rate 10/60s",
         error.InvalidDuration => "example: --alert-silence 60s  (suffixes: ms, s, m, h)",
         error.InvalidRegexSpec => "example: --alert-regex 'panic:5/30s'",

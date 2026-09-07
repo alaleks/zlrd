@@ -123,13 +123,25 @@ pub fn run(
     }
     defer if (sidecar_storage) |*s| s.stop();
 
-    var srv = try server.Server.listen(allocator, io, &m, .{
-        .listen_addr = cfg.listen_addr,
-        .metrics_token = cfg.metrics_token,
-    });
-    defer srv.deinit();
+    // The metrics endpoint only exists if it was asked for. Everything else
+    // in agent mode runs without it.
+    var srv_storage: ?server.Server = null;
+    defer if (srv_storage) |*s| s.deinit();
+    // Registered before the thread is spawned so the listener is closed and
+    // joined on every exit path, including the `try`s below.
+    var server_thread: ?std.Thread = null;
+    defer if (server_thread) |t| {
+        srv_storage.?.requestShutdown();
+        t.join();
+    };
+    if (cfg.http_enabled) {
+        srv_storage = try server.Server.listen(allocator, io, &m, .{
+            .listen_addr = cfg.listen_addr,
+            .metrics_token = cfg.metrics_token,
+        });
+        log.info("metrics on {s}", .{cfg.listen_addr});
+    }
 
-    log.info("listening on {s}", .{cfg.listen_addr});
     log.info("watching {d} file(s); error_rate={s} regex={d} first_seen={s} silence={s}", .{
         args.files.len,
         if (args.alert_error_rate) |s| s else "off",
@@ -142,16 +154,8 @@ pub fn run(
     defer w.deinit();
     if (store_storage) |*st| w.seedTrackers(st);
 
-    const server_thread = try std.Thread.spawn(.{}, runServer, .{&srv});
-    // Shut the listener down and join before `srv.deinit()` runs. As a
-    // trailing statement this was skipped whenever anything below returned an
-    // error — the journal setup is all `try` — leaving the server thread
-    // running against a destroyed `Server`. `requestShutdown` closes the
-    // listener under a swap-guard, so a pending `accept()` returns at once
-    // and this is safe to call twice.
-    defer {
-        srv.requestShutdown();
-        server_thread.join();
+    if (srv_storage) |*s| {
+        server_thread = try std.Thread.spawn(.{}, runServer, .{s});
     }
 
     var km: ?kernel.Monitor = if (args.kernel_probes)

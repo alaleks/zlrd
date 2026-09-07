@@ -5,9 +5,10 @@
 <h1 align="center">zlrd</h1>
 
 <p align="center">
-  <strong>A fast log viewer and observability sidecar for the terminal.</strong><br/>
-  Stream, filter, watch — then surface what matters as metrics and alerts.<br/>
-  Built in Zig. Single binary. Zero dependencies.
+  <strong>Read your logs fast. Know when a service dies.</strong><br/>
+  A terminal log viewer that doubles as a crash watcher — panics go straight
+  to Telegram or Slack,<br/>and the history stays on the box.<br/>
+  Built in Zig. One static binary. No agent, no database, no stack to run.
 </p>
 
 <p align="center">
@@ -26,22 +27,78 @@
 
 ## Why zlrd
 
-`tail -f | grep | jq` works — until it doesn't. As soon as you need a windowed
-error-rate, a `/metrics` endpoint for Prometheus, or a webhook into Slack, you
-end up gluing five tools together. `zlrd` collapses that pipeline into a single
-static binary:
+If you already run Loki, Datadog or a Prometheus stack, use them — they are
+better at this than a 1.6 MB binary can be.
 
-| You used to run                                              | With `zlrd`                                            |
-| ------------------------------------------------------------ | ------------------------------------------------------ |
-| `tail -F app.log \| grep -i error`                           | `zlrd -tl error app.log`                               |
-| `zcat app.log.gz \| jq 'select(.level=="error")'`            | `zlrd -l error --output json app.log.gz \| jq .`       |
-| `awk '/ERROR/{n++} END{print n}'` over a window              | `zlrd --agent --alert-error-rate=10/60s app.log`       |
-| logrotate watcher + Slack curl + node_exporter textfile      | `zlrd --agent` with `/metrics` + webhook + alert file  |
+`zlrd` is for the other case. One box. A handful of services. No room for an
+observability stack, and no appetite for running one. You still need to know
+that the API died at three in the morning, and why.
 
-It streams files line-by-line in constant memory, auto-detects JSON / bracketed
-plain text / logfmt, filters by level/date/regex, and — in **agent mode** —
-exposes Prometheus metrics, runs alert rules, and ships notifications to
-stderr, files, or HTTP webhooks.
+So it does two things, in one static binary you copy onto the host:
+
+**Reads logs fast.** Streams multi-GB files in constant memory, auto-detects
+JSON / `[LEVEL]` / logfmt, filters by level, regex, date and time window,
+follows like `tail -F`, and reads `.log.gz` without unpacking.
+
+**Watches services.** Recognises a panic from Go, Rust, Python, Java, C/C++
+or a pattern of your own, captures the stack trace that follows it, tells a
+crash from a restart, and sends you the whole thing.
+
+### What that looks like
+
+```bash
+zlrd --agent \
+     --service api=/var/log/api.log \
+     --alert-telegram="$BOT_TOKEN:$CHAT_ID" \
+     /var/log/api.log
+```
+
+That is the whole setup. No scrape target, no Alertmanager, no templating
+proxy, no sidecar container. When the service panics, this lands in your
+chat:
+
+    🔴 api crashed
+    go_panic · /var/log/api.log · pid 4192
+    panic: runtime error: invalid memory address or nil pointer dereference
+
+        goroutine 1 [running]:
+        main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+                /src/api/server.go:142 +0x24
+        main.main()
+                /src/api/main.go:31 +0x88
+
+    crashes: 3 · restarts: 1
+
+And in the morning, without anything having to still be running:
+
+```console
+$ zlrd status
+
+SERVICE  CRASHES  RESTARTS  LAST CRASH
+api            3         1  4h ago   go_panic
+worker         0         2  -
+
+last crash api · 4h ago (2026-09-06 03:12:44 UTC)
+  panic: runtime error: invalid memory address or nil pointer dereference
+  goroutine 1 [running]:
+  main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+      /src/api/server.go:142 +0x24
+```
+
+There *is* a Prometheus endpoint, and it is a good one — but it is
+[opt-in](#optional-prometheus-endpoint) and off until you ask for it, because
+the whole point is that you probably don't have a Prometheus.
+
+### Instead of
+
+| You used to run                                          | With `zlrd`                                                    |
+| -------------------------------------------------------- | -------------------------------------------------------------- |
+| `tail -F app.log \| grep -i error`                       | `zlrd -tl error app.log`                                       |
+| `zcat app.log.gz \| jq 'select(.level=="error")'`        | `zlrd -l error --output json app.log.gz \| jq .`               |
+| `awk '/ERROR/{n++} END{print n}'` over a window          | `zlrd --agent --alert-error-rate=10/60s app.log`               |
+| a cron job grepping for `panic:` + a `curl` into Slack   | `zlrd --agent --service api=app.log --alert-slack=$URL`        |
+| "did it crash last night?" → SSH, `less`, scroll         | `zlrd status`                                                  |
+| Alertmanager + a templating proxy for a chat message     | `--alert-telegram` / `--alert-slack` / `--alert-discord`       |
 
 ---
 
@@ -50,24 +107,23 @@ stderr, files, or HTTP webhooks.
 - [Highlights](#highlights)
 - [Benchmarks](#benchmarks)
 - [Installation](#installation)
-- [Reader mode](#reader-mode)
+- [Reading logs](#reading-logs)
   - [Examples](#reader-examples)
   - [Supported log formats](#supported-log-formats)
   - [Relative windows](#relative-windows)
   - [Aggregation modes](#aggregation-modes)
-- [Agent mode](#agent-mode)
+- [Watching services](#watching-services)
   - [Quick start](#agent-quick-start)
   - [How it fits together](#how-it-fits-together)
-  - [HTTP API](#http-api)
+  - [Service crash tracking](#service-crash-tracking)
+  - [Chat alerts: Telegram, Slack, Discord](#chat-alerts-telegram-slack-discord)
+  - [State that survives a restart](#state-that-survives-a-restart)
   - [Alert rules](#alert-rules)
   - [Alert sinks](#alert-sinks)
-  - [Chat alerts: Telegram, Slack, Discord](#chat-alerts-telegram-slack-discord)
-  - [Service crash tracking](#service-crash-tracking)
   - [systemd journal sources](#systemd-journal-sources)
   - [Kernel-level probes](#kernel-level-probes)
   - [Webhook integration](#webhook-integration)
-  - [State that survives a restart](#state-that-survives-a-restart)
-  - [Prometheus scrape config](#prometheus-scrape-config)
+  - [Optional: Prometheus endpoint](#optional-prometheus-endpoint)
   - [Production deployment](#production-deployment)
 - [CLI reference](#cli-reference)
 - [Roadmap](#roadmap)
@@ -80,26 +136,44 @@ stderr, files, or HTTP webhooks.
 
 ## Highlights
 
-- **Streaming reader** — line-by-line, constant memory, multi-GB files
+**Reader**
+
+- **Streaming** — line-by-line, constant memory, multi-GB files
 - **SIMD-accelerated** parsing of JSON / `[LEVEL]` / `level=` logfmt
-- **Filtering** — by level, date range, time-of-day window, regex (with `|` / `&`)
-- **Tail mode** — drop-in replacement for `tail -F`
+- **Filtering** — level, date range, time-of-day window, regex (`|` and `&`),
+  and `--since 5m` relative to the log's own newest record
+- **Tail mode** — a drop-in `tail -F` that keeps the filtering
 - **Aggregation** — group identical, normalized, or message-keyed lines
-- **JSONL output** for clean piping into `jq` and friends
+- **Nested payloads** — JSON *and* protobuf inside a log message, expanded
+  and highlighted in place
+- **Parallel scan** — seekable files split at line boundaries across cores,
+  output byte-identical to the serial path
 - **Compressed input** — read `.log.gz` directly, no temp files
-- **Agent mode** — background watcher with:
-  - `/metrics` (Prometheus text + JSON snapshot)
-  - error-rate, regex-rate, first-seen and silence alert rules
-  - **per-service crash tracking** with stack-trace capture (Go / Python / Java / custom)
-  - **stop vs. restart** detection via file inode change and silence windows
-  - **systemd-journal** sources (`--journal-unit`) with wildcards
-  - **kernel-level probes** (`--kernel-probes`) — OOM, segfault, prior-boot panic; eBPF when `-Dwith-ebpf=true`
-  - stderr / JSONL file / HTTP webhook sinks
-  - **native Telegram, Slack and Discord messages** — no templating proxy
-  - **state that survives a restart**, and `zlrd status` to read it
-- **Parallel scan** — seekable files are split at line boundaries across
-  cores, output byte-identical to the serial path
+- **JSONL output** for clean piping into `jq`
+
+**Watcher** (`--agent`)
+
+- **Crash tracking per service** — Go, Rust, Python, Java, C/C++, shell, or
+  your own `--crash-marker`, with the stack trace captured whole
+- **Stop vs. restart** — told apart by inode change and silence windows, no
+  PID guessing
+- **Alerts into chat** — native Telegram, Slack and Discord bodies, no
+  templating proxy in between
+- **State that survives a restart** — counters, last crash and its trace,
+  read back with `zlrd status`
+- **Alert rules** — error-rate, regex-rate, first-seen signature, silence
+- **systemd-journal sources** (`--journal-unit`), read natively — no
+  `journalctl` subprocess
+- **Kernel-level probes** — OOM, segfault, prior-boot panic; eBPF when built
+  with `-Dwith-ebpf=true`
+- **Prometheus `/metrics`** if you already have a scraper — opt-in, off by
+  default
+
+**Everywhere**
+
 - **Single static binary** — no runtime, no glibc, no surprises
+- **Zero third-party dependencies** — regex engine, gzip, HTTP server,
+  protobuf and journal readers are all in-tree Zig
 
 ---
 
@@ -290,7 +364,7 @@ sudo install zig-out/bin/zlrd-lite /usr/local/bin/
 
 ---
 
-## Reader mode
+## Reading logs
 
 The default mode: read, filter, paginate, follow.
 
@@ -397,114 +471,346 @@ on, `--since` does nothing rather than guessing.
 
 ---
 
-## Agent mode
+## Watching services
 
-Agent mode turns `zlrd` into a long-running watcher that you point at one or
-more log files. It exposes a Prometheus-compatible `/metrics` endpoint,
-evaluates alert rules over a sliding window, and fans alerts out to the sinks
-you enable. **Everything is implemented natively in Zig — no Prometheus client
-library, no HTTP framework, no third-party deps.**
+Point `zlrd --agent` at the log files your services write. It follows them
+the way `tail -F` does, and on top of that it knows what a crash looks like:
+it recognises panics and aborts from the common runtimes, captures the stack
+trace underneath them, tells a crash apart from a routine restart, and sends
+the result somewhere you will actually see it.
+
+Everything below is implemented natively in Zig — no Prometheus client
+library, no HTTP framework, no third-party deps — and nothing here needs a
+collector, a database or a second process.
 
 ### Agent quick start
 
-A minimal production-shaped invocation:
+The smallest thing worth running:
 
 ```bash
 zlrd --agent \
-     --metrics-token=$(openssl rand -hex 16) \
-     --listen=127.0.0.1:9100 \
-     --alert-error-rate=10/60s \
-     --alert-stderr \
-     /var/log/app.log
+     --service api=/var/log/api.log \
+     --alert-telegram="$BOT_TOKEN:$CHAT_ID" \
+     /var/log/api.log
 ```
 
-What this does, step by step:
+Step by step, that:
 
-1. Starts an HTTP server on `127.0.0.1:9100`.
-2. Requires `Authorization: Bearer <token>` on `/metrics` and `/metrics.json`.
-3. Tails `/var/log/app.log` from its current end (matches `tail -F`).
-4. Increments per-level counters for every observed line.
-5. Fires an alert when more than 10 `error|fatal|panic` lines occur in any
-   60-second window. The alert is printed to stderr as a single-line JSON
-   document.
+1. Follows `/var/log/api.log` from its current end.
+2. Binds the name `api` to it, so events are about a *service* rather than
+   about a path.
+3. Watches every line for a crash marker — `panic:`, `fatal error:`,
+   `Traceback (most recent call last):`, `thread '...' panicked at`, and the
+   rest of the [built-in set](#what-counts-as-a-crash).
+4. On a hit, collects the stack trace that follows and sends one message to
+   your chat.
+5. Writes what happened to the [state file](#state-that-survives-a-restart),
+   so `zlrd status` can answer for it later.
 
-Scrape it:
+No port is opened and no token is needed. Add `--alert-stderr` if you would
+rather it went to the journal, or `--alert-file=/var/log/zlrd/alerts.jsonl`
+for a JSONL record on disk.
 
-```bash
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9100/metrics | head
-```
-
-A richer invocation that uses all the optional features at once:
+Once that is in place, the rules are additive:
 
 ```bash
 zlrd --agent \
-     --metrics-token=$(openssl rand -hex 16) \
-     --listen=127.0.0.1:9100 \
+     --service api=/var/log/api.log \
+     --service gw=/var/log/gateway.log \
+     --alert-slack="$SLACK_WEBHOOK" \
      --alert-error-rate=10/60s \
-     --alert-regex='panic:1/30s' \
+     --alert-regex='connection refused:5/60s' \
      --alert-first-seen \
      --alert-silence=120s \
      --alert-file=/var/log/zlrd/alerts.jsonl \
-     --alert-webhook=https://alerts.internal/zlrd/ingest \
-     --webhook-header='Authorization: Bearer wh-secret' \
-     --service=api=/var/log/api.log \
-     --crash-marker='runtime error:' \
-     --journal-unit=workers='myapp@*.service' \
-     --kernel-probes \
+     --state=/var/lib/zlrd/state.json \
      /var/log/api.log /var/log/gateway.log
+```
+
+And if you *do* run Prometheus, one flag adds the endpoint — see
+[Optional: Prometheus endpoint](#optional-prometheus-endpoint):
+
+```bash
+zlrd --agent ... --metrics-token=$(openssl rand -hex 16)
 ```
 
 ### How it fits together
 
 ```
-                  ┌────────────────────────────────────────────┐
-                  │                 zlrd --agent               │
-                  │                                            │
-   log file ───▶  │   watcher    ──▶   rules    ──▶  alert     │  ──▶ stderr
-   (tail loop)    │  (per-line)        engine       dispatcher │  ──▶ JSONL file
-                  │      │                                     │  ──▶ webhook(s)
-                  │      ▼                                     │
-                  │   atomic counters (lines / bytes / etc.)   │
-                  │      │                                     │
-                  │      ▼                                     │
-                  │   HTTP server  (/metrics, /metrics.json,   │  ──▶ Prometheus
-                  │                 /healthz)                  │      Grafana, etc.
-                  └────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────┐
+                 │                 zlrd --agent                 │
+                 │                                              │      ──▶ Telegram
+  log file  ──▶  │  watcher  ──▶  crash detector  ──▶           │      ──▶ Slack
+  journal   ──▶  │ (per-line)     + rule engine       alert     │  ──▶ ──▶ Discord
+  kernel    ──▶  │                                  dispatcher  │      ──▶ stderr
+                 │                     │                        │      ──▶ JSONL file
+                 │                     ▼                        │      ──▶ webhook
+                 │              state file  ──▶  zlrd status    │
+                 │                                              │
+                 │  ‥‥‥‥‥‥‥‥‥‥ optional ‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥  │
+                 │  atomic counters ──▶ HTTP server (/metrics)  │  ──▶ Prometheus
+                 └──────────────────────────────────────────────┘
 ```
 
-The watcher runs on the main thread; the HTTP server runs on a dedicated OS
-thread. State shared between them is either atomic (counters) or protected by
-an `Io.Mutex` (rule state, alert file fd).
+The watcher runs on the main thread. Journal sources, the kernel monitor, the
+webhook sender, the state saver and the HTTP server each get their own thread.
+State shared between them is either atomic (counters) or behind an `Io.Mutex`
+(rule state, alert file, state file). The dotted half is off unless
+`--metrics-token` or `--listen` asks for it.
 
-### HTTP API
+### Service crash tracking
 
-| Method | Path             | Auth   | Returns                                                  |
-| ------ | ---------------- | ------ | -------------------------------------------------------- |
-| GET    | `/metrics`       | Bearer | Prometheus text exposition (`text/plain; version=0.0.4`) |
-| GET    | `/metrics.json`  | Bearer | JSON snapshot of all counters                            |
-| GET    | `/healthz`       | none   | `ok` (200)                                               |
+`zlrd` can monitor named services for **abnormal termination** — panics,
+fatals, unhandled exceptions — and surface them with a captured **stack
+trace** and a tally of how often a given service has died and restarted.
 
-Auth is enforced with a **constant-time comparison** against the configured
-token. Any non-matching token returns `401 Unauthorized` without leaking
-timing information. Requests without an `Authorization: Bearer ...` header
-also receive `401`.
+Bind a service to a log file path:
 
-Exposed metrics:
+```bash
+zlrd --agent \
+     --service=api=/var/log/api.log \
+     --service=worker=/var/log/worker.log \
+     /var/log/api.log /var/log/worker.log
+```
 
-| Name                          | Type    | Labels                | Description                                |
-| ----------------------------- | ------- | --------------------- | ------------------------------------------ |
-| `zlrd_up`                     | gauge   | —                     | Always `1` while the process is healthy    |
-| `zlrd_uptime_seconds`         | gauge   | —                     | Seconds since the agent started            |
-| `zlrd_files_watched`          | gauge   | —                     | Number of files currently followed         |
-| `zlrd_lines_total`            | counter | `level`               | Lines observed, bucketed by detected level |
-| `zlrd_bytes_total`            | counter | —                     | Total bytes of log content read            |
-| `zlrd_alerts_fired_total`     | counter | `rule`                | Alerts emitted, by rule kind               |
-| `zlrd_http_requests_total`    | counter | `route`, `code`       | Metrics endpoint hits                      |
-| `zlrd_file_rotation_total`    | counter | —                     | File truncations / rotations detected      |
+#### What counts as a crash
 
-`level` label values: `trace`, `debug`, `info`, `warn`, `error`, `fatal`,
-`panic`, `unknown`. `rule` values: `error_rate`, `regex`, `first_seen`,
-`silence`.
+A crash fires when a log line matches any of the built-in markers below.
+You can also add custom regex patterns with `--crash-marker '<regex>'`
+(repeatable; extends the built-in set):
+
+| Language / shape  | Marker pattern                                |
+| ----------------- | --------------------------------------------- |
+| Go — panic        | `panic: `                                     |
+| Go — runtime throw | `fatal error: `, `runtime: out of memory`, `[signal SIG…]` |
+| Rust              | `thread '…' panicked at ` (both the current and pre-1.72 spellings) |
+| Python            | `Traceback (most recent call last):`          |
+| Java / Kotlin     | `Exception in thread `                        |
+| C / C++ / glibc   | `terminate called `, `*** stack smashing detected ***`, `double free or corruption`, `free(): invalid pointer`, `malloc(): corrupted top size` |
+| Reaped by the shell | `Segmentation fault (core dumped)`, `Aborted (core dumped)` |
+| JSON / logfmt     | detected `level=fatal` or `level=panic`       |
+| User-defined      | `--crash-marker '<regex>'`                    |
+
+A marker only counts when it **starts the line**, or starts the message part
+of a captured line whose envelope ends in `:`, `]` or `|` — so
+`unit[7]: panic: boom` is a crash and `GET /api/panic: status`,
+`no panic: all good` and `"panic: 0 restarts: 0"` are not. A line that carries
+its own level below `error` is never a crash either, however runtime-looking
+its text: `{"level":"info","msg":"recovered from panic: …"}` came out of a
+logger, not out of a dying process. Custom `--crash-marker` patterns are
+exempt from that last rule — you asked for them explicitly.
+
+#### Stack-trace capture
+
+After a marker is detected, `zlrd` keeps reading subsequent lines and appends
+them to the trace until the continuation heuristic breaks (next "normal" log
+entry, blank line, byte/line cap). Captured into a fixed 4 KiB / 32-line
+buffer per service — **zero per-line heap activity**.
+
+Heuristic for "trace continuation":
+- starts with a tab or two+ spaces (Java / Python indent)
+- starts with `goroutine ` / `[signal ` (Go)
+- starts with `Caused by:` (Java)
+- starts with `0x` (raw backtrace)
+- starts with `note: ` / `stack backtrace:` (Rust)
+
+**Go gets a grammar of its own**, because Go is the runtime that doesn't
+indent. A real dump alternates a flush-left symbol with a tab-indented file
+position, and puts blank lines between goroutine blocks:
+
+```
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x10a2f]
+
+goroutine 1 [running]:
+main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+	/src/api/server.go:142 +0x24
+main.main()
+	/src/api/main.go:31 +0x88
+```
+
+Read through the indentation rule alone, that trace ends at the blank line
+and the alert carries the signal and none of the frames. So once `[signal `
+or `goroutine ` has gone past — a trace already in progress, where an
+ordinary log line cannot appear — two more rules apply:
+
+- a blank line is a separator, stepped over rather than stored;
+- a flush-left **Go frame** is a continuation: the text before the first `(`
+  is a dotted path with no whitespace and the line ends on `)`, plus
+  `created by ...` for goroutine attribution.
+
+That second rule is narrow on purpose. `INFO handled request (took 3ms)` also
+ends in a parenthesis, but everything before its `(` is prose full of spaces,
+so it terminates the trace like any other log line.
+
+#### Stop vs. restart
+
+`zlrd` distinguishes service termination from process recycling using
+**file-level signals only** (no PID guessing, no kernel hooks needed):
+
+- **`service_restart`** — the file's **inode changed** under the path
+  (logrotate, `mv old new`, `rm + recreate`, container restart writing to
+  a new log file). Resets the tracker's in-flight crash collection.
+- **`service_stop`** — after a crash event, the log goes silent for the
+  configured stop window (30 s default). Indicates the process died and
+  was not respawned.
+- **`service_crash`** — a marker matched. Includes stack trace and PID
+  if discoverable from the trigger line.
+
+#### Alert payload (service events)
+
+```json
+{
+  "ts_ms": 1781552666549,
+  "kind": "service_crash",
+  "service": "api",
+  "file": "/var/log/api.log",
+  "marker": "go_panic",
+  "pid": 1234,
+  "crash_count": 1,
+  "restart_count": 0,
+  "detail": "panic: nil pointer dereference",
+  "stack_trace": "goroutine 1 [running]:\n\tmain.crash(0x0)\n\t\t/app/main.go:42\n\tmain.main()\n"
+}
+```
+
+| Field           | Notes                                                                          |
+| --------------- | ------------------------------------------------------------------------------ |
+| `kind`          | `service_crash` · `service_stop` · `service_restart`                           |
+| `marker`        | `go_panic` · `go_fatal` · `rust_panic` · `python_traceback` · `java_exception` · `native_abort` · `fatal_level` · `panic_level` · `custom_regex` · `systemd_signal` |
+| `pid`           | Parsed from `"pid":N`, `pid=N`, or `[N]:` if present in the trigger line       |
+| `crash_count`   | Cumulative crashes seen for this service since agent start                     |
+| `restart_count` | Cumulative restarts (inode changes) seen for this service                      |
+| `stack_trace`   | Captured continuation lines (omitted for `stop` / `restart`)                   |
+
+### Chat alerts: Telegram, Slack, Discord
+
+These three take a message, not a document. Pointing `--alert-webhook` at a
+Slack URL gets a `400` back, because what Slack wants is `{"text": ...}` and
+what it received was the alert payload — which is why the usual answer is a
+small templating proxy in front of the webhook.
+
+zlrd renders the three bodies itself instead. Same alert, same rules, same
+everything else; only the shape of the POST differs, and there is nothing new
+to deploy or keep running:
+
+```bash
+# Telegram: the bot token, then the chat id, separated by a colon.
+# Group and channel ids are negative; a public channel can be @name.
+zlrd --agent \
+     --service api=/var/log/api.log \
+     --alert-telegram="$BOT_TOKEN:$CHAT_ID" \
+     /var/log/api.log
+
+# Slack and Discord take the incoming-webhook URL as printed by the app.
+zlrd --agent \
+     --alert-slack="https://hooks.slack.com/services/T00/B00/xxxx" \
+     --alert-discord="https://discord.com/api/webhooks/123/xxxx" \
+     app.log
+```
+
+A crash arrives looking like this — headline, where it came from, the first
+line of the panic, then the trace in a code block:
+
+    🔴 api crashed
+    go_panic · /var/log/api.log · pid 4192
+    panic: runtime error: invalid memory address or nil pointer dereference
+
+        goroutine 1 [running]:
+        main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+                /src/api/server.go:142 +0x24
+
+    crashes: 3 · restarts: 1
+
+Details worth knowing:
+
+- **The colour is the level colour.** A Discord embed is tinted with the same
+  red, amber, blue and green the reader paints levels with, so an alert in a
+  channel matches the line that produced it in the terminal.
+- **Long traces are cut, not dropped.** Each service caps a message
+  (Telegram 4096 characters, Slack 3000 per block, Discord 2000). The
+  headline, source and first line always survive; the trace is trimmed with a
+  `…` where it stops.
+- **Log text can't break the formatting.** A line containing `<b>`, `*bold*`
+  or a stray backtick is escaped for the channel it is going to before it is
+  escaped for JSON, so a hostile log line renders as text.
+- **Telegram needs both halves.** `--alert-telegram` splits on the *last*
+  colon because a bot token contains one of its own. A chat id is all digits
+  (negative for groups) or `@channelusername`; anything else is rejected at
+  startup rather than POSTing into the void for the life of the process.
+- **`--webhook-header` applies to all of them**, so leave it off unless a
+  proxy in between needs it — none of the three services do.
+
+The raw `--alert-webhook` sink is unchanged and still sends the documented
+payload, so a chat channel and a collector can run side by side.
+
+### State that survives a restart
+
+The agent keeps a small file with what it has to remember between runs:
+per-service crash and restart counts, the most recent crash with its trace,
+a ring of recent events, and the first-seen signature set.
+
+Without it, restarting the agent — which is what happens when the box it
+watches reboots — loses two things quietly. The counters go back to zero, so
+"crashes: 1" in an alert describes the current process rather than the
+service. And the first-seen set empties, so every error it had already
+reported announces itself as new all over again.
+
+`zlrd status` reads that file. It is the answer to "something broke
+overnight, what was it", and it needs nothing running:
+
+```console
+$ zlrd status
+state /var/lib/zlrd/state.json
+
+SERVICE  CRASHES  RESTARTS  LAST CRASH
+api            3         1  4h ago   go_panic
+worker         0         2  -
+
+last crash api · 4h ago (2026-09-06 03:12:44 UTC)
+  panic: runtime error: invalid memory address or nil pointer dereference
+  goroutine 1 [running]:
+  main.(*Server).handle(0x0, {0x14000112000, 0x1f})
+      /src/api/server.go:142 +0x24
+
+recent
+  4h ago     service_crash   api      panic: runtime error: invalid memory...
+  6h ago     error_rate      app.log  ERROR upstream timed out
+```
+
+Times are shown twice on purpose: "4h ago" is the question actually being
+asked and needs no time zone to be true, and the absolute stamp beside it is
+UTC, labelled, so it can be matched against a log line without guessing whose
+clock it came from.
+
+Where the file lives, in order:
+
+| Source                       | Path                                     |
+| ---------------------------- | ---------------------------------------- |
+| `--state <path>`             | exactly that                             |
+| `$ZLRD_STATE`                | exactly that                             |
+| `$XDG_STATE_HOME`            | `$XDG_STATE_HOME/zlrd/state.json`        |
+| `$HOME`                      | `~/.local/state/zlrd/state.json`         |
+| Windows                      | `%LOCALAPPDATA%\zlrd\state.json`         |
+
+Under systemd, `StateDirectory=zlrd` plus `Environment=ZLRD_STATE=/var/lib/zlrd/state.json`
+puts it somewhere a `DynamicUser=` service can write. `--no-state` turns the
+file off entirely.
+
+Notes:
+
+- **Crashes are written through immediately**; everything else is coalesced
+  and flushed a couple of times a second, because a busy rule fires far more
+  often than a state file deserves to be rewritten.
+- **Writes are atomic** — an unnamed file renamed over the target — so a
+  crash mid-write leaves the previous state readable rather than a truncated
+  document.
+- **It is bounded**: 64 recent events, 64 services, 4096 signatures, a 4 KiB
+  trace. It is a state file, not a second log.
+- **It never blocks the watcher.** A corrupt or unwritable file is reported
+  once and then ignored; the agent goes on watching logs.
+- **It is plain JSON**, so `zlrd status` is a convenience, not the only way
+  in: `jq . /var/lib/zlrd/state.json` works too.
 
 ### Alert rules
 
@@ -606,163 +912,6 @@ never silently swallowed.
 | `observed_count` | How many events were in the window when the rule latched              |
 | `line`           | The triggering log line (omitted for `silence`)                        |
 
-### Chat alerts: Telegram, Slack, Discord
-
-These three take a message, not a document. Pointing `--alert-webhook` at a
-Slack URL gets a `400` back, because what Slack wants is `{"text": ...}` and
-what it received was the alert payload — which is why the usual answer is a
-small templating proxy in front of the webhook.
-
-zlrd renders the three bodies itself instead. Same alert, same rules, same
-everything else; only the shape of the POST differs, and there is nothing new
-to deploy or keep running:
-
-```bash
-# Telegram: the bot token, then the chat id, separated by a colon.
-# Group and channel ids are negative; a public channel can be @name.
-zlrd --agent --metrics-token=$TOKEN \
-     --service api=/var/log/api.log \
-     --alert-telegram="$BOT_TOKEN:$CHAT_ID" \
-     /var/log/api.log
-
-# Slack and Discord take the incoming-webhook URL as printed by the app.
-zlrd --agent --metrics-token=$TOKEN \
-     --alert-slack="https://hooks.slack.com/services/T00/B00/xxxx" \
-     --alert-discord="https://discord.com/api/webhooks/123/xxxx" \
-     app.log
-```
-
-A crash arrives looking like this — headline, where it came from, the first
-line of the panic, then the trace in a code block:
-
-    🔴 api crashed
-    go_panic · /var/log/api.log · pid 4192
-    panic: runtime error: invalid memory address or nil pointer dereference
-
-        goroutine 1 [running]:
-        main.(*Server).handle(0x0, {0x14000112000, 0x1f})
-                /src/api/server.go:142 +0x24
-
-    crashes: 3 · restarts: 1
-
-Details worth knowing:
-
-- **The colour is the level colour.** A Discord embed is tinted with the same
-  red, amber, blue and green the reader paints levels with, so an alert in a
-  channel matches the line that produced it in the terminal.
-- **Long traces are cut, not dropped.** Each service caps a message
-  (Telegram 4096 characters, Slack 3000 per block, Discord 2000). The
-  headline, source and first line always survive; the trace is trimmed with a
-  `…` where it stops.
-- **Log text can't break the formatting.** A line containing `<b>`, `*bold*`
-  or a stray backtick is escaped for the channel it is going to before it is
-  escaped for JSON, so a hostile log line renders as text.
-- **Telegram needs both halves.** `--alert-telegram` splits on the *last*
-  colon because a bot token contains one of its own. A chat id is all digits
-  (negative for groups) or `@channelusername`; anything else is rejected at
-  startup rather than POSTing into the void for the life of the process.
-- **`--webhook-header` applies to all of them**, so leave it off unless a
-  proxy in between needs it — none of the three services do.
-
-The raw `--alert-webhook` sink is unchanged and still sends the documented
-payload, so a chat channel and a collector can run side by side.
-
-### Service crash tracking
-
-`zlrd` can monitor named services for **abnormal termination** — panics,
-fatals, unhandled exceptions — and surface them with a captured **stack
-trace** and a tally of how often a given service has died and restarted.
-
-Bind a service to a log file path:
-
-```bash
-zlrd --agent --metrics-token=$TOKEN \
-     --service=api=/var/log/api.log \
-     --service=worker=/var/log/worker.log \
-     /var/log/api.log /var/log/worker.log
-```
-
-#### What counts as a crash
-
-A crash fires when a log line matches any of the built-in markers below.
-You can also add custom regex patterns with `--crash-marker '<regex>'`
-(repeatable; extends the built-in set):
-
-| Language / shape  | Marker pattern                                |
-| ----------------- | --------------------------------------------- |
-| Go — panic        | `panic: `                                     |
-| Go — runtime throw | `fatal error: `, `runtime: out of memory`, `[signal SIG…]` |
-| Rust              | `thread '…' panicked at ` (both the current and pre-1.72 spellings) |
-| Python            | `Traceback (most recent call last):`          |
-| Java / Kotlin     | `Exception in thread `                        |
-| C / C++ / glibc   | `terminate called `, `*** stack smashing detected ***`, `double free or corruption`, `free(): invalid pointer`, `malloc(): corrupted top size` |
-| Reaped by the shell | `Segmentation fault (core dumped)`, `Aborted (core dumped)` |
-| JSON / logfmt     | detected `level=fatal` or `level=panic`       |
-| User-defined      | `--crash-marker '<regex>'`                    |
-
-A marker only counts when it **starts the line**, or starts the message part
-of a captured line whose envelope ends in `:`, `]` or `|` — so
-`unit[7]: panic: boom` is a crash and `GET /api/panic: status`,
-`no panic: all good` and `"panic: 0 restarts: 0"` are not. A line that carries
-its own level below `error` is never a crash either, however runtime-looking
-its text: `{"level":"info","msg":"recovered from panic: …"}` came out of a
-logger, not out of a dying process. Custom `--crash-marker` patterns are
-exempt from that last rule — you asked for them explicitly.
-
-#### Stack-trace capture
-
-After a marker is detected, `zlrd` keeps reading subsequent lines and appends
-them to the trace until the continuation heuristic breaks (next "normal" log
-entry, blank line, byte/line cap). Captured into a fixed 4 KiB / 32-line
-buffer per service — **zero per-line heap activity**.
-
-Heuristic for "trace continuation":
-- starts with a tab or two+ spaces (Java / Python / Go indent)
-- starts with `goroutine ` / `[signal ` (Go)
-- starts with `Caused by:` (Java)
-- starts with `0x` (raw backtrace)
-- one leading blank line is tolerated (Go's `panic:` → blank → `goroutine`)
-
-#### Stop vs. restart
-
-`zlrd` distinguishes service termination from process recycling using
-**file-level signals only** (no PID guessing, no kernel hooks needed):
-
-- **`service_restart`** — the file's **inode changed** under the path
-  (logrotate, `mv old new`, `rm + recreate`, container restart writing to
-  a new log file). Resets the tracker's in-flight crash collection.
-- **`service_stop`** — after a crash event, the log goes silent for the
-  configured stop window (30 s default). Indicates the process died and
-  was not respawned.
-- **`service_crash`** — a marker matched. Includes stack trace and PID
-  if discoverable from the trigger line.
-
-#### Alert payload (service events)
-
-```json
-{
-  "ts_ms": 1781552666549,
-  "kind": "service_crash",
-  "service": "api",
-  "file": "/var/log/api.log",
-  "marker": "go_panic",
-  "pid": 1234,
-  "crash_count": 1,
-  "restart_count": 0,
-  "detail": "panic: nil pointer dereference",
-  "stack_trace": "goroutine 1 [running]:\n\tmain.crash(0x0)\n\t\t/app/main.go:42\n\tmain.main()\n"
-}
-```
-
-| Field           | Notes                                                                          |
-| --------------- | ------------------------------------------------------------------------------ |
-| `kind`          | `service_crash` · `service_stop` · `service_restart`                           |
-| `marker`        | `go_panic` · `go_fatal` · `rust_panic` · `python_traceback` · `java_exception` · `native_abort` · `fatal_level` · `panic_level` · `custom_regex` · `systemd_signal` |
-| `pid`           | Parsed from `"pid":N`, `pid=N`, or `[N]:` if present in the trigger line       |
-| `crash_count`   | Cumulative crashes seen for this service since agent start                     |
-| `restart_count` | Cumulative restarts (inode changes) seen for this service                      |
-| `stack_trace`   | Captured continuation lines (omitted for `stop` / `restart`)                   |
-
 ### systemd journal sources
 
 On modern Linux, most services no longer write to flat log files — their
@@ -770,7 +919,7 @@ stdout/stderr is captured by **journald**. Point `zlrd` at a unit (or a
 glob) and it streams the journal directly:
 
 ```bash
-zlrd --agent --metrics-token=$TOKEN \
+zlrd --agent \
      --journal-unit=api='myapp.service' \
      --journal-unit=workers='myapp@*.service'
 ```
@@ -827,16 +976,16 @@ Three backends layered for accuracy vs. portability:
 
 ```bash
 # Stock build (kmsg + pstore)
-zlrd --agent --metrics-token=$TOKEN --kernel-probes /var/log/app.log
+zlrd --agent --kernel-probes /var/log/app.log
 
 # With eBPF backend compiled in
 zig build -Doptimize=ReleaseFast -Dwith-ebpf=true
 sudo setcap cap_bpf,cap_perfmon,cap_syslog+ep ./zig-out/bin/zlrd
-zlrd --agent --metrics-token=$TOKEN --kernel-probes /var/log/app.log
+zlrd --agent --kernel-probes /var/log/app.log
 ```
 
-Kernel events flow through the same alert sinks (stderr / file / webhook)
-as everything else, with a distinct payload kind:
+Kernel events flow through the same alert sinks (chat / stderr / file /
+webhook) as everything else, with a distinct payload kind:
 
 ```json
 {
@@ -870,7 +1019,7 @@ For systems that accept arbitrary JSON, the default `Content-Type` works
 and auth attaches via `--webhook-header`:
 
 ```bash
-zlrd --agent --metrics-token=$TOKEN \
+zlrd --agent \
      --alert-error-rate=10/60s \
      --alert-regex='panic:1/30s' \
      --alert-webhook="https://alerts.internal/zlrd/ingest" \
@@ -891,75 +1040,42 @@ Passing one of their URLs to `--alert-webhook` anyway is caught at startup
 with a line naming the flag you probably wanted, because the alternative is a
 `400` visible only in the agent's own log.
 
-### State that survives a restart
+### Optional: Prometheus endpoint
 
-The agent keeps a small file with what it has to remember between runs:
-per-service crash and restart counts, the most recent crash with its trace,
-a ring of recent events, and the first-seen signature set.
+Everything above works with no HTTP server at all. If you already run a
+scraper, `--metrics-token <secret>` turns one on; `--listen <addr>` moves it
+off the default `127.0.0.1:9100`. Without either flag no port is opened, and
+`--listen` on its own is refused rather than exposing an unauthenticated
+endpoint.
 
-Without it, restarting the agent — which is what happens when the box it
-watches reboots — loses two things quietly. The counters go back to zero, so
-"crashes: 1" in an alert describes the current process rather than the
-service. And the first-seen set empties, so every error it had already
-reported announces itself as new all over again.
+| Method | Path             | Auth   | Returns                                                  |
+| ------ | ---------------- | ------ | -------------------------------------------------------- |
+| GET    | `/metrics`       | Bearer | Prometheus text exposition (`text/plain; version=0.0.4`) |
+| GET    | `/metrics.json`  | Bearer | JSON snapshot of all counters                            |
+| GET    | `/healthz`       | none   | `ok` (200)                                               |
 
-`zlrd status` reads that file. It is the answer to "something broke
-overnight, what was it", and it needs nothing running:
+Auth is enforced with a **constant-time comparison** against the configured
+token. Any non-matching token returns `401 Unauthorized` without leaking
+timing information. Requests without an `Authorization: Bearer ...` header
+also receive `401`.
 
-```console
-$ zlrd status
-state /var/lib/zlrd/state.json
+Exposed metrics:
 
-SERVICE  CRASHES  RESTARTS  LAST CRASH
-api            3         1  4h ago   go_panic
-worker         0         2  -
+| Name                          | Type    | Labels                | Description                                |
+| ----------------------------- | ------- | --------------------- | ------------------------------------------ |
+| `zlrd_up`                     | gauge   | —                     | Always `1` while the process is healthy    |
+| `zlrd_uptime_seconds`         | gauge   | —                     | Seconds since the agent started            |
+| `zlrd_files_watched`          | gauge   | —                     | Number of files currently followed         |
+| `zlrd_lines_total`            | counter | `level`               | Lines observed, bucketed by detected level |
+| `zlrd_bytes_total`            | counter | —                     | Total bytes of log content read            |
+| `zlrd_alerts_fired_total`     | counter | `rule`                | Alerts emitted, by rule kind               |
+| `zlrd_http_requests_total`    | counter | `route`, `code`       | Metrics endpoint hits                      |
+| `zlrd_file_rotation_total`    | counter | —                     | File truncations / rotations detected      |
 
-last crash api · 4h ago (2026-09-06 03:12:44 UTC)
-  panic: runtime error: invalid memory address or nil pointer dereference
-  goroutine 1 [running]:
-  main.(*Server).handle(0x0, {0x14000112000, 0x1f})
-      /src/api/server.go:142 +0x24
+`level` label values: `trace`, `debug`, `info`, `warn`, `error`, `fatal`,
+`panic`, `unknown`. `rule` values: `error_rate`, `regex`, `first_seen`,
+`silence`.
 
-recent
-  4h ago     service_crash   api      panic: runtime error: invalid memory...
-  6h ago     error_rate      app.log  ERROR upstream timed out
-```
-
-Times are shown twice on purpose: "4h ago" is the question actually being
-asked and needs no time zone to be true, and the absolute stamp beside it is
-UTC, labelled, so it can be matched against a log line without guessing whose
-clock it came from.
-
-Where the file lives, in order:
-
-| Source                       | Path                                     |
-| ---------------------------- | ---------------------------------------- |
-| `--state <path>`             | exactly that                             |
-| `$ZLRD_STATE`                | exactly that                             |
-| `$XDG_STATE_HOME`            | `$XDG_STATE_HOME/zlrd/state.json`        |
-| `$HOME`                      | `~/.local/state/zlrd/state.json`         |
-| Windows                      | `%LOCALAPPDATA%\zlrd\state.json`         |
-
-Under systemd, `StateDirectory=zlrd` plus `Environment=ZLRD_STATE=/var/lib/zlrd/state.json`
-puts it somewhere a `DynamicUser=` service can write. `--no-state` turns the
-file off entirely.
-
-Notes:
-
-- **Crashes are written through immediately**; everything else is coalesced
-  and flushed a couple of times a second, because a busy rule fires far more
-  often than a state file deserves to be rewritten.
-- **Writes are atomic** — an unnamed file renamed over the target — so a
-  crash mid-write leaves the previous state readable rather than a truncated
-  document.
-- **It is bounded**: 64 recent events, 64 services, 4096 signatures, a 4 KiB
-  trace. It is a state file, not a second log.
-- **It never blocks the watcher.** A corrupt or unwritable file is reported
-  once and then ignored; the agent goes on watching logs.
-- **It is plain JSON**, so `zlrd status` is a convenience, not the only way
-  in: `jq . /var/lib/zlrd/state.json` works too.
-
-### Prometheus scrape config
 
 A working scrape configuration for the metrics endpoint:
 
@@ -1007,8 +1123,7 @@ EnvironmentFile=/etc/zlrd/env
 StateDirectory=zlrd
 Environment=ZLRD_STATE=/var/lib/zlrd/state.json
 ExecStart=/usr/local/bin/zlrd --agent \
-  --listen=127.0.0.1:9100 \
-  --metrics-token=${ZLRD_METRICS_TOKEN} \
+  --service=api=/var/log/app.log \
   --alert-error-rate=20/60s \
   --alert-regex=panic:1/30s \
   --alert-first-seen \
@@ -1029,10 +1144,9 @@ WantedBy=multi-user.target
 
 Tips:
 
-- Bind to `127.0.0.1` and front it with the existing scrape proxy / mesh — no
-  need to expose `9100` publicly.
-- Generate the token once, persist it to `/etc/zlrd/env` with mode `0400`,
-  and feed it to both the agent and the scrape config.
+- No port is opened unless you add `--metrics-token`. If you do, bind to
+  `127.0.0.1` and front it with the existing scrape proxy — no need to expose
+  `9100` publicly — and keep the token in `/etc/zlrd/env` with mode `0400`.
 - Send the JSONL alert log to your existing log pipeline; it pairs nicely
   with `zlrd` itself (`zlrd --output json /var/log/zlrd/alerts.jsonl`).
 - `zlrd status` reads `/var/lib/zlrd/state.json` directly, so it answers
@@ -1066,8 +1180,8 @@ Tips:
 | Flag                          | Value      | Description                                                                  |
 | ----------------------------- | ---------- | ---------------------------------------------------------------------------- |
 | `    --agent`                 |            | Run as a background watcher                                                  |
-| `    --listen`                | `<addr>`   | HTTP bind address — default `127.0.0.1:9100`                                 |
-| `    --metrics-token`         | `<token>`  | Bearer token (mandatory)                                                     |
+| `    --metrics-token`         | `<token>`  | Bearer token — **enables** the optional `/metrics` endpoint                   |
+| `    --listen`                | `<addr>`   | HTTP bind address — default `127.0.0.1:9100`, needs a token                  |
 | `    --alert-error-rate`      | `<N/Ws>`   | Error spike threshold (e.g. `10/60s`)                                        |
 | `    --alert-regex`           | `<spec>`   | `pattern:N/Ws` — repeatable                                                  |
 | `    --alert-first-seen`      |            | Alert on novel normalized error signatures                                   |
@@ -1083,7 +1197,7 @@ Tips:
 | `    --no-state`              |            | Keep no state on disk                                                        |
 | `    --alert-exit`            |            | Exit non-zero on first alert                                                 |
 
-### Status
+### Status command
 
 | Command                       | Description                                                                  |
 | ----------------------------- | ---------------------------------------------------------------------------- |
@@ -1128,6 +1242,7 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 
 - [x] Protobuf payloads decoded out of JSON log messages
 - [x] Crash markers for Rust and the C/C++/glibc abort family
+- [x] Go stack traces captured whole — blank lines and flush-left frames
 - [x] `--since 5m` relative time filters
 - [x] Parallel scan across line-aligned chunks
 - [x] Native Telegram / Slack / Discord alert bodies (no templating proxy)

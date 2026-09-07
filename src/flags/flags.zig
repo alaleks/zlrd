@@ -366,7 +366,7 @@ pub fn printHelp(colored: bool) void {
         "      " ++ lo ++ "--listen" ++ r ++
         "           " ++ ar ++ "<addr>   " ++ r ++ "  HTTP bind address  " ++ ar ++ "(default 127.0.0.1:9100)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--metrics-token" ++ r ++
-        "    " ++ ar ++ "<token>  " ++ r ++ "  Bearer token required on /metrics  " ++ ar ++ "(mandatory)" ++ r ++ "\n" ++
+        "    " ++ ar ++ "<token>  " ++ r ++ "  Bearer token on /metrics  " ++ ar ++ "(enables the endpoint)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--alert-error-rate" ++ r ++
         " " ++ ar ++ "<N/Ws>   " ++ r ++ "  Alert if >N error/fatal/panic lines in window  " ++ ar ++ "e.g. 10/60s" ++ r ++ "\n" ++
         "      " ++ lo ++ "--alert-regex" ++ r ++

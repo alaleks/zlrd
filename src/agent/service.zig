@@ -228,6 +228,19 @@ pub const StackTraceBuilder = struct {
     /// continuation heuristic would end the trace before capturing the one
     /// line that says what actually went wrong.
     free_first: bool = false,
+    /// Apply Go's own trace grammar on top of the generic indentation
+    /// heuristic. Set from the marker when the detector already knows it is a
+    /// Go panic, and latched on the way past `[signal ...]` or `goroutine N`
+    /// so a crash found by a custom `--crash-marker` gets it too.
+    ///
+    /// The generic heuristic is indentation-based, and a Go trace is the one
+    /// that does not indent: `goroutine 1 [running]:` is followed by
+    /// alternating flush-left symbols and tab-indented file positions, with
+    /// blank lines between goroutine blocks. Reading it as "indented means
+    /// continuation" captures every other line at best, so Go gets rules
+    /// of its own — scoped to a trace already in progress, where an ordinary
+    /// log line cannot appear.
+    go_mode: bool = false,
 
     pub fn start(self: *StackTraceBuilder, now_ms: i64) void {
         self.used = 0;
@@ -235,6 +248,7 @@ pub const StackTraceBuilder = struct {
         self.active = true;
         self.started_at_ms = now_ms;
         self.free_first = false;
+        self.go_mode = false;
     }
 
     pub fn reset(self: *StackTraceBuilder) void {
@@ -242,6 +256,7 @@ pub const StackTraceBuilder = struct {
         self.lines = 0;
         self.active = false;
         self.free_first = false;
+        self.go_mode = false;
     }
 
     /// Tries to append `line` as a continuation of the trace. Returns true
@@ -254,12 +269,29 @@ pub const StackTraceBuilder = struct {
             return false;
         }
 
-        // Go's runtime prints a blank line between `panic: <reason>` and
-        // `goroutine ... [running]:` — accept one leading blank as a
-        // separator so the trace below it still gets captured.
-        if (line.len == 0 and self.used == 0) return true;
+        // Anything that names the Go runtime puts the builder into Go mode
+        // for the rest of this trace, including a crash first spotted by a
+        // custom marker.
+        if (opensGoTrace(line)) self.go_mode = true;
 
-        if (!isTraceLine(line) and !(self.free_first and self.used == 0)) {
+        // A blank line separates `panic:` from the goroutine dump and one
+        // goroutine block from the next. In Go it is punctuation, so it is
+        // stepped over rather than appended or treated as the end.
+        //
+        // Outside Go mode a blank still ends the trace: the indentation
+        // heuristic has no way to tell a separator from the gap before an
+        // unrelated indented block, and Java and Python do not put blanks in
+        // the middle of a trace anyway.
+        if (line.len == 0) {
+            if (self.go_mode or self.used == 0) return true;
+            self.active = false;
+            return false;
+        }
+
+        const accepted = isTraceLine(line) or
+            (self.go_mode and isGoFrame(line)) or
+            (self.free_first and self.used == 0);
+        if (!accepted) {
             self.active = false;
             return false;
         }
@@ -304,6 +336,44 @@ pub fn isTraceLine(line: []const u8) bool {
     if (std.mem.startsWith(u8, line, "note: ")) return true;
     if (std.mem.startsWith(u8, line, "stack backtrace:")) return true;
     return false;
+}
+
+/// True for the two lines that identify a dump as Go's. Either one is enough
+/// to switch on the grammar below, and both are specific enough that an
+/// ordinary log line does not trip them.
+pub fn opensGoTrace(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "goroutine ") or
+        std.mem.startsWith(u8, line, "[signal ");
+}
+
+/// True for a flush-left Go stack frame.
+///
+/// Go writes a frame as a symbol immediately followed by its arguments and
+/// nothing else — `main.main()`, `main.(*Server).handle(0x0, {0x14000112000,
+/// 0x1f})`, `github.com/x/y.(*Pool).Get(0x14000a2000)`. The shape that
+/// separates those from a log line is narrow: the text before the first `(`
+/// is a dotted path with no whitespace in it, and the line ends on the
+/// closing paren.
+///
+/// `2026-09-06 10:44:05 INFO handled request (took 3ms)` ends in `)` too, but
+/// everything before its `(` is prose full of spaces, so it is not a frame —
+/// and this is only ever consulted once a Go trace is already open.
+pub fn isGoFrame(line: []const u8) bool {
+    // Go 1.21+ attributes a goroutine to whatever started it. Flush-left,
+    // and not a call, so it needs saying separately.
+    if (std.mem.startsWith(u8, line, "created by ")) return true;
+
+    if (line.len < 3 or line[line.len - 1] != ')') return false;
+    const open = std.mem.indexOfScalar(u8, line, '(') orelse return false;
+    const symbol = line[0..open];
+    if (symbol.len == 0) return false;
+
+    var dotted = false;
+    for (symbol) |c| {
+        if (c == ' ' or c == '\t') return false;
+        if (c == '.') dotted = true;
+    }
+    return dotted;
 }
 
 /// Best-effort PID extraction. Recognizes `"pid":<n>` (JSON),
@@ -504,6 +574,7 @@ pub const Tracker = struct {
         self.crash_count += 1;
         self.trace.start(now_ms);
         self.trace.free_first = marker == .rust_panic;
+        self.trace.go_mode = marker == .go_panic;
         return null;
     }
 
@@ -891,4 +962,107 @@ test "Detector: user regexes still fire on a low-severity line" {
         MarkerKind.custom_regex,
         det.detect("{\"level\":\"info\",\"msg\":\"shard-7 lost\"}", .Info).?,
     );
+}
+
+test "isGoFrame: accepts real frames, rejects prose that happens to end in )" {
+    // The shapes Go actually emits.
+    try testing.expect(isGoFrame("main.main()"));
+    try testing.expect(isGoFrame("main.(*Server).handle(0x0, {0x14000112000, 0x1f})"));
+    try testing.expect(isGoFrame("runtime.gopanic(0x14000064000)"));
+    try testing.expect(isGoFrame("github.com/x/y.(*Pool).Get(0x14000a2000, 0x1)"));
+    try testing.expect(isGoFrame("created by main.startWorker in goroutine 1"));
+
+    // A log line ending in a parenthesis is the case this has to survive:
+    // everything before the `(` is prose, and prose has spaces in it.
+    try testing.expect(!isGoFrame("2026-09-06 10:44:05 INFO handled request (took 3ms)"));
+    try testing.expect(!isGoFrame("done (ok)"));
+    // No dot, so not a qualified symbol.
+    try testing.expect(!isGoFrame("main()"));
+    // Not a call at all.
+    try testing.expect(!isGoFrame("exit status 2"));
+    try testing.expect(!isGoFrame("{\"level\":\"info\",\"message\":\"done\"}"));
+    try testing.expect(!isGoFrame(""));
+}
+
+test "StackTraceBuilder: a Go dump survives its blank lines and flush-left frames" {
+    var b: StackTraceBuilder = .{};
+    b.start(0);
+    b.go_mode = true;
+
+    // Exactly what the runtime prints for a nil-pointer dereference.
+    try testing.expect(b.feed("[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x10a2f]"));
+    try testing.expect(b.feed(""));
+    try testing.expect(b.feed("goroutine 1 [running]:"));
+    try testing.expect(b.feed("main.(*Server).handle(0x0, {0x14000112000, 0x1f})"));
+    try testing.expect(b.feed("\t/src/api/server.go:142 +0x24"));
+    try testing.expect(b.feed("main.main()"));
+    try testing.expect(b.feed("\t/src/api/main.go:31 +0x88"));
+    // A second goroutine block, separated by a blank.
+    try testing.expect(b.feed(""));
+    try testing.expect(b.feed("goroutine 18 [select]:"));
+    try testing.expect(b.feed("created by main.startWorker in goroutine 1"));
+    // And an ordinary log line still ends it.
+    try testing.expect(!b.feed("{\"level\":\"info\",\"message\":\"restarted\"}"));
+
+    const trace = b.slice();
+    try testing.expect(std.mem.indexOf(u8, trace, "goroutine 1 [running]:") != null);
+    try testing.expect(std.mem.indexOf(u8, trace, "main.(*Server).handle") != null);
+    try testing.expect(std.mem.indexOf(u8, trace, "/src/api/server.go:142") != null);
+    try testing.expect(std.mem.indexOf(u8, trace, "goroutine 18 [select]:") != null);
+    try testing.expect(std.mem.indexOf(u8, trace, "created by main.startWorker") != null);
+    // Separators are stepped over, not stored.
+    try testing.expect(std.mem.indexOf(u8, trace, "\n\n") == null);
+}
+
+test "StackTraceBuilder: [signal ...] switches on Go mode by itself" {
+    // A crash found through a custom `--crash-marker` never tells the builder
+    // which runtime it is looking at, so the dump has to say so.
+    var b: StackTraceBuilder = .{};
+    b.start(0);
+    try testing.expect(!b.go_mode);
+    try testing.expect(b.feed("[signal SIGSEGV: segmentation violation code=0x1 addr=0x0]"));
+    try testing.expect(b.go_mode);
+    try testing.expect(b.feed(""));
+    try testing.expect(b.feed("goroutine 1 [running]:"));
+    try testing.expect(std.mem.indexOf(u8, b.slice(), "goroutine 1") != null);
+}
+
+test "StackTraceBuilder: Go's grammar stays inside a Go trace" {
+    // The same flush-left shape under a Java trace must not extend it — the
+    // frame rule is only safe because a trace is already open and known to
+    // be Go's.
+    var b: StackTraceBuilder = .{};
+    b.start(0);
+    try testing.expect(b.feed("\tat com.example.Service.handle(Service.java:42)"));
+    try testing.expect(!b.feed("com.example.Other.call(0x1)"));
+}
+
+test "Tracker: a Go panic keeps its frames end to end" {
+    const detector = Detector{ .customs = &.{} };
+    var t = Tracker.init("api", "/var/log/api.log", 0);
+
+    try testing.expect(t.observe("panic: runtime error: invalid memory address or nil pointer dereference", null, &detector, 100) == null);
+    try testing.expect(t.observe("[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x10a2f]", null, &detector, 101) == null);
+    try testing.expect(t.observe("", null, &detector, 102) == null);
+    try testing.expect(t.observe("goroutine 1 [running]:", null, &detector, 103) == null);
+    try testing.expect(t.observe("main.(*Server).handle(0x0, {0x14000112000, 0x1f})", null, &detector, 104) == null);
+    try testing.expect(t.observe("\t/src/api/server.go:142 +0x24", null, &detector, 105) == null);
+    try testing.expect(t.observe("main.main()", null, &detector, 106) == null);
+    try testing.expect(t.observe("\t/src/api/main.go:31 +0x88", null, &detector, 107) == null);
+
+    const ev = t.observe("{\"level\":\"info\",\"message\":\"back up\"}", .Info, &detector, 200).?;
+    try testing.expectEqual(EventKind.crash, ev.kind);
+    try testing.expectEqualStrings("go_panic", ev.marker);
+    try testing.expect(std.mem.indexOf(u8, ev.detail, "nil pointer dereference") != null);
+
+    // Every frame, not just the signal line the old heuristic stopped at.
+    for ([_][]const u8{
+        "goroutine 1 [running]:",
+        "main.(*Server).handle",
+        "/src/api/server.go:142",
+        "main.main()",
+        "/src/api/main.go:31",
+    }) |want| {
+        try testing.expect(std.mem.indexOf(u8, ev.stack_trace, want) != null);
+    }
 }

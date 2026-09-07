@@ -131,6 +131,14 @@ pub const SidecarConfig = struct {
 pub const AgentConfig = struct {
     listen_addr: []const u8,
     metrics_token: []const u8,
+    /// Whether to bind the metrics endpoint at all.
+    ///
+    /// It is opt-in because most of what agent mode does — watching services
+    /// for crashes, alerting into a chat, keeping the state file — needs no
+    /// scraper on the other end. Requiring a token to start meant every
+    /// invocation carried `--metrics-token=$(openssl rand -hex 16)` whether
+    /// anything was ever going to read it or not.
+    http_enabled: bool,
     error_rate: ?ThresholdSpec,
     regex_rules: []RegexRule,
     first_seen: bool,
@@ -165,8 +173,15 @@ pub const AgentConfig = struct {
     /// `regex_rules` and `sinks.webhook_headers` slices — all string slices
     /// remain borrowed from `args` and stay valid for the lifetime of `args`.
     pub fn fromArgs(allocator: std.mem.Allocator, args: flags.Args) (ParseError || error{OutOfMemory})!AgentConfig {
-        const token = args.metrics_token orelse return error.MissingMetricsToken;
-        if (token.len == 0) return error.MissingMetricsToken;
+        // Asking for either half of the endpoint turns it on. `--listen`
+        // without a token still fails: opening an unauthenticated port is a
+        // worse answer than refusing to start.
+        const http_enabled = args.metrics_token != null or args.listen != null;
+        const token = if (http_enabled) blk: {
+            const t = args.metrics_token orelse return error.MissingMetricsToken;
+            if (t.len == 0) return error.MissingMetricsToken;
+            break :blk t;
+        } else "";
 
         const error_rate: ?ThresholdSpec = if (args.alert_error_rate) |s|
             try parseThresholdSpec(s)
@@ -234,6 +249,7 @@ pub const AgentConfig = struct {
         return .{
             .listen_addr = args.listen orelse default_listen,
             .metrics_token = token,
+            .http_enabled = http_enabled,
             .error_rate = error_rate,
             .regex_rules = regex_rules,
             .first_seen = args.alert_first_seen,
@@ -397,13 +413,6 @@ test "parseHeaderSpec rejects malformed input" {
     try testing.expectError(error.InvalidHeaderSpec, parseHeaderSpec("Name:  "));
 }
 
-test "AgentConfig.fromArgs: missing token surfaces specific error" {
-    const allocator = testing.allocator;
-    var args = flags.Args{};
-    args.agent_mode = true;
-    try testing.expectError(error.MissingMetricsToken, AgentConfig.fromArgs(allocator, args));
-}
-
 test "AgentConfig.fromArgs: defaults listen, defaults stderr sink when no sink given" {
     const allocator = testing.allocator;
     var args = flags.Args{};
@@ -474,4 +483,43 @@ test "AgentConfig.fromArgs: explicit sink suppresses default stderr" {
     defer cfg.deinit(allocator);
     try testing.expect(!cfg.sinks.stderr);
     try testing.expectEqualStrings("/tmp/alerts.jsonl", cfg.sinks.file_path.?);
+}
+
+test "the metrics endpoint is off until it is asked for" {
+    const allocator = testing.allocator;
+    // Watching a service and alerting into a chat needs no scraper, and
+    // making a token mandatory put one in every command line whether or not
+    // anything would ever read it.
+    var args = flags.Args{};
+    args.agent_mode = true;
+    var cfg = try AgentConfig.fromArgs(allocator, args);
+    defer cfg.deinit(allocator);
+    try testing.expect(!cfg.http_enabled);
+}
+
+test "a token turns the endpoint on; --listen without one is refused" {
+    const allocator = testing.allocator;
+    {
+        var args = flags.Args{};
+        args.agent_mode = true;
+        args.metrics_token = "t";
+        var cfg = try AgentConfig.fromArgs(allocator, args);
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.http_enabled);
+        try testing.expectEqualStrings(default_listen, cfg.listen_addr);
+    }
+    {
+        // Binding a port nobody has to authenticate against is a worse
+        // answer than not starting.
+        var args = flags.Args{};
+        args.agent_mode = true;
+        args.listen = "0.0.0.0:9100";
+        try testing.expectError(error.MissingMetricsToken, AgentConfig.fromArgs(allocator, args));
+    }
+    {
+        var args = flags.Args{};
+        args.agent_mode = true;
+        args.metrics_token = "";
+        try testing.expectError(error.MissingMetricsToken, AgentConfig.fromArgs(allocator, args));
+    }
 }
