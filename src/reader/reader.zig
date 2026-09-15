@@ -1969,27 +1969,24 @@ fn printStyledLine(out: *Out, line: []const u8, info: LineInfo, search_matches: 
 
 /// Writes a byte range of `line`, inserting search-highlight escapes around
 /// `matches` that fall inside the range.
-fn writeRangeHighlighted(out: *Out, line: []const u8, start: usize, end: usize, matches: []const MatchRange) void {
-    writeRangeHighlightedIn(out, line, start, end, matches, "");
-}
-
-/// Same as `writeRangeHighlighted`, but wraps the whole range in `wrap_color`
-/// and re-applies it after each highlight so the `reset` that closes a
-/// highlight doesn't leave the tail uncoloured.
-fn writeRangeHighlightedIn(
+///
+/// `restore` is re-emitted after every highlight closes, and carrying it is
+/// not optional. The `reset` that ends a highlight clears *all* attributes,
+/// the caller's colour included, so without it the rest of the token renders
+/// in the terminal's default foreground — a match inside a string value left
+/// everything after it plain white. Callers that open a colour before this
+/// and close it after pass that same colour here; `""` is only correct where
+/// no colour is open to begin with.
+fn writeRangeHighlighted(
     out: *Out,
     line: []const u8,
     start: usize,
     end: usize,
     matches: []const MatchRange,
-    wrap_color: []const u8,
+    restore: []const u8,
 ) void {
-    const reset = out.theme.palette.reset;
-    const wrapped = wrap_color.len > 0;
-    if (wrapped) out.write(wrap_color);
     if (matches.len == 0) {
         out.write(line[start..end]);
-        if (wrapped) out.write(reset);
         return;
     }
     var pos = start;
@@ -2001,12 +1998,28 @@ fn writeRangeHighlightedIn(
         if (pos < seg_start) out.write(line[pos..seg_start]);
         out.write(out.theme.palette.match_on);
         out.write(line[seg_start..seg_end]);
-        out.write(reset);
-        if (wrapped) out.write(wrap_color);
+        out.write(out.theme.palette.reset);
+        out.write(restore);
         pos = seg_end;
     }
     if (pos < end) out.write(line[pos..end]);
-    if (wrapped) out.write(reset);
+}
+
+/// Same as `writeRangeHighlighted`, but also opens `wrap_color` before the
+/// range and resets after it, for callers that are not managing the colour
+/// themselves.
+fn writeRangeHighlightedIn(
+    out: *Out,
+    line: []const u8,
+    start: usize,
+    end: usize,
+    matches: []const MatchRange,
+    wrap_color: []const u8,
+) void {
+    const wrapped = wrap_color.len > 0;
+    if (wrapped) out.write(wrap_color);
+    writeRangeHighlighted(out, line, start, end, matches, wrap_color);
+    if (wrapped) out.write(out.theme.palette.reset);
 }
 
 /// Prints a line as JSON (JSONL format) for pipeline compatibility.
@@ -2159,7 +2172,7 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
             }
 
             out.write(if (is_key) p.json_key_open else p.json_string_open);
-            writeRangeHighlighted(out, line, body, value_end, search_matches);
+            writeRangeHighlighted(out, line, body, value_end, search_matches, if (is_key) p.json_key else p.json_string);
             if (value_end != end) {
                 out.write(p.dim);
                 out.write(if (out.theme.glyphs.unicode_ok) "…" else "...");
@@ -2191,7 +2204,7 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
                     line[i] == '+' or line[i] == '-')) : (i += 1)
             {}
             out.write(p.json_number);
-            writeRangeHighlighted(out, line, num_start, i, search_matches);
+            writeRangeHighlighted(out, line, num_start, i, search_matches, p.json_number);
             out.write(p.reset);
             plain_start = i;
             continue;
@@ -2208,7 +2221,7 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
         if (word_len != 0) {
             if (i > plain_start) out.write(line[plain_start..i]);
             out.write(p.json_bool_null);
-            writeRangeHighlighted(out, line, i, i + word_len, search_matches);
+            writeRangeHighlighted(out, line, i, i + word_len, search_matches, p.json_bool_null);
             out.write(p.reset);
             i += word_len;
             plain_start = i;
@@ -4051,6 +4064,62 @@ test "normalized key trims surrounding whitespace and ends on a date" {
     defer s3.deinit(std.testing.allocator);
     const key3 = try buildAggregateKeyForLine(std.testing.allocator, &s3, .normalized, "id=12345 ok");
     try std.testing.expectEqualStrings("id=# ok", key3);
+}
+
+test "colour resumes after a highlight closes" {
+    // The `reset` that ends a highlight clears the caller's colour too, so
+    // the restore has to follow it immediately. Without that, everything
+    // after the first match in a token printed in the terminal's default
+    // foreground — a teal string value turned white halfway through.
+    const line = "{\"level\":\"info\",\"msg\":\"connection refused by upstream\"}";
+    const info = analyzeLine(line, true);
+    var match_buf: [max_search_matches]MatchRange = undefined;
+    const matches = findSearchMatches(line, "refused", &match_buf);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    try h.start();
+    defer h.deinit();
+    printStyledLine(&h.out, line, info, matches, null);
+    const got = try h.take();
+    defer std.testing.allocator.free(got);
+
+    const p = h.th.palette;
+    var buf: [256]u8 = undefined;
+
+    // The exact sequence the bug was missing: highlight, reset, colour again.
+    const want = try std.fmt.bufPrint(&buf, "{s}refused{s}{s}", .{ p.match_on, p.reset, p.json_string });
+    try std.testing.expect(std.mem.indexOf(u8, got, want) != null);
+
+    // And the tail really sits inside that colour rather than running bare.
+    var buf2: [256]u8 = undefined;
+    const tail = try std.fmt.bufPrint(&buf2, "{s} by upstream", .{p.json_string});
+    try std.testing.expect(std.mem.indexOf(u8, got, tail) != null);
+}
+
+test "colour resumes after a highlight in numbers and literals" {
+    const line = "{\"latency_ms\":12345.678,\"ok\":false}";
+    const info = analyzeLine(line, true);
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    try h.start();
+    defer h.deinit();
+    const p = h.th.palette;
+
+    var b1: [max_search_matches]MatchRange = undefined;
+    printStyledLine(&h.out, line, info, findSearchMatches(line, "345", &b1), null);
+    const num = try h.take();
+    defer std.testing.allocator.free(num);
+    var nbuf: [256]u8 = undefined;
+    const num_want = try std.fmt.bufPrint(&nbuf, "{s}{s}.678", .{ p.reset, p.json_number });
+    try std.testing.expect(std.mem.indexOf(u8, num, num_want) != null);
+
+    var b2: [max_search_matches]MatchRange = undefined;
+    printStyledLine(&h.out, line, info, findSearchMatches(line, "als", &b2), null);
+    const lit = try h.take();
+    defer std.testing.allocator.free(lit);
+    var lbuf: [256]u8 = undefined;
+    const lit_want = try std.fmt.bufPrint(&lbuf, "{s}{s}e", .{ p.reset, p.json_bool_null });
+    try std.testing.expect(std.mem.indexOf(u8, lit, lit_want) != null);
 }
 
 test "search highlighting still takes the token walk" {
