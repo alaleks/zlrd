@@ -170,20 +170,44 @@ fn badge(comptime bg_hex: u24, comptime fg_hex: u24) []const u8 {
     );
 }
 
+/// The non-badge foreground colours, named so the contrast test at the
+/// bottom of this file can assert on the values themselves rather than on
+/// the escape sequences built from them.
+const tc = struct {
+    const muted: u24 = 0x8e8e8e;
+    const key: u24 = 0x3f8cff;
+    const string: u24 = 0x099cb1;
+    const number: u24 = 0xb468ff;
+    const bool_null: u24 = 0x03a41d;
+};
+
 /// Badge backgrounds carry white text at 5.9:1–7.4:1, so they read on any
 /// terminal theme.
+///
+/// The non-badge colours all sit at one relative luminance (~0.27), chosen
+/// deliberately on the dark side of centre. A single fixed colour cannot
+/// clear 4.5:1 against both #ffffff and a dark terminal background — the two
+/// constraints do not overlap, and the best any one value can do on both at
+/// once is 3.74:1. Sitting exactly on that balance point left every colour
+/// looking flat on dark themes, which is where most terminals are, so these
+/// trade white-background contrast down to ~3.3:1 (still above the 3:1 floor
+/// for large text and UI) to buy ~4.3:1 on One Dark and ~5.1:1 on the
+/// #1e1e1e family — a 29% gain on every dark background.
+///
+/// `text` stays the terminal's own default foreground for the reason given
+/// on the field: no fixed value can beat the one the user already chose.
 const truecolor_palette: Palette = .{
     .reset = esc ++ "0m",
     .dim = esc ++ "2m",
-    .muted = fg(0x7b7b7b),
+    .muted = fg(tc.muted),
     .text = esc ++ "39m",
-    .json_key = fg(0x1974fc),
-    .json_string = fg(0x188796),
-    .json_key_open = fg(0x1974fc) ++ "\"",
-    .json_string_open = fg(0x188796) ++ "\"",
+    .json_key = fg(tc.key),
+    .json_string = fg(tc.string),
+    .json_key_open = fg(tc.key) ++ "\"",
+    .json_string_open = fg(tc.string) ++ "\"",
     .quote_close = "\"" ++ esc ++ "0m",
-    .json_number = fg(0xa34bfb),
-    .json_bool_null = fg(0x038f19),
+    .json_number = fg(tc.number),
+    .json_bool_null = fg(tc.bool_null),
     .json_punct = esc ++ "2m",
     .match_on = badge(0x146b73, 0xffffff),
     .level = .{
@@ -199,19 +223,25 @@ const truecolor_palette: Palette = .{
 
 /// Nearest xterm-256 cube entries to the truecolor values above. A few are
 /// nudged by hand where the closest index drifted in hue (Info's green would
-/// otherwise land on a teal).
+/// otherwise land on a teal, and the nearest entry to the new `json_string`
+/// came out blue enough to be mistaken for `json_key`).
+///
+/// The cube is coarse where these colours live, so it cannot reproduce the
+/// truecolor luminance exactly; each index below is the closest one that
+/// still clears 3:1 on white and on the dark backgrounds. This palette only
+/// serves terminals that cap out at 256 colours — mostly `screen` and `tmux`.
 const ansi256_palette: Palette = .{
     .reset = esc ++ "0m",
     .dim = esc ++ "2m",
-    .muted = esc ++ "38;5;243m",
+    .muted = esc ++ "38;5;245m",
     .text = esc ++ "39m",
-    .json_key = esc ++ "38;5;33m",
-    .json_string = esc ++ "38;5;30m",
-    .json_key_open = esc ++ "38;5;33m" ++ "\"",
-    .json_string_open = esc ++ "38;5;30m" ++ "\"",
+    .json_key = esc ++ "38;5;69m",
+    .json_string = esc ++ "38;5;31m",
+    .json_key_open = esc ++ "38;5;69m" ++ "\"",
+    .json_string_open = esc ++ "38;5;31m" ++ "\"",
     .quote_close = "\"" ++ esc ++ "0m",
     .json_number = esc ++ "38;5;135m",
-    .json_bool_null = esc ++ "38;5;28m",
+    .json_bool_null = esc ++ "38;5;34m",
     .json_punct = esc ++ "2m",
     .match_on = esc ++ "48;5;23m" ++ esc ++ "38;5;231m",
     .level = .{
@@ -509,5 +539,87 @@ test "primary text uses the terminal default foreground" {
     // the user's own background.
     for ([_]Mode{ .truecolor, .ansi256, .ansi16 }) |m| {
         try testing.expectEqualStrings("\x1b[39m", Theme.forMode(m, Glyphs.ascii).palette.text);
+    }
+}
+
+// ─── Contrast ─────────────────────────────────────────────────────────────
+
+fn srgbToLinear(c: u8) f64 {
+    const x = @as(f64, @floatFromInt(c)) / 255.0;
+    return if (x <= 0.03928) x / 12.92 else std.math.pow(f64, (x + 0.055) / 1.055, 2.4);
+}
+
+/// WCAG relative luminance.
+fn relLuminance(hex: u24) f64 {
+    const r = srgbToLinear(@intCast((hex >> 16) & 0xff));
+    const g = srgbToLinear(@intCast((hex >> 8) & 0xff));
+    const b = srgbToLinear(@intCast(hex & 0xff));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/// WCAG contrast ratio, 1.0 (identical) to 21.0 (black on white).
+fn contrastRatio(a: u24, b: u24) f64 {
+    const la = relLuminance(a);
+    const lb = relLuminance(b);
+    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
+}
+
+test "every foreground colour clears 3:1 on light and dark backgrounds" {
+    // The palette's whole claim is that it reads on either background. That
+    // is a numeric property, so assert it numerically: a later colour picked
+    // by eye can look better in one terminal and quietly fail in the other.
+    //
+    // 3:1 is the WCAG floor for large text and UI components, and it is the
+    // real ceiling here — no single fixed colour reaches 4.5:1 against both
+    // #ffffff and a dark terminal background, because the two requirements
+    // have no overlapping luminance range.
+    const backgrounds = [_]struct { name: []const u8, hex: u24 }{
+        .{ .name = "white", .hex = 0xffffff },
+        .{ .name = "vscode dark", .hex = 0x1e1e1e },
+        .{ .name = "one dark", .hex = 0x282c34 },
+        // The lightest dark theme in common use, so it binds the constraint.
+        .{ .name = "nord", .hex = 0x2e3440 },
+        .{ .name = "black", .hex = 0x000000 },
+    };
+    const colors = [_]struct { name: []const u8, hex: u24 }{
+        .{ .name = "muted", .hex = tc.muted },
+        .{ .name = "json_key", .hex = tc.key },
+        .{ .name = "json_string", .hex = tc.string },
+        .{ .name = "json_number", .hex = tc.number },
+        .{ .name = "json_bool_null", .hex = tc.bool_null },
+    };
+    for (colors) |c| {
+        for (backgrounds) |bg| {
+            const r = contrastRatio(c.hex, bg.hex);
+            if (r < 3.0) {
+                std.debug.print("{s} (#{x:0>6}) on {s}: {d:.2}:1\n", .{ c.name, c.hex, bg.name, r });
+                return error.InsufficientContrast;
+            }
+        }
+    }
+}
+
+test "level badges keep white legible on their own background" {
+    // Badges carry their own background, so unlike the foreground colours
+    // above they are free to clear the full 4.5:1 — and must, since the
+    // level is the one token a reader scans for.
+    const badge_bgs = [_]u24{ 0x595f66, 0x0d5bbd, 0x11713c, 0x8a5300, 0xc02626, 0x9c1382 };
+    for (badge_bgs) |bg| {
+        try std.testing.expect(contrastRatio(0xffffff, bg) >= 4.5);
+    }
+}
+
+test "foreground colours stay distinguishable from one another" {
+    // They all sit at the same luminance by design, so hue is the only thing
+    // telling them apart: two that converge there become one colour on
+    // screen even though both pass the contrast test above.
+    const colors = [_]u24{ tc.key, tc.string, tc.number, tc.bool_null };
+    for (colors, 0..) |a, i| {
+        for (colors[i + 1 ..]) |b| {
+            const dr = @abs(@as(i32, @intCast((a >> 16) & 0xff)) - @as(i32, @intCast((b >> 16) & 0xff)));
+            const dg = @abs(@as(i32, @intCast((a >> 8) & 0xff)) - @as(i32, @intCast((b >> 8) & 0xff)));
+            const db = @abs(@as(i32, @intCast(a & 0xff)) - @as(i32, @intCast(b & 0xff)));
+            try std.testing.expect(dr + dg + db >= 120);
+        }
     }
 }

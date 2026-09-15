@@ -24,6 +24,8 @@ zig-out/
 .zed
 *.iml
 .agents
+.specify
+.claude
 
 # Coverage / profiling
 *.prof
