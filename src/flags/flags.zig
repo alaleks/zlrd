@@ -14,6 +14,14 @@ pub const Level = enum(u8) {
 /// no dependency on the reader package.
 pub const ColorChoice = enum { auto, always, never };
 
+/// `--theme` setting: which background the palette is tuned for. No single
+/// fixed colour clears 4.5:1 against both a white and a dark terminal
+/// background — the two requirements have no overlapping luminance range —
+/// so the palette is picked per background instead of compromised across
+/// both. `auto` reads `ZLRD_THEME`, then `COLORFGBG`, and falls back to
+/// `dark`, which is where most terminals are.
+pub const ThemeChoice = enum { auto, dark, light };
+
 pub const AggregateMode = enum {
     exact,
     level_message,
@@ -134,6 +142,7 @@ pub const Args = struct {
     /// How colour should be resolved. `auto` honours NO_COLOR and whether
     /// stdout is a terminal.
     color: ColorChoice = .auto,
+    theme: ThemeChoice = .auto,
     /// Suppress expansion of JSON found inside a log message.
     no_expand_json: bool = false,
 
@@ -237,6 +246,8 @@ pub const ParseError = error{
     InvalidOutputMode,
     InvalidColorChoice,
     MissingColor,
+    InvalidThemeChoice,
+    MissingTheme,
     MissingSearch,
     MissingLevel,
     MissingDate,
@@ -344,6 +355,10 @@ pub fn printHelp(colored: bool) void {
         "            " ++ ar ++ "<when>   " ++ r ++ "  " ++
         ar ++ "auto" ++ r ++ " · " ++ ar ++ "always" ++ r ++ " · " ++ ar ++ "never" ++ r ++
         "   (auto honours NO_COLOR)\n" ++
+        "      " ++ lo ++ "--theme" ++ r ++
+        "            " ++ ar ++ "<bg>     " ++ r ++ "  " ++
+        ar ++ "auto" ++ r ++ " · " ++ ar ++ "dark" ++ r ++ " · " ++ ar ++ "light" ++ r ++
+        "     (palette tuned for the background)\n" ++
         "      " ++ lo ++ "--no-expand-json" ++ r ++
         "                Do not expand JSON found inside a message\n" ++
         "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
@@ -476,6 +491,10 @@ pub fn printHelpLite(colored: bool) void {
         "            " ++ ar ++ "<when>   " ++ r ++ "  " ++
         ar ++ "auto" ++ r ++ " · " ++ ar ++ "always" ++ r ++ " · " ++ ar ++ "never" ++ r ++
         "   (auto honours NO_COLOR)\n" ++
+        "      " ++ lo ++ "--theme" ++ r ++
+        "            " ++ ar ++ "<bg>     " ++ r ++ "  " ++
+        ar ++ "auto" ++ r ++ " · " ++ ar ++ "dark" ++ r ++ " · " ++ ar ++ "light" ++ r ++
+        "     (palette tuned for the background)\n" ++
         "      " ++ lo ++ "--no-expand-json" ++ r ++
         "                Do not expand JSON found inside a message\n" ++
         "  " ++ sh ++ "-t" ++ r ++ ", " ++ lo ++ "--tail" ++ r ++
@@ -696,6 +715,7 @@ const ValuedFlag = enum {
     since,
     output,
     color,
+    theme,
     listen,
     metrics_token,
     alert_error_rate,
@@ -729,6 +749,7 @@ const ValuedFlag = enum {
             .{ .name = "since", .kind = .since },
             .{ .name = "output", .kind = .output },
             .{ .name = "color", .kind = .color },
+            .{ .name = "theme", .kind = .theme },
             .{ .name = "listen", .kind = .listen },
             .{ .name = "metrics-token", .kind = .metrics_token },
             .{ .name = "alert-error-rate", .kind = .alert_error_rate },
@@ -762,6 +783,7 @@ const ValuedFlag = enum {
             .num_lines => error.MissingNumLines,
             .aggregate_mode => error.MissingAggregateMode,
             .color => error.MissingColor,
+            .theme => error.MissingTheme,
             .from_time => error.MissingFromTime,
             .to_time => error.MissingToTime,
             .since => error.MissingSince,
@@ -907,6 +929,7 @@ fn applyValuedFlag(
         .sidecar_header => try appendString(allocator, &bufs.sidecar_headers, val),
         .sidecar_flush_interval => try replaceOwnedString(allocator, &parsed.sidecar_flush_interval, val),
         .color => try parseColorChoice(parsed, val),
+        .theme => try parseThemeChoice(parsed, val),
         .sidecar_batch_size => try replaceOwnedString(allocator, &parsed.sidecar_batch_size, val),
     }
 }
@@ -919,6 +942,16 @@ fn parseColorChoice(parsed: *Args, value: []const u8) ParseError!void {
     } else if (std.mem.eql(u8, value, "never")) {
         parsed.color = .never;
     } else return error.InvalidColorChoice;
+}
+
+fn parseThemeChoice(parsed: *Args, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, value, "auto")) {
+        parsed.theme = .auto;
+    } else if (std.mem.eql(u8, value, "dark")) {
+        parsed.theme = .dark;
+    } else if (std.mem.eql(u8, value, "light")) {
+        parsed.theme = .light;
+    } else return error.InvalidThemeChoice;
 }
 
 fn parseOutputMode(parsed: *Args, value: []const u8) ParseError!void {

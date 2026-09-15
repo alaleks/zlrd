@@ -34,9 +34,9 @@ pub fn main(opts: struct {
     const err_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stderr_file.isTty(io) catch false));
 
     var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
-        // `--color` is unavailable when parsing is what failed, so this one
-        // path falls back to plain auto-detection.
-        const early = reader.theme_mod.resolve(err_env, .auto);
+        // `--color` and `--theme` are unavailable when parsing is what
+        // failed, so this one path falls back to plain auto-detection.
+        const early = reader.theme_mod.resolve(err_env, .auto, .auto);
         fatal(io, &early, parseErrorMessage(err), "run zlrd --help for usage");
         std.process.exit(1);
     };
@@ -47,8 +47,8 @@ pub fn main(opts: struct {
         .always => .always,
         .never => .never,
     };
-    const th = reader.theme_mod.resolve(out_env, choice);
-    const err_th = reader.theme_mod.resolve(err_env, choice);
+    const th = reader.theme_mod.resolve(out_env, choice, parsed_args.theme);
+    const err_th = reader.theme_mod.resolve(err_env, choice, parsed_args.theme);
 
     if (parsed_args.version) {
         printVersion(io, &th);
@@ -380,6 +380,8 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.InvalidOutputMode => "invalid output mode (valid: json)",
         error.InvalidColorChoice => "invalid --color value (valid: auto, always, never)",
         error.MissingColor => "--color requires a value (auto, always, never)",
+        error.InvalidThemeChoice => "invalid --theme value (valid: auto, dark, light)",
+        error.MissingTheme => "--theme requires a value (auto, dark, light)",
         error.MissingFile => "missing value for --file",
         error.MissingSearch => "missing value for --search",
         error.MissingLevel => "missing value for --level",

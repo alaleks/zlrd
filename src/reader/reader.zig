@@ -2682,7 +2682,7 @@ test "FilterState.checkLine should filter by date" {
 }
 
 test "level badges are distinct per level and padded to a fixed width" {
-    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii, .dark) };
     try h.start();
     defer h.deinit();
 
@@ -3449,7 +3449,7 @@ test "styled JSON output reproduces the input byte for byte" {
         "{\"unicode\":\"привет мир\",\"emoji\":\"ok\"}",
     };
     for (cases) |line| {
-        var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+        var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii, .dark) };
         try h.start();
         defer h.deinit();
         const info = analyzeLine(line, true);
@@ -3783,7 +3783,7 @@ test "the parallel scan produces exactly the serial output" {
         .{ .files = &files, .search = "handled" },
         .{ .files = &files, .output_json = true },
     }) |args| {
-        for ([_]*const Theme{ &Theme.plain, &Theme.forMode(.truecolor, theme.Glyphs.unicode) }) |th| {
+        for ([_]*const Theme{ &Theme.plain, &Theme.forMode(.truecolor, theme.Glyphs.unicode, .dark) }) |th| {
             const got = try bothScanPaths(a, args, th, 4000, 4096);
             defer a.free(got.serial);
             defer a.free(got.parallel);
@@ -3833,13 +3833,13 @@ test "pagination and aggregation stay on the serial path" {
 test "expansion never runs for --output json" {
     var file = [_][]const u8{"x.log"};
     const args = flags.Args{ .files = &file, .output_json = true };
-    const th = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode);
+    const th = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode, .dark);
     try std.testing.expect(!wantsJsonExpansion(args, &th));
 }
 
 test "expansion follows colour, and --no-expand-json overrides it" {
     var file = [_][]const u8{"x.log"};
-    const colored = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode);
+    const colored = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode, .dark);
     const plain = theme.Theme.plain;
 
     try std.testing.expect(wantsJsonExpansion(.{ .files = &file }, &colored));
@@ -4077,7 +4077,7 @@ test "colour resumes after a highlight closes" {
     const matches = findSearchMatches(line, "refused", &match_buf);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
 
-    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii, .dark) };
     try h.start();
     defer h.deinit();
     printStyledLine(&h.out, line, info, matches, null);
@@ -4100,7 +4100,7 @@ test "colour resumes after a highlight closes" {
 test "colour resumes after a highlight in numbers and literals" {
     const line = "{\"latency_ms\":12345.678,\"ok\":false}";
     const info = analyzeLine(line, true);
-    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii, .dark) };
     try h.start();
     defer h.deinit();
     const p = h.th.palette;
@@ -4131,7 +4131,7 @@ test "search highlighting still takes the token walk" {
     const matches = findSearchMatches(line, "needle", &match_buf);
     try std.testing.expect(matches.len > 0);
 
-    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii) };
+    var h = TestOut{ .th = theme.Theme.forMode(.truecolor, theme.Glyphs.ascii, .dark) };
     try h.start();
     defer h.deinit();
     printStyledLine(&h.out, line, info, matches, null);

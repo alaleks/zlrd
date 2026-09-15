@@ -673,7 +673,7 @@ test "writeBlock handles an escaped-string value verbatim" {
 test "writeBlock colours keys, strings, numbers and literals distinctly" {
     var sink = TestSink{};
     defer sink.deinit();
-    const th = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode);
+    const th = theme.Theme.forMode(.truecolor, theme.Glyphs.unicode, .dark);
     writeBlock(&sink, &th, "{\"k\":\"s\",\"n\":42,\"b\":null}", .{});
     const p = th.palette;
     const got = sink.items();

@@ -1168,12 +1168,23 @@ Tips:
 | `    --to`                    | `<time>`   | Time range end                                                      |
 | `    --since`                 | `<window>` | Last `5m` / `90s` / `2h` / `7d` of the log, from its newest record  |
 | `    --output`                | `<mode>`   | Output mode: `json` (JSONL)                                         |
+| `    --color`                 | `<when>`   | `auto` · `always` · `never` — `auto` honours `NO_COLOR`              |
+| `    --theme`                 | `<bg>`     | `auto` · `dark` · `light` — palette tuned for the background        |
 | `-t, --tail`                  |            | Follow file in real time                                            |
 | `-n, --num-lines`             | `<num>`    | Paginate N lines per page                                           |
 | `-a, --aggregate`             |            | Group identical matched lines                                       |
 | `-m, --aggregate-mode`        | `<mode>`   | `exact` · `level-message` · `json-message` · `normalized`           |
 | `-v, --version`               |            | Print version and exit                                              |
 | `-h, --help`                  |            | Show help                                                           |
+
+Colours are tuned per background, because one fixed palette cannot serve
+both: a colour needs relative luminance ≤ 0.183 to clear 4.5:1 on white and
+≥ 0.227 to clear it on a dark theme, and those ranges do not overlap. So there
+are two sets, each clearing 4.5:1 on the backgrounds it is for, and `--theme`
+picks between them. `auto` reads `ZLRD_THEME`, then `COLORFGBG`, and otherwise
+assumes **dark** — on a light terminal, run `zlrd --theme light` or export
+`ZLRD_THEME=light`. Level badges are shared by both: they carry their own
+background, so they read either way.
 
 ### Agent options
 
