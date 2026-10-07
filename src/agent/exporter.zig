@@ -537,9 +537,9 @@ fn addCounters(
     }
 
     // Per-rule alert counters — same grouping principle as above.
-    const rule_fields = @typeInfo(metrics_mod.RuleKind).@"enum".fields;
-    inline for (rule_fields) |f| {
-        const kind: metrics_mod.RuleKind = @enumFromInt(f.value);
+    const rule_values = @typeInfo(metrics_mod.RuleKind).@"enum".field_values;
+    inline for (rule_values) |value| {
+        const kind: metrics_mod.RuleKind = @fromBackingInt(@intCast(value));
         const attrs = try a.alloc(otlp.Attr, 1);
         attrs[0] = .{ .key = "rule", .value = .{ .string = kind.label() } };
         try points.append(a, .{
@@ -548,7 +548,7 @@ fn addCounters(
             .is_monotonic = true,
             .time_unix_nano = now_ns,
             .start_time_unix_nano = start_ns,
-            .value = @intCast(m.alerts_fired_total[f.value].load(.monotonic)),
+            .value = @intCast(m.alerts_fired_total[value].load(.monotonic)),
             .attrs = attrs,
         });
     }
@@ -705,7 +705,7 @@ test "addCounters: emits one metric per level and per rule kind" {
 
     try addCounters(arena.allocator(), &points, &m, 2_000_000_000, 1_000_000_000);
 
-    const rule_count = @typeInfo(metrics_mod.RuleKind).@"enum".fields.len;
+    const rule_count = @typeInfo(metrics_mod.RuleKind).@"enum".field_names.len;
     const expected_min = metrics_mod.level_labels.len + rule_count + 4; // 4 scalars
     try testing.expect(points.items.len == expected_min);
 

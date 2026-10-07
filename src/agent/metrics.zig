@@ -57,8 +57,8 @@ pub const level_labels = [_][]const u8{
 };
 
 const level_count = level_labels.len;
-const rule_count = @typeInfo(RuleKind).@"enum".fields.len;
-const route_count = @typeInfo(HttpRoute).@"enum".fields.len;
+const rule_count = @typeInfo(RuleKind).@"enum".field_names.len;
+const route_count = @typeInfo(HttpRoute).@"enum".field_names.len;
 /// HTTP status codes we surface explicitly. Any other status is bucketed into
 /// the corresponding hundred (200/400/500). Keeps cardinality bounded.
 pub const http_status_codes = [_]u16{ 200, 400, 401, 404, 500 };
@@ -105,11 +105,11 @@ pub const Metrics = struct {
     }
 
     pub fn observeAlert(self: *Metrics, kind: RuleKind) void {
-        _ = self.alerts_fired_total[@intFromEnum(kind)].fetchAdd(1, .monotonic);
+        _ = self.alerts_fired_total[@backingInt(kind)].fetchAdd(1, .monotonic);
     }
 
     pub fn observeHttp(self: *Metrics, route: HttpRoute, status: u16) void {
-        const route_idx = @intFromEnum(route);
+        const route_idx = @backingInt(route);
         const code_idx = statusIndex(status);
         _ = self.http_requests_total[route_idx][code_idx].fetchAdd(1, .monotonic);
     }
@@ -126,7 +126,7 @@ pub const Metrics = struct {
 
 /// Maps an optional Level into the lines_total array slot.
 fn levelIndex(level: ?flags.Level) usize {
-    if (level) |l| return @intFromEnum(l);
+    if (level) |l| return @backingInt(l);
     return level_count - 1; // "unknown" is the last slot
 }
 
@@ -169,23 +169,23 @@ pub fn renderPrometheus(m: *const Metrics, writer: *std.Io.Writer, now_ms: i64) 
 
     try writer.print("# HELP zlrd_alerts_fired_total Alerts fired, by rule kind.\n", .{});
     try writer.print("# TYPE zlrd_alerts_fired_total counter\n", .{});
-    inline for (@typeInfo(RuleKind).@"enum".fields) |f| {
-        const kind: RuleKind = @enumFromInt(f.value);
+    inline for (@typeInfo(RuleKind).@"enum".field_values) |value| {
+        const kind: RuleKind = @fromBackingInt(@intCast(value));
         try writer.print("zlrd_alerts_fired_total{{rule=\"{s}\"}} {d}\n", .{
             kind.label(),
-            m.alerts_fired_total[f.value].load(.monotonic),
+            m.alerts_fired_total[value].load(.monotonic),
         });
     }
 
     try writer.print("# HELP zlrd_http_requests_total HTTP requests served by the metrics endpoint.\n", .{});
     try writer.print("# TYPE zlrd_http_requests_total counter\n", .{});
-    inline for (@typeInfo(HttpRoute).@"enum".fields) |rf| {
-        const route: HttpRoute = @enumFromInt(rf.value);
+    inline for (@typeInfo(HttpRoute).@"enum".field_values) |value| {
+        const route: HttpRoute = @fromBackingInt(@intCast(value));
         for (http_status_codes, 0..) |code, ci| {
             try writer.print("zlrd_http_requests_total{{route=\"{s}\",code=\"{d}\"}} {d}\n", .{
                 route.label(),
                 code,
-                m.http_requests_total[rf.value][ci].load(.monotonic),
+                m.http_requests_total[value][ci].load(.monotonic),
             });
         }
     }
@@ -211,19 +211,19 @@ pub fn renderJson(m: *const Metrics, writer: *std.Io.Writer, now_ms: i64) std.Io
     try writer.print(",\"bytes_total\":{d}", .{m.bytes_total.load(.monotonic)});
 
     try writer.writeAll(",\"alerts_fired_total\":{");
-    inline for (@typeInfo(RuleKind).@"enum".fields, 0..) |f, i| {
-        const kind: RuleKind = @enumFromInt(f.value);
+    inline for (@typeInfo(RuleKind).@"enum".field_values, 0..) |value, i| {
+        const kind: RuleKind = @fromBackingInt(@intCast(value));
         if (i != 0) try writer.writeByte(',');
-        try writer.print("\"{s}\":{d}", .{ kind.label(), m.alerts_fired_total[f.value].load(.monotonic) });
+        try writer.print("\"{s}\":{d}", .{ kind.label(), m.alerts_fired_total[value].load(.monotonic) });
     }
     try writer.writeAll("}");
 
     try writer.writeAll(",\"http_requests_total\":[");
     var first = true;
-    inline for (@typeInfo(HttpRoute).@"enum".fields) |rf| {
-        const route: HttpRoute = @enumFromInt(rf.value);
+    inline for (@typeInfo(HttpRoute).@"enum".field_values) |value| {
+        const route: HttpRoute = @fromBackingInt(@intCast(value));
         for (http_status_codes, 0..) |code, ci| {
-            const v = m.http_requests_total[rf.value][ci].load(.monotonic);
+            const v = m.http_requests_total[value][ci].load(.monotonic);
             if (v == 0) continue;
             if (!first) try writer.writeByte(',');
             first = false;
@@ -244,8 +244,8 @@ test "observeLine: known level increments matching bucket, unknown lands in 'unk
     m.observeLine(.Info, 10);
     m.observeLine(null, 5);
     m.observeLine(null, 0);
-    try testing.expectEqual(@as(u64, 1), m.lines_total[@intFromEnum(flags.Level.Error)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.lines_total[@intFromEnum(flags.Level.Info)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.lines_total[@backingInt(flags.Level.Error)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.lines_total[@backingInt(flags.Level.Info)].load(.monotonic));
     try testing.expectEqual(@as(u64, 2), m.lines_total[level_count - 1].load(.monotonic));
     try testing.expectEqual(@as(u64, 57), m.bytes_total.load(.monotonic));
 }
@@ -255,8 +255,8 @@ test "observeAlert: increments matching rule bucket" {
     m.observeAlert(.regex);
     m.observeAlert(.regex);
     m.observeAlert(.first_seen);
-    try testing.expectEqual(@as(u64, 2), m.alerts_fired_total[@intFromEnum(RuleKind.regex)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.alerts_fired_total[@intFromEnum(RuleKind.first_seen)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), m.alerts_fired_total[@backingInt(RuleKind.regex)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.alerts_fired_total[@backingInt(RuleKind.first_seen)].load(.monotonic));
 }
 
 test "observeHttp: known and unknown codes" {
@@ -264,9 +264,9 @@ test "observeHttp: known and unknown codes" {
     m.observeHttp(.metrics, 200);
     m.observeHttp(.metrics, 401);
     m.observeHttp(.metrics, 503); // unknown -> bucketed into 500
-    try testing.expectEqual(@as(u64, 1), m.http_requests_total[@intFromEnum(HttpRoute.metrics)][indexOfCode(200)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.http_requests_total[@intFromEnum(HttpRoute.metrics)][indexOfCode(401)].load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), m.http_requests_total[@intFromEnum(HttpRoute.metrics)][indexOfCode(500)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.http_requests_total[@backingInt(HttpRoute.metrics)][indexOfCode(200)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.http_requests_total[@backingInt(HttpRoute.metrics)][indexOfCode(401)].load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), m.http_requests_total[@backingInt(HttpRoute.metrics)][indexOfCode(500)].load(.monotonic));
 }
 
 test "renderPrometheus: contains expected metric lines" {

@@ -231,13 +231,13 @@ test "on-disk headers decode as little-endian" {
     // skip rather than report a failure the code can't act on.
     if (comptime builtin.cpu.arch.endian() != .little) return error.SkipZigTest;
 
-    var bytes: [@sizeOf(ObjectHeader)]u8 = .{0} ** @sizeOf(ObjectHeader);
-    bytes[0] = @intFromEnum(ObjectType.entry_array);
+    var bytes: [@sizeOf(ObjectHeader)]u8 = @splat(0);
+    bytes[0] = @backingInt(ObjectType.entry_array);
     // size = 0x0102 stored little-endian at offset 8.
     bytes[8] = 0x02;
     bytes[9] = 0x01;
 
     const obj = std.mem.bytesAsValue(ObjectHeader, &bytes).*;
-    try testing.expectEqual(@intFromEnum(ObjectType.entry_array), obj.type);
+    try testing.expectEqual(@backingInt(ObjectType.entry_array), obj.type);
     try testing.expectEqual(@as(u64, 0x0102), obj.size);
 }

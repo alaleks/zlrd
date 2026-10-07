@@ -154,13 +154,13 @@ pub fn filetimeToUnixMs(ft: u64) i64 {
 
 /// CRC32 as the format uses it — the ordinary IEEE/zlib polynomial.
 pub fn crc32(bytes: []const u8) u32 {
-    return std.hash.crc.Crc32.hash(bytes);
+    return std.hash.crc.@"CRC-32/ISO-HDLC".hash(bytes);
 }
 
 /// CRC32 over two regions, for `ChunkHeader.header_checksum`, which skips
 /// the checksum field itself.
 pub fn crc32Split(a: []const u8, b: []const u8) u32 {
-    var h = std.hash.crc.Crc32.init();
+    var h = std.hash.crc.@"CRC-32/ISO-HDLC".init();
     h.update(a);
     h.update(b);
     return h.final();

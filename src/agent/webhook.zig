@@ -201,7 +201,7 @@ pub const Sender = struct {
             return;
         };
 
-        const code = @intFromEnum(result.status);
+        const code = @backingInt(result.status);
         if (code >= 400) {
             log.warn("webhook POST {s} returned {d}", .{ url, code });
         }

@@ -122,7 +122,7 @@ pub const Detector = struct {
             //
             // User-supplied patterns are deliberately still honoured: the
             // operator asked for those explicitly.
-            if (@intFromEnum(l) < @intFromEnum(flags.Level.Error)) return self.matchCustom(line);
+            if (@backingInt(l) < @backingInt(flags.Level.Error)) return self.matchCustom(line);
         }
         if (runtimeMarker(line)) |m| return m;
         if (bannerAt(line, "Traceback (most recent call last):")) return .python_traceback;

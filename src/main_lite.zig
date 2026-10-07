@@ -31,9 +31,10 @@ pub fn main(opts: struct {
     // be legible.
     const stdout = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
-    const vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
-    const out_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stdout.isTty(io) catch false));
-    const err_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stderr_file.isTty(io) catch false));
+    const stdout_vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
+    const stderr_vt_ok = reader.theme_mod.prepareConsole(stderr_file.handle);
+    const out_env = reader.theme_mod.fromMap(opts.environ_map, stdout_vt_ok and (stdout.isTty(io) catch false));
+    const err_env = reader.theme_mod.fromMap(opts.environ_map, stderr_vt_ok and (stderr_file.isTty(io) catch false));
 
     var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
         // `--color` and `--theme` are unavailable when parsing is what
@@ -151,6 +152,7 @@ fn isAgentModeRequested(args: flags.Args) bool {
     // `--state` and `zlrd status` read and write the agent's own bookkeeping,
     // which this build has nothing to write.
     if (args.state_path != null) return true;
+    if (args.no_state) return true;
     if (args.status_mode) return true;
     if (args.alert_exit_on_alert) return true;
     if (args.kernel_probes) return true;
@@ -159,7 +161,15 @@ fn isAgentModeRequested(args: flags.Args) bool {
     if (args.journal_units.len > 0) return true;
     if (args.sidecar_url != null) return true;
     if (args.sidecar_headers.len > 0) return true;
+    if (args.sidecar_flush_interval != null) return true;
+    if (args.sidecar_batch_size != null) return true;
     return false;
+}
+
+test "lite rejects every state and sidecar-only flag" {
+    try std.testing.expect(isAgentModeRequested(.{ .no_state = true }));
+    try std.testing.expect(isAgentModeRequested(.{ .sidecar_flush_interval = "1s" }));
+    try std.testing.expect(isAgentModeRequested(.{ .sidecar_batch_size = "1" }));
 }
 
 /// Styled fatal error. `hint` is an optional follow-up line in muted colour.
@@ -176,7 +186,7 @@ fn fatal(io: std.Io, th: *const reader.Theme, msg: []const u8, hint: ?[]const u8
 
     e.writeStreamingAll(io, "\n") catch {};
     if (th.colored) e.writeStreamingAll(io, "\x1b[1m") catch {};
-    e.writeStreamingAll(io, p.level[@intFromEnum(flags.Level.Error)]) catch {};
+    e.writeStreamingAll(io, p.level[@backingInt(flags.Level.Error)]) catch {};
     e.writeStreamingAll(io, cross) catch {};
     e.writeStreamingAll(io, p.reset) catch {};
     e.writeStreamingAll(io, "  ") catch {};
@@ -264,7 +274,9 @@ fn findLogFiles(allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
         if (!std.mem.endsWith(u8, entry.name, ".log") and
             !std.mem.endsWith(u8, entry.name, ".log.gz")) continue;
 
-        try list.append(allocator, try allocator.dupe(u8, entry.name));
+        const path = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(path);
+        try list.append(allocator, path);
     }
 
     std.mem.sort([]const u8, list.items, {}, struct {

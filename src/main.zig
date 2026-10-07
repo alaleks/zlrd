@@ -29,9 +29,10 @@ pub fn main(opts: struct {
     // legible.
     const stdout = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
-    const vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
-    const out_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stdout.isTty(io) catch false));
-    const err_env = reader.theme_mod.fromMap(opts.environ_map, vt_ok and (stderr_file.isTty(io) catch false));
+    const stdout_vt_ok = reader.theme_mod.prepareConsole(stdout.handle);
+    const stderr_vt_ok = reader.theme_mod.prepareConsole(stderr_file.handle);
+    const out_env = reader.theme_mod.fromMap(opts.environ_map, stdout_vt_ok and (stdout.isTty(io) catch false));
+    const err_env = reader.theme_mod.fromMap(opts.environ_map, stderr_vt_ok and (stderr_file.isTty(io) catch false));
 
     var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
         // `--color` and `--theme` are unavailable when parsing is what
@@ -64,21 +65,21 @@ pub fn main(opts: struct {
     // rather than inside the agent because it depends on the environment,
     // and because `zlrd status` needs the very same answer.
     const state_path: ?[]u8 = if (parsed_args.no_state) null else if (parsed_args.state_path) |p|
-        allocator.dupe(u8, p) catch null
+        try allocator.dupe(u8, p)
     else
-        state.defaultPath(allocator, .{
+        try state.defaultPath(allocator, .{
             .zlrd_state = opts.environ_map.get("ZLRD_STATE"),
             .xdg_state_home = opts.environ_map.get("XDG_STATE_HOME"),
             .home = opts.environ_map.get("HOME"),
             .local_app_data = opts.environ_map.get("LOCALAPPDATA"),
-        }) catch null;
+        });
     defer if (state_path) |p| allocator.free(p);
 
     if (parsed_args.status_mode) {
         // Before the file discovery below, which would fail out of a
         // directory with no logs in it — `zlrd status` reads one file and it
         // is never a log.
-        printStatus(allocator, io, &th, &err_th, state_path);
+        printStatus(allocator, io, &th, &err_th, state_path) catch std.process.exit(1);
         return;
     }
 
@@ -164,17 +165,17 @@ fn printStatus(
     th: *const reader.Theme,
     err_th: *const reader.Theme,
     state_path: ?[]const u8,
-) void {
+) !void {
     const path = state_path orelse {
         fatal(io, err_th, "--no-state leaves nothing for status to read", "drop --no-state, or pass --state <path>");
-        return;
+        return error.StateDisabled;
     };
 
     var store = state.Store.open(allocator, io, path) catch |err| {
         var buf: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ path, @errorName(err) }) catch "cannot read the state file";
         fatal(io, err_th, msg, "the agent writes this file; run zlrd --agent first");
-        return;
+        return err;
     };
     defer store.deinit();
 
@@ -185,8 +186,14 @@ fn printStatus(
         store.snapshot(),
         statusStyle(th),
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
-    ) catch {};
-    fw.interface.flush() catch {};
+    ) catch |err| {
+        fatal(io, err_th, runtimeErrorMessage(err), null);
+        return err;
+    };
+    fw.interface.flush() catch |err| {
+        fatal(io, err_th, runtimeErrorMessage(err), null);
+        return err;
+    };
 }
 
 /// Adapts the resolved terminal theme to the handful of escapes the status
@@ -199,7 +206,7 @@ fn statusStyle(th: *const reader.Theme) status.Style {
         .reset = p.reset,
         .dim = p.dim,
         .muted = p.muted,
-        .bad = p.level[@intFromEnum(flags.Level.Error)],
+        .bad = p.level[@backingInt(flags.Level.Error)],
         .rule = if (th.glyphs.unicode_ok) th.glyphs.rule else "-",
         .none = if (th.glyphs.unicode_ok) "\u{2014}" else "-",
     };
@@ -220,7 +227,7 @@ fn fatal(io: std.Io, th: *const reader.Theme, msg: []const u8, hint: ?[]const u8
 
     e.writeStreamingAll(io, "\n") catch {};
     if (th.colored) e.writeStreamingAll(io, "\x1b[1m") catch {};
-    e.writeStreamingAll(io, p.level[@intFromEnum(flags.Level.Error)]) catch {};
+    e.writeStreamingAll(io, p.level[@backingInt(flags.Level.Error)]) catch {};
     e.writeStreamingAll(io, cross) catch {};
     e.writeStreamingAll(io, p.reset) catch {};
     e.writeStreamingAll(io, "  ") catch {};
@@ -308,7 +315,9 @@ fn findLogFiles(allocator: std.mem.Allocator, io: std.Io) ![][]const u8 {
         if (!std.mem.endsWith(u8, entry.name, ".log") and
             !std.mem.endsWith(u8, entry.name, ".log.gz")) continue;
 
-        try list.append(allocator, try allocator.dupe(u8, entry.name));
+        const path = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(path);
+        try list.append(allocator, path);
     }
 
     std.mem.sort([]const u8, list.items, {}, struct {

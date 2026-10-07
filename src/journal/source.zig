@@ -218,9 +218,9 @@ test "matchesUnitGlob: backtracks when a wildcard overshoots" {
 
 test "matchesUnitGlob: pathological pattern stays linear" {
     // The recursive implementation this replaced went exponential here.
-    const unit = "a" ** 40;
-    try testing.expect(!matchesUnitGlob("*a*a*a*a*a*b", unit));
-    try testing.expect(matchesUnitGlob("*a*a*a*a*a*a", unit));
+    const unit: [40]u8 = @splat('a');
+    try testing.expect(!matchesUnitGlob("*a*a*a*a*a*b", &unit));
+    try testing.expect(matchesUnitGlob("*a*a*a*a*a*a", &unit));
 }
 
 test "matchesUnitGlob: '?' is a literal, not a wildcard" {

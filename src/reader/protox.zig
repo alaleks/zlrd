@@ -705,7 +705,7 @@ test "hex dump is capped and reports the full length" {
     var sink = TestSink{ .allocator = testing.allocator };
     defer sink.deinit();
 
-    const body = [_]u8{0xff} ** 8;
+    const body: [8]u8 = @splat(0xff);
     const src = "\x0a\x08" ++ body;
     writeBlock(&sink, &theme.Theme.plain, src, .{ .max_hex_bytes = 2 });
 

@@ -43,7 +43,7 @@ const Builder = struct {
         try self.pad();
         const off = self.b.items.len;
         var dh: fmt.DataHead = std.mem.zeroes(fmt.DataHead);
-        dh.object.type = @intFromEnum(fmt.ObjectType.data);
+        dh.object.type = @backingInt(fmt.ObjectType.data);
         dh.object.size = @sizeOf(fmt.DataHead) + payload.len;
         dh.n_entries = n_refs;
         try self.b.appendSlice(self.a, std.mem.asBytes(&dh));
@@ -54,7 +54,7 @@ const Builder = struct {
         try self.pad();
         const off = self.b.items.len;
         var eh: fmt.EntryHead = std.mem.zeroes(fmt.EntryHead);
-        eh.object.type = @intFromEnum(fmt.ObjectType.entry);
+        eh.object.type = @backingInt(fmt.ObjectType.entry);
         eh.object.size = @sizeOf(fmt.EntryHead) + @sizeOf(fmt.EntryItem) * items.len;
         eh.seqnum = seq;
         eh.realtime = 1_700_000_000_000_000 + seq * 1000;
@@ -69,11 +69,11 @@ const Builder = struct {
         try self.pad();
         const off = self.b.items.len;
         var ah: fmt.EntryArrayHead = std.mem.zeroes(fmt.EntryArrayHead);
-        ah.object.type = @intFromEnum(fmt.ObjectType.entry_array);
+        ah.object.type = @backingInt(fmt.ObjectType.entry_array);
         ah.object.size = @sizeOf(fmt.EntryArrayHead) + 8 * cap;
         try self.b.appendSlice(self.a, std.mem.asBytes(&ah));
         for (entries) |e| try self.b.appendSlice(self.a, &@as([8]u8, @bitCast(e)));
-        for (entries.len..cap) |_| try self.b.appendSlice(self.a, &[_]u8{0} ** 8);
+        for (entries.len..cap) |_| try self.b.appendSlice(self.a, &@as([8]u8, @splat(0)));
         return @intCast(off);
     }
 };

@@ -199,7 +199,7 @@ test "decompressSystemd validates the size prefix and round-trips" {
 }
 
 test "rejects an impossibly large declared size" {
-    var src: [16]u8 = .{0} ** 16;
+    var src: [16]u8 = @splat(0);
     std.mem.writeInt(u64, src[0..8], std.math.maxInt(u64), .little);
     try testing.expectError(error.InvalidSize, decompressSystemd(testing.allocator, &src));
 }
@@ -235,7 +235,7 @@ test "extended match length (nibble 15 plus continuation bytes)" {
     var dst: [24]u8 = undefined;
     const n = try decompressBlock(&block, &dst);
     try testing.expectEqual(@as(usize, 24), n);
-    try testing.expectEqualStrings("ABCD" ** 6, &dst);
+    try testing.expectEqualStrings("ABCDABCDABCDABCDABCDABCD", &dst);
 }
 
 test "overlapping match with offset 1 expands to a run" {
@@ -303,7 +303,7 @@ test "rejects a payload too short to hold the size prefix" {
 test "rejects a literal run that would overrun the output buffer" {
     // Token claims 15+ literals and the continuation says 300, but the
     // caller only sized `dst` for 16.
-    const block = [_]u8{ 0xF0, 0xFF, 0x2A } ++ [_]u8{'x'} ** 16;
+    const block = [_]u8{ 0xF0, 0xFF, 0x2A } ++ @as([16]u8, @splat('x'));
     var dst: [16]u8 = undefined;
     try testing.expectError(error.Truncated, decompressBlock(&block, &dst));
 }

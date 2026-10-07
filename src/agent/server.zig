@@ -161,7 +161,7 @@ pub const Server = struct {
         content_type: []const u8,
         body: []const u8,
     ) void {
-        self.metrics.observeHttp(route, @intFromEnum(status));
+        self.metrics.observeHttp(route, @backingInt(status));
         request.respond(body, .{
             .status = status,
             .extra_headers = &.{

@@ -192,7 +192,7 @@ pub const Transport = struct {
                 continue;
             };
 
-            const code = @intFromEnum(result.status);
+            const code = @backingInt(result.status);
             if (code >= 200 and code < 300) return .success;
             if (!retryable(code)) {
                 log.warn("sidecar POST {s} returned {d} (non-retryable)", .{ url, code });
@@ -382,10 +382,10 @@ test "gzipCompress output round-trips through the gzip decoder" {
     });
     defer t.deinit();
 
-    const long = "L" ** 4096;
+    const long: [4096]u8 = @splat('L');
     const short = "short payload";
 
-    _ = try t.gzipCompress(long);
+    _ = try t.gzipCompress(&long);
     const compressed = try t.gzipCompress(short);
 
     var in: std.Io.Reader = .fixed(compressed);

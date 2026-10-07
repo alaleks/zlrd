@@ -729,11 +729,11 @@ pub const FilterState = struct {
 
 /// Per-level line counter for summary display.
 pub const LevelCounter = struct {
-    counts: [7]usize = [_]usize{0} ** 7,
+    counts: [7]usize = @splat(0),
     total: usize = 0,
 
     pub fn add(self: *LevelCounter, lvl: flags.Level) void {
-        self.counts[@intFromEnum(lvl)] += 1;
+        self.counts[@backingInt(lvl)] += 1;
         self.total += 1;
     }
 
@@ -742,7 +742,7 @@ pub const LevelCounter = struct {
         if (self.total == 0) return;
         const levels = [_]flags.Level{ .Trace, .Debug, .Info, .Warn, .Error, .Fatal, .Panic };
         for (levels) |lvl| {
-            const n = self.counts[@intFromEnum(lvl)];
+            const n = self.counts[@backingInt(lvl)];
             if (n == 0) continue;
             out.write(out.theme.levelStyle(lvl));
             out.write(" ");
@@ -3258,7 +3258,8 @@ test "scanLines splits on newlines across read boundaries" {
     defer content.deinit(std.testing.allocator);
     for (0..500) |i| {
         var buf: [512]u8 = undefined;
-        const ln = try std.fmt.bufPrint(&buf, "line {d} {s}", .{ i, "x" ** 300 });
+        const padding: [300]u8 = @splat('x');
+        const ln = try std.fmt.bufPrint(&buf, "line {d} {s}", .{ i, &padding });
         try expected.append(std.testing.allocator, try std.testing.allocator.dupe(u8, ln));
         try content.appendSlice(std.testing.allocator, ln);
         if (i != 499) try content.append(std.testing.allocator, '\n');
@@ -3854,7 +3855,8 @@ test "expanding a huge embedded payload is refused rather than attempted" {
     var big: std.ArrayList(u8) = .empty;
     defer big.deinit(std.testing.allocator);
     try big.appendSlice(std.testing.allocator, "12:00:01 [INFO] dump {\"k\":\"");
-    try big.appendSlice(std.testing.allocator, "y" ** 4096);
+    const padding: [4096]u8 = @splat('y');
+    try big.appendSlice(std.testing.allocator, &padding);
     try big.appendSlice(std.testing.allocator, "\"}");
 
     var h = TestOut{ .th = theme.Theme.plain };

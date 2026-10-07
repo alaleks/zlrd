@@ -10,7 +10,7 @@ asked only once.
 
 ## Building and testing
 
-Requires Zig **0.16.0** or later. No other toolchain, no package manager.
+Requires Zig **0.17.0** or later. No other toolchain, no package manager.
 
 ```bash
 zig build                 # both binaries into zig-out/bin

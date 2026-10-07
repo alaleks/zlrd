@@ -86,7 +86,7 @@ fn encodeLogRecord(enc: *pb.Encoder, record: LogRecord) !void {
     const lr = try enc.beginMessage(2); // ScopeLogs.log_records = 2
 
     try enc.writeFixed64Field(1, record.time_unix_nano);
-    try enc.writeVarintField(2, @intFromEnum(record.severity));
+    try enc.writeVarintField(2, @backingInt(record.severity));
     if (record.severity_text.len > 0) try enc.writeStringField(3, record.severity_text);
 
     // body is an AnyValue (string variant).

@@ -54,7 +54,7 @@ pub fn varintSize(value: u64) usize {
 
 /// Encodes a field tag `(field_number << 3) | wire_type` into `buf`.
 pub fn encodeTag(buf: []u8, field_number: u32, wire: WireType) Error!usize {
-    const tag = (@as(u64, field_number) << 3) | @intFromEnum(wire);
+    const tag = (@as(u64, field_number) << 3) | @backingInt(wire);
     return encodeVarint(buf, tag);
 }
 
@@ -199,7 +199,7 @@ pub const Encoder = struct {
     }
 
     pub fn writeTag(self: *Encoder, field_number: u32, wire: WireType) !void {
-        const tag = (@as(u64, field_number) << 3) | @intFromEnum(wire);
+        const tag = (@as(u64, field_number) << 3) | @backingInt(wire);
         try self.writeVarintImpl(tag);
     }
 

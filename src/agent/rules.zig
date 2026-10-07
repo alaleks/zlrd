@@ -22,7 +22,7 @@ const buckets_per_window = 8;
 /// `(now_ms / bucket_size_ms) % N`; if the slot's stored epoch is stale, it's
 /// recycled. On read, we sum buckets whose epoch is within `[now - window, now]`.
 const WindowedCounter = struct {
-    buckets: [buckets_per_window]Bucket = [_]Bucket{.{ .epoch = 0, .count = 0 }} ** buckets_per_window,
+    buckets: [buckets_per_window]Bucket = @splat(.{ .epoch = 0, .count = 0 }),
     window_ms: u64,
     bucket_size_ms: u64,
     threshold: u32,

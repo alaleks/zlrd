@@ -491,9 +491,9 @@ test "validate rejects things that only look like JSON" {
 }
 
 test "validate honours the depth and size caps" {
-    const deep = "{\"a\":" ++ ("[" ** 40) ++ ("]" ** 40) ++ "}";
+    const deep = "{\"a\":" ++ @as([40]u8, @splat('[')) ++ @as([40]u8, @splat(']')) ++ "}";
     try testing.expect(validate(deep, .{ .max_depth = 8 }) == null);
-    const big = "{\"key\":\"" ++ ("x" ** 500) ++ "\"}";
+    const big = "{\"key\":\"" ++ @as([500]u8, @splat('x')) ++ "\"}";
     try testing.expect(validate(big, .{ .max_bytes = 64 }) == null);
     try testing.expect(validate(big, .{}) != null);
 }

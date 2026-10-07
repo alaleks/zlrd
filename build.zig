@@ -146,17 +146,13 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run zlrd");
     run_step.dependOn(&run_cmd.step);
 
     const run_lite_cmd = b.addRunArtifact(exe_lite);
     run_lite_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_lite_cmd.addArgs(args);
-    }
+    run_lite_cmd.addPassthruArgs();
     const run_lite_step = b.step("run-lite", "Run zlrd-lite");
     run_lite_step.dependOn(&run_lite_cmd.step);
 

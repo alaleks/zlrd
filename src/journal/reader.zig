@@ -436,7 +436,7 @@ pub const Iterator = struct {
         try self.reader.readAt(self.array_offset, &head_buf);
         const head = std.mem.bytesAsValue(fmt.EntryArrayHead, &head_buf).*;
 
-        if (head.object.type != @intFromEnum(fmt.ObjectType.entry_array)) return error.InvalidObjectType;
+        if (head.object.type != @backingInt(fmt.ObjectType.entry_array)) return error.InvalidObjectType;
         if (head.object.size < @sizeOf(fmt.EntryArrayHead)) return error.InvalidObjectSize;
         try self.reader.checkObjectFits(self.array_offset, head.object.size);
 
@@ -591,7 +591,7 @@ pub const Iterator = struct {
         if (got.len < @sizeOf(fmt.EntryHead)) return error.InvalidObjectSize;
         const head = std.mem.bytesAsValue(fmt.EntryHead, got[0..@sizeOf(fmt.EntryHead)]).*;
 
-        if (head.object.type != @intFromEnum(fmt.ObjectType.entry)) return error.InvalidObjectType;
+        if (head.object.type != @backingInt(fmt.ObjectType.entry)) return error.InvalidObjectType;
         if (head.object.size < @sizeOf(fmt.EntryHead)) return error.InvalidObjectSize;
         try self.reader.checkObjectFits(offset, head.object.size);
 
@@ -669,7 +669,7 @@ pub const Iterator = struct {
         if (got.len < @sizeOf(fmt.DataHead)) return error.InvalidObjectSize;
         const head = std.mem.bytesAsValue(fmt.DataHead, got[0..@sizeOf(fmt.DataHead)]).*;
 
-        if (head.object.type != @intFromEnum(fmt.ObjectType.data)) return error.InvalidObjectType;
+        if (head.object.type != @backingInt(fmt.ObjectType.data)) return error.InvalidObjectType;
         const compression = head.object.flags & fmt.obj_compression_mask;
 
         const payload_start = fmt.dataPayloadStart(compact);
@@ -953,7 +953,7 @@ const SyntheticBuilder = struct {
         const off = self.bytes.items.len;
         const extra_size: usize = if (self.compact) @sizeOf(fmt.DataCompactExtra) else 0;
         var dh: fmt.DataHead = std.mem.zeroes(fmt.DataHead);
-        dh.object.type = @intFromEnum(fmt.ObjectType.data);
+        dh.object.type = @backingInt(fmt.ObjectType.data);
         dh.object.flags = obj_flags;
         dh.object.size = @sizeOf(fmt.DataHead) + extra_size + payload.len;
         dh.n_entries = n_entries;
@@ -992,7 +992,7 @@ const SyntheticBuilder = struct {
         const off = self.bytes.items.len;
         const item_sz: usize = if (self.compact) @sizeOf(fmt.CompactEntryItem) else @sizeOf(fmt.EntryItem);
         var eh: fmt.EntryHead = std.mem.zeroes(fmt.EntryHead);
-        eh.object.type = @intFromEnum(fmt.ObjectType.entry);
+        eh.object.type = @backingInt(fmt.ObjectType.entry);
         eh.object.size = @sizeOf(fmt.EntryHead) + item_sz * data_offsets.len;
         eh.seqnum = seqnum;
         eh.realtime = realtime;
@@ -1026,7 +1026,7 @@ const SyntheticBuilder = struct {
         const off = self.bytes.items.len;
         const item_sz: usize = if (self.compact) @sizeOf(u32) else @sizeOf(u64);
         var ah: fmt.EntryArrayHead = std.mem.zeroes(fmt.EntryArrayHead);
-        ah.object.type = @intFromEnum(fmt.ObjectType.entry_array);
+        ah.object.type = @backingInt(fmt.ObjectType.entry_array);
         ah.object.size = @sizeOf(fmt.EntryArrayHead) + item_sz * capacity;
         try self.bytes.appendSlice(self.allocator, std.mem.asBytes(&ah));
         for (entry_offsets) |e| try self.appendArrayItem(e);
@@ -1087,7 +1087,7 @@ test "Reader.open rejects files without the magic header" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(tio, .{
         .sub_path = "bogus.journal",
-        .data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 } ** 32,
+        .data = &@as([256]u8, @splat(0)),
     });
     try testing.expectError(error.InvalidMagic, Reader.open(tio, tmp.dir, "bogus.journal"));
 }
@@ -2124,7 +2124,7 @@ test "Reader.refresh picks up header changes and the new file size" {
     h.n_entries = 7;
     h.tail_entry_seqnum = 42;
     // Static fields must survive the partial re-read untouched.
-    try b.bytes.appendSlice(testing.allocator, &[_]u8{0} ** 64);
+    try b.bytes.appendSlice(testing.allocator, &@as([64]u8, @splat(0)));
     try b.write(tmp.dir, "hdr.journal");
 
     try r.refresh();
@@ -2187,7 +2187,8 @@ test "a single-use payload cannot evict the working set" {
     for (&entries, 0..) |*slot, i| {
         // Each message is unique and long enough that 400 of them would
         // overrun the cache arena several times over.
-        const msg = try std.fmt.bufPrint(&key_buf, "MESSAGE=unique payload number {d} {s}", .{ i, "p" ** 64 });
+        const padding: [64]u8 = @splat('p');
+        const msg = try std.fmt.bufPrint(&key_buf, "MESSAGE=unique payload number {d} {s}", .{ i, &padding });
         const d = try b.writeDataShared(msg, 1);
         slot.* = try b.writeEntry(@intCast(i + 1), 1, &.{ shared, d });
     }

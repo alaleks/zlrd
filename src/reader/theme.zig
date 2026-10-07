@@ -147,7 +147,7 @@ pub const Theme = struct {
 
     /// Badge escape for `lvl`, or an empty string when colour is off.
     pub inline fn levelStyle(self: *const Theme, lvl: flags.Level) []const u8 {
-        return self.palette.level[@intFromEnum(lvl)];
+        return self.palette.level[@backingInt(lvl)];
     }
 };
 
@@ -616,8 +616,8 @@ test "the plain palette emits nothing at all" {
 
 test "level badges cover every level in the enum" {
     const t = Theme.forMode(.truecolor, Glyphs.ascii, .dark);
-    inline for (@typeInfo(flags.Level).@"enum".fields) |f| {
-        const lvl: flags.Level = @enumFromInt(f.value);
+    inline for (@typeInfo(flags.Level).@"enum".field_values) |value| {
+        const lvl: flags.Level = @fromBackingInt(@intCast(value));
         try testing.expect(t.levelStyle(lvl).len > 0);
     }
 }

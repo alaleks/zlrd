@@ -129,7 +129,7 @@ pub const Monitor = struct {
             .sink = sink,
             .ctx = ctx,
             .stop_flag = .init(false),
-            .threads = [_]?std.Thread{null} ** max_threads,
+            .threads = @splat(null),
             .threads_len = 0,
             .stop_fd = -1,
         };
@@ -276,7 +276,8 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 const testing = std.testing;
 
 test "makeEvent: truncates comm and detail to fixed buffers" {
-    const ev = makeEvent(.oom, .kmsg, 1234, "abcdefghijklmnopqrstuvwxyz", "x" ** 200);
+    const long_message: [200]u8 = @splat('x');
+    const ev = makeEvent(.oom, .kmsg, 1234, "abcdefghijklmnopqrstuvwxyz", &long_message);
     try testing.expectEqual(@as(u8, 16), ev.comm_len);
     try testing.expectEqualStrings("abcdefghijklmnop", ev.commSlice());
     try testing.expectEqual(@as(u8, 128), ev.detail_len);

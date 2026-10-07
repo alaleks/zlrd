@@ -258,7 +258,7 @@ const Builder = struct {
 
     /// Appends one chunk holding `payloads`, one record each.
     fn addChunk(self: *Builder, payloads: []const []const u8) !void {
-        var chunk = [_]u8{0} ** fmt.chunk_size;
+        var chunk: [fmt.chunk_size]u8 = @splat(0);
         @memcpy(chunk[0..8], &fmt.chunk_magic);
 
         var pos: usize = fmt.chunk_records_offset;
@@ -296,7 +296,7 @@ const Builder = struct {
 
     /// Finishes the file by prepending the header block.
     fn finish(self: *Builder) ![]const u8 {
-        var block = [_]u8{0} ** fmt.header_block_size;
+        var block: [fmt.header_block_size]u8 = @splat(0);
         @memcpy(block[0..8], &fmt.file_magic);
         std.mem.writeInt(u64, block[8..][0..8], 0, .little);
         std.mem.writeInt(u64, block[16..][0..8], self.chunks -| 1, .little);
@@ -331,7 +331,7 @@ test "file header round-trips through the builder" {
 }
 
 test "a file that is not evtx is rejected by magic, not by luck" {
-    var block = [_]u8{0} ** fmt.header_block_size;
+    var block: [fmt.header_block_size]u8 = @splat(0);
     @memcpy(block[0..8], "NotElf\x00\x00");
     try testing.expectError(Error.NotEvtx, parseFileHeader(&block));
 }

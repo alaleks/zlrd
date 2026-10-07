@@ -33,14 +33,14 @@ pub const LevelMask = u8;
 
 pub fn allLevelsMask() LevelMask {
     var mask: LevelMask = 0;
-    inline for (@typeInfo(Level).@"enum".fields) |f| {
-        mask |= levelBit(@enumFromInt(f.value));
+    inline for (@typeInfo(Level).@"enum".field_values) |value| {
+        mask |= levelBit(@fromBackingInt(@intCast(value)));
     }
     return mask;
 }
 
 pub inline fn levelBit(lvl: Level) LevelMask {
-    return @as(LevelMask, 1) << @intCast(@intFromEnum(lvl));
+    return @as(LevelMask, 1) << @intCast(@backingInt(lvl));
 }
 
 pub fn parseLevelInsensitive(s: []const u8) ?Level {
@@ -59,8 +59,9 @@ pub fn parseLevelInsensitive(s: []const u8) ?Level {
         else => return null,
     }
 
-    inline for (@typeInfo(Level).@"enum".fields) |f| {
-        if (eqlIgnoreCaseFast(s, f.name)) return @enumFromInt(f.value);
+    const level_info = @typeInfo(Level).@"enum";
+    inline for (level_info.field_names, level_info.field_values) |name, value| {
+        if (eqlIgnoreCaseFast(s, name)) return @fromBackingInt(@intCast(value));
     }
     // Short / alternate forms emitted by common loggers (zerolog, gRPC, syslog).
     if (s.len == 3) {
@@ -92,8 +93,9 @@ pub fn parseLevelInsensitive(s: []const u8) ?Level {
 }
 
 pub fn parseAggregateMode(s: []const u8) ?AggregateMode {
-    inline for (@typeInfo(AggregateMode).@"enum".fields) |f| {
-        if (eqlDashInsensitive(s, f.name)) return @enumFromInt(f.value);
+    const mode_info = @typeInfo(AggregateMode).@"enum";
+    inline for (mode_info.field_names, mode_info.field_values) |name, value| {
+        if (eqlDashInsensitive(s, name)) return @fromBackingInt(@intCast(value));
     }
     return null;
 }

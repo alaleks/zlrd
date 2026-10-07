@@ -15,7 +15,7 @@
   <a href="https://github.com/alaleks/zlrd/releases"><img src="https://img.shields.io/github/v/release/alaleks/zlrd?color=blue&label=release&cacheSeconds=3600" alt="Release"></a>
   <a href="https://github.com/alaleks/zlrd/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alaleks/zlrd/ci.yml?branch=master&label=ci" alt="CI"></a>
   <a href="https://github.com/alaleks/zlrd/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alaleks/zlrd/release.yml?label=release" alt="Release build"></a>
-  <a href="https://ziglang.org"><img src="https://img.shields.io/badge/zig-0.16.0-orange?logo=zig" alt="Zig 0.16.0"></a>
+  <a href="https://ziglang.org"><img src="https://img.shields.io/badge/zig-0.17.0-orange?logo=zig" alt="Zig 0.17.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="License"></a>
 </p>
 
@@ -350,7 +350,7 @@ curl -fsSL https://github.com/alaleks/zlrd/releases/latest/download/zlrd-lite-x8
 
 ### From source
 
-Requires Zig **0.16.0** or later.
+Requires Zig **0.17.0** or later.
 
 ```bash
 git clone https://github.com/alaleks/zlrd.git

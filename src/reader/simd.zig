@@ -473,7 +473,7 @@ test "findByte: small buffer" {
 }
 
 test "findByte: large buffer SIMD" {
-    const buf = "a" ** 100 ++ "x" ++ "a" ** 100;
+    const buf = @as([100]u8, @splat('a')) ++ "x" ++ @as([100]u8, @splat('a'));
     try testing.expectEqual(@as(?usize, 100), findByte(buf, 0, 'x'));
 }
 
@@ -536,7 +536,7 @@ test "findEither: not found" {
 }
 
 test "findEither: large buffer" {
-    const buf = "a" ** 50 ++ "x" ++ "a" ** 50;
+    const buf = @as([50]u8, @splat('a')) ++ "x" ++ @as([50]u8, @splat('a'));
     try testing.expectEqual(@as(?usize, 50), findEither(buf, 0, 'x', 'y'));
 }
 
@@ -563,7 +563,7 @@ test "findAny3: not found" {
 }
 
 test "findAny3: large buffer" {
-    const buf = "a" ** 50 ++ "x" ++ "a" ** 50;
+    const buf = @as([50]u8, @splat('a')) ++ "x" ++ @as([50]u8, @splat('a'));
     try testing.expectEqual(@as(?usize, 50), findAny3(buf, 0, 'x', 'y', 'z'));
 }
 
