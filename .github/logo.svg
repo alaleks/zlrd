@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
   <title id="title">zlrd</title>
-  <desc id="desc">A Z-shaped log stream framed by terminal prompts and a crash alert.</desc>
+  <desc id="desc">Two log lines with a terminal prompt between healthy and crash states.</desc>
 
   <defs>
-    <linearGradient id="incident" x1="382" y1="150" x2="130" y2="362" gradientUnits="userSpaceOnUse">
+    <linearGradient id="incident" x1="210" y1="190" x2="210" y2="330" gradientUnits="userSpaceOnUse">
       <stop stop-color="#FFB454"/>
       <stop offset="1" stop-color="#FF5266"/>
     </linearGradient>
@@ -11,18 +11,13 @@
 
   <rect width="512" height="512" rx="104" fill="#10141D"/>
 
-  <!-- The two horizontal strokes read as log records; the falling stroke
-       marks the incident that zlrd follows and reports. -->
-  <path d="M130 150H382" fill="none" stroke="#E9F1F4" stroke-width="42" stroke-linecap="round"/>
-  <path d="M382 150 130 362" fill="none" stroke="url(#incident)" stroke-width="42" stroke-linecap="round"/>
-  <path d="M130 362H382" fill="none" stroke="#E9F1F4" stroke-width="42" stroke-linecap="round"/>
+  <!-- Log records frame the terminal prompt that reads between them. -->
+  <path d="M100 124H412" fill="none" stroke="#E9F1F4" stroke-width="34" stroke-linecap="round"/>
+  <path d="m164 197 84 59-84 59" fill="none" stroke="url(#incident)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M288 317h78" stroke="url(#incident)" stroke-width="28" stroke-linecap="round"/>
+  <path d="M100 388H412" fill="none" stroke="#E9F1F4" stroke-width="34" stroke-linecap="round"/>
 
-  <!-- Status dots turn the monogram into a tiny log timeline. -->
-  <circle cx="130" cy="150" r="11" fill="#4ADEA0"/>
-  <circle cx="382" cy="362" r="11" fill="#FF5266"/>
-
-  <path d="m338 68 19 16-19 16" fill="none" stroke="#91A6B9" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M374 101h25" stroke="#91A6B9" stroke-width="10" stroke-linecap="round"/>
-  <path d="m112 406 19 16-19 16" fill="none" stroke="#91A6B9" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M148 439h25" stroke="#91A6B9" stroke-width="10" stroke-linecap="round"/>
+  <!-- Status dots turn the mark into a tiny log timeline. -->
+  <circle cx="100" cy="124" r="10" fill="#4ADEA0"/>
+  <circle cx="412" cy="388" r="10" fill="#FF5266"/>
 </svg>
