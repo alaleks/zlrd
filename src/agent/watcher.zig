@@ -311,8 +311,9 @@ pub const Watcher = struct {
         for (fired[0..n]) |entry| self.dispatcher.dispatch(entry, now_ms);
 
         if (f.tracker) |*t| {
-            if (t.observe(line, level, &self.detector, now_ms)) |ev| {
+            while (t.observe(line, level, &self.detector, now_ms)) |ev| {
                 self.dispatcher.dispatchService(ev, now_ms);
+                if (!t.refeed) break;
             }
         }
     }

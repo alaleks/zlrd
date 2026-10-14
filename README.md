@@ -963,15 +963,17 @@ zlrd --agent \
      --journal-unit=workers='myapp@*.service'
 ```
 
-How it works: one `journalctl -fu '<pattern>' --output=json --no-pager
---since now` subprocess per `--journal-unit`. Each entry is parsed and
+How it works: the journal files are read natively — `system.journal` is
+tailed from its end with inotify, no subprocess. Only if the journal
+directory cannot be found does `zlrd` fall back to one `journalctl -fu
+'<pattern>' --output=json --since now` per `--journal-unit`. Each entry is
 classified:
 
 | Source of message               | What `zlrd` does                                |
 | ------------------------------- | ----------------------------------------------- |
-| App-level `panic:` / `Traceback` / `level=fatal` in `MESSAGE` | Routed to the per-unit crash tracker (same as file-backed services) |
+| App-level `panic:` / `Traceback` / `level=fatal` in `MESSAGE` | Routed to the per-unit crash tracker (same as file-backed services). The message's own level decides what is quoted text; `PRIORITY` only counts at `err` or worse, because journald files all of stdout/stderr at `info` |
 | systemd lifecycle (`Started`, `Stopped`, `Stopping`, `Reloading`, `Deactivated`) | **Silently dropped** — systemd already owns lifecycle; surfacing it is noise |
-| systemd crash signal (`Main process exited, code=killed/dumped`, `Failed with result 'signal' / 'core-dump' / 'oom-kill' / 'watchdog'`) | Fires `service_crash` with `marker=systemd_signal` |
+| systemd crash signal (`Main process exited, code=killed/dumped`, `Failed with result 'signal' / 'core-dump' / 'oom-kill' / 'watchdog' / 'exit-code'`) | Fires `service_crash` with `marker=systemd_signal` |
 
 **Wildcards** (`myapp@*.service`) are passed verbatim to `journalctl -u`,
 which expands them natively. Inside the source `zlrd` keeps a per-unit
@@ -988,14 +990,23 @@ for crashes only. The `file` field in the payload uses a pseudo-path:
   "service": "workers",
   "file": "journal://myapp@worker1.service",
   "marker": "systemd_signal",
-  "pid": 5678,
   "detail": "Main process exited, code=killed, status=11/SEGV"
 }
 ```
 
-**Dedup**: if the application logged a panic right before systemd noticed
-the unit died, `zlrd` suppresses the systemd-side `service_crash` for that
-unit — the app-level event already captured the trace.
+There is no `pid` on a `systemd_signal` crash: the entry comes from PID 1,
+and the message does not name the process that died.
+
+**One death, one alert.** systemd reports a death twice (`Main process
+exited…`, then `Failed with result…`), and after an application crash it
+reports it again. The first report is the alert; the rest are dropped as
+its echo until the next `Started` for that unit, or for a minute at most.
+When systemd's notice arrives while a stack trace is still being collected,
+the trace is sent right then — the process is gone, so nothing more of it
+is coming.
+
+`crash_count` is per `--journal-unit` binding, summed over every instance
+its pattern matches.
 
 The agent runs with `--journal-unit` alone — no positional log files
 required. Requires Linux with systemd; on macOS/Windows the source logs

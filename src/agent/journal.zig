@@ -30,6 +30,7 @@ const native = @import("journal");
 const alert = @import("alert.zig");
 const config = @import("config.zig");
 const service = @import("service.zig");
+const signature = @import("signature.zig");
 const state = @import("state");
 
 const log = std.log.scoped(.zlrd_journal);
@@ -86,7 +87,44 @@ fn isCrashSignal(msg: []const u8) bool {
     if (std.mem.indexOf(u8, msg, "Failed with result 'core-dump'") != null) return true;
     if (std.mem.indexOf(u8, msg, "Failed with result 'oom-kill'") != null) return true;
     if (std.mem.indexOf(u8, msg, "Failed with result 'watchdog'") != null) return true;
+    // A non-zero exit is how most runtimes die: Go exits 2 after a panic,
+    // Python 1 after an uncaught exception, `log.Fatal` 1. When the app
+    // printed its own crash first, this is deduplicated as its echo; when it
+    // printed nothing — a C binary calling `exit(1)` — it is the only sign.
+    if (std.mem.indexOf(u8, msg, "Failed with result 'exit-code'") != null) return true;
     return false;
+}
+
+/// True for the systemd lines that mean a new process now runs the unit.
+fn isStart(msg: []const u8) bool {
+    return std.mem.startsWith(u8, msg, "Started ") or std.mem.startsWith(u8, msg, "Starting ");
+}
+
+/// The level used for crash detection on a journal entry.
+///
+/// The message's own level wins: a JSON or logfmt line says what it is. The
+/// entry's PRIORITY only counts when it is err or worse, because journald
+/// stamps everything a service writes to stdout or stderr with
+/// `SyslogLevel=`, which defaults to info. Taken at face value that made
+/// every Go `panic:`, Python `Traceback` and Rust `panicked at` captured from
+/// stderr an info line — and the detector ignores runtime banners on lines
+/// below error, so none of them was ever reported.
+pub fn journalLevel(message: []const u8, priority: []const u8) ?flags.Level {
+    if (signature.extractLevel(message)) |l| return l;
+    const l = priorityToLevel(priority) orelse return null;
+    return if (@backingInt(l) >= @backingInt(flags.Level.Error)) l else null;
+}
+
+/// Which unit an entry is about. systemd's own messages come from PID 1,
+/// whose `_SYSTEMD_UNIT` is `init.scope`; the unit they describe is in
+/// `UNIT`. Reading `_SYSTEMD_UNIT` for those filtered every `Main process
+/// exited` out of a natively tailed journal, and in the journalctl path
+/// filed it under `init.scope`, where no deduplication could find it.
+pub fn entryUnit(syslog_id: []const u8, unit_field: ?[]const u8, systemd_unit: ?[]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, syslog_id, "systemd")) {
+        if (unit_field) |u| return u;
+    }
+    return systemd_unit;
 }
 
 /// Maps a numeric systemd / syslog priority (`"0"`..`"7"`) to the agent's
@@ -255,10 +293,12 @@ pub const JournalSource = struct {
     overflow_logged: bool = false,
     stop_flag: std.atomic.Value(bool),
     child: ?std.process.Child = null,
-    /// State store, when one is configured. Units appear here lazily — the
-    /// first line from a unit is what creates its tracker — so the counters
-    /// are adopted at that moment rather than up front.
-    store: ?*state.Store = null,
+    /// Crashes for this `--journal-unit` binding, across every unit its
+    /// pattern matches. Kept here rather than per tracker: the store keys
+    /// counts by binding name, and two instances of `worker@*.service` each
+    /// counting from the same seed overwrote each other's totals.
+    crash_count: u64 = 0,
+    restart_count: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -280,14 +320,20 @@ pub const JournalSource = struct {
         };
     }
 
+    /// Adopts the counts a previous run left behind.
     pub fn setStore(self: *JournalSource, store: *state.Store) void {
-        self.store = store;
+        const c = store.counts(self.name);
+        self.crash_count = c.crash;
+        self.restart_count = c.restart;
     }
 
     pub fn deinit(self: *JournalSource) void {
         var it = self.trackers.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
+            // `trackerFor` allocates the `journal://unit` path; nothing else
+            // frees it.
+            self.allocator.free(entry.value_ptr.*.path);
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.trackers.deinit(self.allocator);
@@ -417,39 +463,73 @@ pub const JournalSource = struct {
     /// filtered out before it is copied, so adding an `e.get` below means
     /// adding the key here too.
     const native_fields = [_][]const u8{
-        "MESSAGE", "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "PRIORITY", "_PID",
+        "MESSAGE", "_SYSTEMD_UNIT", "UNIT", "SYSLOG_IDENTIFIER", "PRIORITY",
     };
 
     fn handleNativeEntry(self: *JournalSource, e: *const native.Entry) void {
+        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        // Every entry in the journal is a clock tick, including the ones
+        // for other units: it is what lets a trace whose process died
+        // mid-sentence be flushed without waiting for that unit to speak.
+        self.tickAll(now_ms);
+
         const message = e.get("MESSAGE") orelse return;
         if (message.len == 0) return;
-
-        const unit = e.get("_SYSTEMD_UNIT") orelse self.pattern;
-        if (!native.source.matchesUnitGlob(self.pattern, unit)) return;
         const syslog_id = e.get("SYSLOG_IDENTIFIER") orelse "";
-        const priority = e.get("PRIORITY") orelse "";
-        const level = priorityToLevel(priority);
-        const pid_str = e.get("_PID");
-        const pid: ?u32 = if (pid_str) |s| std.fmt.parseInt(u32, s, 10) catch null else null;
-        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        // No unit means kernel, audit or early-boot output. Defaulting it to
+        // the pattern used to hand a crit-level kernel line to every
+        // journal source as a crash of its service.
+        const unit = entryUnit(syslog_id, e.get("UNIT"), e.get("_SYSTEMD_UNIT")) orelse return;
+        if (!native.source.matchesUnitGlob(self.pattern, unit)) return;
+        self.handleMessage(unit, syslog_id, message, e.get("PRIORITY") orelse "", now_ms);
+    }
 
+    /// Classifies one entry already known to belong to this source.
+    fn handleMessage(
+        self: *JournalSource,
+        unit: []const u8,
+        syslog_id: []const u8,
+        message: []const u8,
+        priority: []const u8,
+        now_ms: i64,
+    ) void {
         if (std.mem.eql(u8, syslog_id, "systemd")) {
             switch (classifySystemdMessage(message)) {
-                .lifecycle, .other => return,
-                .crash_signal => {
-                    self.emitSystemdCrash(unit, pid, message, now_ms);
-                    return;
+                .lifecycle => if (isStart(message)) {
+                    // A new process: whatever it does next is a new death.
+                    if (self.trackers.get(unit)) |t| t.death_reported = false;
                 },
+                .crash_signal => self.onSystemdCrash(unit, message, now_ms),
+                .other => {},
             }
+            return;
         }
 
         const tracker = self.trackerFor(unit, now_ms) orelse return;
-        if (tracker.observe(message, level, self.detector, now_ms)) |ev| {
-            self.dispatcher.dispatchService(ev, now_ms);
+        const level = journalLevel(message, priority);
+        while (tracker.observe(message, level, self.detector, now_ms)) |ev| {
+            self.emit(ev, now_ms);
+            if (!tracker.refeed) break;
         }
-        if (tracker.tick(now_ms, service.default_trace_flush_ms, service.default_stop_window_ms)) |ev| {
-            self.dispatcher.dispatchService(ev, now_ms);
+    }
+
+    /// Flushes traces whose collection window has passed.
+    fn tickAll(self: *JournalSource, now_ms: i64) void {
+        var it = self.trackers.valueIterator();
+        while (it.next()) |t| {
+            if (t.*.tick(now_ms, service.default_trace_flush_ms, service.default_stop_window_ms)) |ev| {
+                self.emit(ev, now_ms);
+            }
         }
+    }
+
+    /// Dispatches with the binding-wide counts in place of the tracker's.
+    fn emit(self: *JournalSource, ev_in: service.ServiceEvent, now_ms: i64) void {
+        var ev = ev_in;
+        if (ev.kind == .crash) self.crash_count += 1;
+        ev.crash_count = self.crash_count;
+        ev.restart_count = self.restart_count;
+        self.dispatcher.dispatchService(ev, now_ms);
     }
 
     fn spawnAndRead(self: *JournalSource) !void {
@@ -544,59 +624,29 @@ pub const JournalSource = struct {
     }
 
     fn handleEntry(self: *JournalSource, json_line: []const u8) void {
-        const raw_message = findJsonStringField(json_line, "MESSAGE") orelse return;
-        if (raw_message.len == 0) return;
+        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        self.tickAll(now_ms);
 
         var msg_buf: [unescape_buf_size]u8 = undefined;
-        const message = unescapeJsonString(&msg_buf, raw_message);
+        const message = messageFromEntry(json_line, &msg_buf) orelse return;
+        if (message.len == 0) return;
 
-        const unit_raw = findJsonStringField(json_line, "_SYSTEMD_UNIT");
-        // Systemd unit names are usually ≤ 100 bytes, but template instances
-        // (e.g. `system-getty.slice/getty-tty@tty1.service`) can push past
-        // 256. `unescapeJsonString` truncates silently on overflow, and a
-        // truncated unit name misses its glob match → the entry gets
-        // dropped without diagnostic.
-        var unit_buf: [512]u8 = undefined;
-        const unit = if (unit_raw) |u|
-            unescapeJsonString(&unit_buf, u)
-        else
-            self.pattern;
-
-        const syslog_id_raw = findJsonStringField(json_line, "SYSLOG_IDENTIFIER");
         // 64 was tight — `SYSLOG_IDENTIFIER` mirrors the executable name and
-        // some binaries have long ones. Truncation here breaks the
-        // `eql(syslog_id, "systemd")` classifier for edge cases where the
-        // 64th byte happens to fall inside "systemd" (won't happen for the
-        // literal, but does for identifiers like `systemd-userdbd`).
+        // some binaries have long ones.
         var sid_buf: [128]u8 = undefined;
-        const syslog_id = if (syslog_id_raw) |s| unescapeJsonString(&sid_buf, s) else "";
+        const syslog_id = if (findJsonStringField(json_line, "SYSLOG_IDENTIFIER")) |s| unescapeJsonString(&sid_buf, s) else "";
 
-        const priority = findJsonStringField(json_line, "PRIORITY") orelse "";
-        const level = priorityToLevel(priority);
-        const pid = pidFromEntry(json_line);
-        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        // Systemd unit names are usually ≤ 100 bytes, but template instances
+        // can push past 256, and a truncated name misses its tracker.
+        var unit_buf: [512]u8 = undefined;
+        var sunit_buf: [512]u8 = undefined;
+        const unit_field = if (findJsonStringField(json_line, "UNIT")) |u| unescapeJsonString(&unit_buf, u) else null;
+        const systemd_unit = if (findJsonStringField(json_line, "_SYSTEMD_UNIT")) |u| unescapeJsonString(&sunit_buf, u) else null;
+        // `journalctl -u` already filtered to the pattern, so an entry that
+        // names no unit still belongs here.
+        const unit = entryUnit(syslog_id, unit_field, systemd_unit) orelse self.pattern;
 
-        if (std.mem.eql(u8, syslog_id, "systemd")) {
-            switch (classifySystemdMessage(message)) {
-                .lifecycle => return,
-                .crash_signal => {
-                    self.emitSystemdCrash(unit, pid, message, now_ms);
-                    return;
-                },
-                .other => return,
-            }
-        }
-
-        // Application log entry — route to the per-unit tracker.
-        const tracker = self.trackerFor(unit, now_ms) orelse return;
-        if (tracker.observe(message, level, self.detector, now_ms)) |ev| {
-            self.dispatcher.dispatchService(ev, now_ms);
-        }
-        // Tick frequently so the trace-collection window can flush even when
-        // entries arrive sparsely.
-        if (tracker.tick(now_ms, service.default_trace_flush_ms, service.default_stop_window_ms)) |ev| {
-            self.dispatcher.dispatchService(ev, now_ms);
-        }
+        self.handleMessage(unit, syslog_id, message, findJsonStringField(json_line, "PRIORITY") orelse "", now_ms);
     }
 
     fn trackerFor(self: *JournalSource, unit: []const u8, now_ms: i64) ?*service.Tracker {
@@ -625,10 +675,6 @@ pub const JournalSource = struct {
             return null;
         };
         ptr.* = service.Tracker.initJournal(self.name, owned_path, now_ms);
-        if (self.store) |st| {
-            const c = st.counts(self.name);
-            ptr.seed(c.crash, c.restart);
-        }
         self.trackers.put(self.allocator, key, ptr) catch {
             self.allocator.free(owned_path);
             self.allocator.destroy(ptr);
@@ -638,39 +684,69 @@ pub const JournalSource = struct {
         return ptr;
     }
 
-    /// systemd told us a unit died abnormally. Surface it directly — there
-    /// is no application-side stack trace to wait for. If a tracker already
-    /// fired a crash for this unit very recently, suppress this echo.
-    fn emitSystemdCrash(self: *JournalSource, unit: []const u8, pid: ?u32, message: []const u8, now_ms: i64) void {
-        if (self.trackers.get(unit)) |t| {
-            if (t.state == .crash_collecting or t.state == .crash_emitted) {
-                // The app already produced a crash event for this unit;
-                // systemd's notice is the same event from a different vantage.
-                return;
-            }
+    /// systemd told us a unit died abnormally.
+    ///
+    /// One death produces up to three reports: the application's own crash
+    /// banner, `Main process exited, …`, and `Failed with result '…'`. Only
+    /// the first one is an alert. A notice is treated as an echo while the
+    /// tracker has a death on record that no `Started` has cleared since,
+    /// and that is recent — an application crash that turned out not to
+    /// kill the process must not swallow a real death hours later.
+    fn onSystemdCrash(self: *JournalSource, unit: []const u8, message: []const u8, now_ms: i64) void {
+        const tracker = self.trackerFor(unit, now_ms) orelse return;
+
+        // The process is gone, so the trace being collected is complete.
+        // Emitting it here is what gets a panic reported when the service
+        // stays down and its unit never logs again.
+        if (tracker.flush()) |ev| {
+            self.emit(ev, now_ms);
+            return;
         }
-        var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ journal_pseudo_path_prefix, unit }) catch unit;
-        const ev: service.ServiceEvent = .{
+        if (tracker.death_reported and now_ms - tracker.last_crash_ms < echo_window_ms) return;
+
+        tracker.death_reported = true;
+        tracker.last_crash_ms = now_ms;
+        self.emit(.{
             .kind = .crash,
             .service_name = self.name,
-            .file_path = path,
+            .file_path = tracker.path,
             .marker = service.MarkerKind.systemd_signal.label(),
-            .pid = pid,
+            // `_PID` on this entry is systemd's own, 1; the message does not
+            // carry the dead process's pid.
+            .pid = null,
             .detail = message,
             .stack_trace = "",
-            .crash_count = 1,
+            .crash_count = 0,
             .restart_count = 0,
-        };
-        self.dispatcher.dispatchService(ev, now_ms);
+        }, now_ms);
     }
 };
 
-/// Extracts the `_PID` field and parses it. Returns null if the field is
-/// missing or non-numeric.
-fn pidFromEntry(json_line: []const u8) ?u32 {
-    const raw = findJsonStringField(json_line, "_PID") orelse return null;
-    return std.fmt.parseInt(u32, raw, 10) catch null;
+/// How long after a crash a systemd notice still counts as its echo. systemd
+/// reports a death within milliseconds; a minute leaves room for a slow
+/// `ExecStopPost=` without merging two separate deaths.
+const echo_window_ms: i64 = 60_000;
+
+/// `MESSAGE`, unescaped into `buf`. journalctl writes it as an array of byte
+/// values instead of a string when it is not valid UTF-8 or holds control
+/// bytes — ANSI colour codes, most often. Those entries used to be dropped,
+/// crash banner and all.
+pub fn messageFromEntry(json_line: []const u8, buf: []u8) ?[]const u8 {
+    if (findJsonStringField(json_line, "MESSAGE")) |raw| return unescapeJsonString(buf, raw);
+    const at = std.mem.indexOf(u8, json_line, "\"MESSAGE\":[") orelse return null;
+    var it = std.mem.tokenizeAny(u8, json_line[at + "\"MESSAGE\":[".len ..], ", ");
+    var n: usize = 0;
+    while (it.next()) |tok| {
+        const end = std.mem.indexOfScalar(u8, tok, ']');
+        const digits = tok[0 .. end orelse tok.len];
+        if (digits.len > 0) {
+            if (n == buf.len) break;
+            buf[n] = std.fmt.parseInt(u8, digits, 10) catch return null;
+            n += 1;
+        }
+        if (end != null) break;
+    }
+    return buf[0..n];
 }
 
 const testing = std.testing;
@@ -761,12 +837,6 @@ test "unescapeJsonString: decodes \\uXXXX BMP codepoints" {
     var buf: [16]u8 = undefined;
     // U+00E9 (é) → UTF-8 C3 A9
     try testing.expectEqualSlices(u8, "\xc3\xa9", unescapeJsonString(&buf, "\\u00e9"));
-}
-
-test "pidFromEntry: parses numeric _PID" {
-    const json = "{\"_PID\":\"1234\"}";
-    try testing.expectEqual(@as(?u32, 1234), pidFromEntry(json));
-    try testing.expectEqual(@as(?u32, null), pidFromEntry("{}"));
 }
 
 /// Collects the entries `processChunk` decides to deliver, so the carry
@@ -880,4 +950,209 @@ test "processChunk: a line split across reads is reassembled" {
     try testing.expectEqual(@as(usize, 2), p.delivered.items.len);
     try testing.expectEqualStrings("{\"MESSAGE\":\"split across three reads\"}", p.delivered.items[0]);
     try testing.expectEqualStrings("{\"MESSAGE\":\"second\"}", p.delivered.items[1]);
+}
+
+// ─── Crash detection, end to end ──────────────────────────────────────────
+
+const metrics_mod = @import("metrics.zig");
+
+/// A journal source wired to a real dispatcher whose only sink is a JSONL
+/// file, so a test reads back exactly what an operator would receive.
+const Harness = struct {
+    tmp: testing.TmpDir,
+    path_buf: [128]u8 = undefined,
+    path: []const u8 = "",
+    m: metrics_mod.Metrics,
+    d: alert.Dispatcher,
+    det: service.Detector,
+    src: JournalSource,
+
+    fn init(self: *Harness, pattern: []const u8) !void {
+        self.tmp = testing.tmpDir(.{});
+        const path = try std.fmt.bufPrint(&self.path_buf, ".zig-cache/tmp/{s}/alerts.jsonl", .{self.tmp.sub_path});
+        self.path = path;
+        self.m = metrics_mod.Metrics.init(0);
+        self.d = try alert.Dispatcher.init(std.Options.debug_io, .{
+            .stderr = false,
+            .file_path = path,
+            .webhooks = &.{},
+            .webhook_headers = &.{},
+        }, &self.m, false);
+        self.det = .{ .customs = &.{} };
+        self.src = JournalSource.init(testing.allocator, std.Options.debug_io, "api", pattern, &self.d, &self.det);
+    }
+
+    fn deinit(self: *Harness) void {
+        self.src.deinit();
+        self.d.deinit();
+        self.tmp.cleanup();
+    }
+
+    /// An application line on stderr: journald's default priority, info.
+    fn app(self: *Harness, unit: []const u8, msg: []const u8, now: i64) void {
+        self.src.tickAll(now);
+        self.src.handleMessage(unit, "api", msg, "6", now);
+    }
+
+    fn systemd(self: *Harness, unit: []const u8, msg: []const u8, now: i64) void {
+        self.src.tickAll(now);
+        self.src.handleMessage(unit, "systemd", msg, "5", now);
+    }
+
+    /// Every alert written so far. Caller frees with `freeRecords`.
+    fn records(self: *Harness) ![]std.json.Parsed(std.json.Value) {
+        const contents = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, self.path, testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(contents);
+        var out: std.ArrayList(std.json.Parsed(std.json.Value)) = .empty;
+        var it = std.mem.tokenizeScalar(u8, contents, '\n');
+        while (it.next()) |line| try out.append(testing.allocator, try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{}));
+        return out.toOwnedSlice(testing.allocator);
+    }
+};
+
+fn freeRecords(rs: []std.json.Parsed(std.json.Value)) void {
+    for (rs) |*r| r.deinit();
+    testing.allocator.free(rs);
+}
+
+fn field(r: std.json.Parsed(std.json.Value), key: []const u8) std.json.Value {
+    return r.value.object.get(key).?;
+}
+
+test "a Go panic on stderr is reported once, and systemd's notices are its echo" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    const u = "api.service";
+
+    // journald files stderr at info; this used to hide every runtime banner.
+    h.app(u, "panic: runtime error: index out of range [3] with length 3", 100);
+    h.app(u, "", 101);
+    h.app(u, "goroutine 1 [running]:", 102);
+    h.app(u, "main.main()", 103);
+    h.app(u, "\t/app/main.go:9 +0x1d", 104);
+    // The process is gone; nothing else from the unit is coming, and the
+    // trace must not wait for it.
+    h.systemd(u, "api.service: Main process exited, code=exited, status=2/INVALIDARGUMENT", 105);
+    h.systemd(u, "api.service: Failed with result 'exit-code'.", 106);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 1), rs.len);
+    try testing.expectEqualStrings("go_panic", field(rs[0], "marker").string);
+    try testing.expect(std.mem.indexOf(u8, field(rs[0], "stack_trace").string, "main.go:9") != null);
+    try testing.expectEqual(@as(i64, 1), field(rs[0], "crash_count").integer);
+    try testing.expectEqualStrings("journal://api.service", field(rs[0], "file").string);
+}
+
+test "a death only systemd saw is one alert, and a restart re-arms it" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    const u = "api.service";
+
+    h.systemd(u, "api.service: Main process exited, code=killed, status=11/SEGV", 100);
+    h.systemd(u, "api.service: Failed with result 'signal'.", 101);
+    h.systemd(u, "Started api.service - API.", 300);
+    h.systemd(u, "api.service: Main process exited, code=dumped, status=6/ABRT", 400);
+    h.systemd(u, "api.service: Failed with result 'core-dump'.", 401);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 2), rs.len);
+    try testing.expectEqualStrings("systemd_signal", field(rs[0], "marker").string);
+    try testing.expect(std.mem.indexOf(u8, field(rs[0], "detail").string, "status=11/SEGV") != null);
+    try testing.expectEqual(@as(i64, 1), field(rs[0], "crash_count").integer);
+    try testing.expectEqual(@as(i64, 2), field(rs[1], "crash_count").integer);
+    // systemd's own pid is not the dead process's.
+    try testing.expect(!rs[0].value.object.contains("pid"));
+}
+
+test "a stale application crash does not swallow a later death" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    const u = "api.service";
+
+    // A traceback the process survived, then an OOM kill hours later with
+    // no restart in between.
+    h.app(u, "Traceback (most recent call last):", 0);
+    h.app(u, "  File \"/app/x.py\", line 1, in <module>", 1);
+    h.app(u, "KeyError: 'x'", 2);
+    h.systemd(u, "api.service: Failed with result 'oom-kill'.", 3 * 60 * 60 * 1000);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 2), rs.len);
+    try testing.expectEqualStrings("python_traceback", field(rs[0], "marker").string);
+    try testing.expectEqualStrings("systemd_signal", field(rs[1], "marker").string);
+}
+
+test "quoted crash phrases in structured logs are not crashes" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    h.app("api.service", "{\"level\":\"info\",\"msg\":\"recovered from panic: nil map\"}", 100);
+    h.app("api.service", "level=warn msg=\"retrying after panic: timeout\"", 200);
+    h.src.tickAll(10_000);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 0), rs.len);
+}
+
+test "counts are per binding, across every unit its pattern matches" {
+    var h: Harness = undefined;
+    try h.init("worker@*.service");
+    defer h.deinit();
+    h.systemd("worker@1.service", "worker@1.service: Failed with result 'signal'.", 100);
+    h.systemd("worker@2.service", "worker@2.service: Failed with result 'signal'.", 200);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 2), rs.len);
+    try testing.expectEqual(@as(i64, 1), field(rs[0], "crash_count").integer);
+    try testing.expectEqual(@as(i64, 2), field(rs[1], "crash_count").integer);
+    try testing.expectEqualStrings("journal://worker@2.service", field(rs[1], "file").string);
+}
+
+test "a trace is flushed by the clock even when its unit falls silent" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    h.app("api.service", "thread 'main' panicked at src/main.rs:4:5:", 100);
+    h.app("api.service", "called `Option::unwrap()` on a `None` value", 101);
+    // Some other unit's entry, well past the flush window.
+    h.src.tickAll(100 + service.default_trace_flush_ms);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 1), rs.len);
+    try testing.expectEqualStrings("rust_panic", field(rs[0], "marker").string);
+    try testing.expect(std.mem.indexOf(u8, field(rs[0], "stack_trace").string, "unwrap()") != null);
+}
+
+test "journalLevel: the message's own level wins; PRIORITY only counts at err or worse" {
+    try testing.expectEqual(@as(?flags.Level, null), journalLevel("panic: boom", "6"));
+    try testing.expectEqual(flags.Level.Error, journalLevel("panic: boom", "3").?);
+    try testing.expectEqual(flags.Level.Fatal, journalLevel("disk on fire", "2").?);
+    try testing.expectEqual(flags.Level.Info, journalLevel("{\"level\":\"info\",\"msg\":\"x\"}", "3").?);
+}
+
+test "entryUnit: systemd's notices are about UNIT, not init.scope" {
+    try testing.expectEqualStrings("api.service", entryUnit("systemd", "api.service", "init.scope").?);
+    try testing.expectEqualStrings("api.service", entryUnit("api", "spoofed.service", "api.service").?);
+    try testing.expectEqualStrings("init.scope", entryUnit("systemd", null, "init.scope").?);
+    try testing.expect(entryUnit("kernel", null, null) == null);
+}
+
+test "messageFromEntry: string and byte-array forms" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("panic: x", messageFromEntry("{\"MESSAGE\":\"panic: x\"}", &buf).?);
+    // `\x1b[31mpanic: x` as journalctl writes it.
+    try testing.expectEqualStrings(
+        "\x1b[31mpanic: x",
+        messageFromEntry("{\"MESSAGE\":[27,91,51,49,109,112,97,110,105,99,58,32,120],\"_PID\":\"1\"}", &buf).?,
+    );
+    try testing.expect(messageFromEntry("{\"_PID\":\"1\"}", &buf) == null);
 }

@@ -241,14 +241,23 @@ pub const StackTraceBuilder = struct {
     /// of its own — scoped to a trace already in progress, where an ordinary
     /// log line cannot appear.
     go_mode: bool = false,
+    /// Python's grammar: indented frames, then one flush-left line that
+    /// names the exception — `ValueError: boom`. That last line is the only
+    /// one that says what went wrong, and the indentation heuristic alone
+    /// ends the trace right before it.
+    python_mode: bool = false,
+    /// Python only: the exception line has been taken, so what follows is
+    /// either a chained exception (`During handling of the above
+    /// exception…`, then another `Traceback`) or the end of the trace.
+    python_tail: bool = false,
+    /// Set by `feed` when the line it just took was a Python exception line,
+    /// so the tracker can make it the event's detail.
+    took_exception_line: bool = false,
 
     pub fn start(self: *StackTraceBuilder, now_ms: i64) void {
-        self.used = 0;
-        self.lines = 0;
+        self.reset();
         self.active = true;
         self.started_at_ms = now_ms;
-        self.free_first = false;
-        self.go_mode = false;
     }
 
     pub fn reset(self: *StackTraceBuilder) void {
@@ -257,12 +266,16 @@ pub const StackTraceBuilder = struct {
         self.active = false;
         self.free_first = false;
         self.go_mode = false;
+        self.python_mode = false;
+        self.python_tail = false;
+        self.took_exception_line = false;
     }
 
     /// Tries to append `line` as a continuation of the trace. Returns true
     /// when the line was accepted (or skipped as a leading separator); false
     /// when the trace is finished (heuristic break, line cap, or byte cap).
     pub fn feed(self: *StackTraceBuilder, line: []const u8) bool {
+        self.took_exception_line = false;
         if (!self.active) return false;
         if (self.lines >= max_trace_lines) {
             self.active = false;
@@ -283,14 +296,29 @@ pub const StackTraceBuilder = struct {
         // unrelated indented block, and Java and Python do not put blanks in
         // the middle of a trace anyway.
         if (line.len == 0) {
-            if (self.go_mode or self.used == 0) return true;
+            // Python separates chained exceptions with blank lines.
+            if (self.go_mode or self.python_tail or self.used == 0) return true;
             self.active = false;
             return false;
         }
 
-        const accepted = isTraceLine(line) or
+        var accepted = isTraceLine(line) or
             (self.go_mode and isGoFrame(line)) or
             (self.free_first and self.used == 0);
+        if (self.python_mode and !accepted) {
+            if (self.python_tail) {
+                // Only a chained exception keeps the trace open past its
+                // exception line; one crash, however many causes it has.
+                accepted = isPythonChainLine(line);
+                // Blank lines surround the chain sentence; the tail lasts
+                // until the next exception's own `Traceback` opens it.
+                if (accepted and std.mem.startsWith(u8, line, "Traceback")) self.python_tail = false;
+            } else if (self.used > 0) {
+                accepted = true;
+                self.python_tail = true;
+                self.took_exception_line = true;
+            }
+        }
         if (!accepted) {
             self.active = false;
             return false;
@@ -336,6 +364,13 @@ pub fn isTraceLine(line: []const u8) bool {
     if (std.mem.startsWith(u8, line, "note: ")) return true;
     if (std.mem.startsWith(u8, line, "stack backtrace:")) return true;
     return false;
+}
+
+/// The lines Python prints between the exceptions of a chain.
+fn isPythonChainLine(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "During handling of the above exception") or
+        std.mem.startsWith(u8, line, "The above exception was the direct cause") or
+        std.mem.startsWith(u8, line, "Traceback (most recent call last):");
 }
 
 /// True for the two lines that identify a dump as Go's. Either one is enough
@@ -444,6 +479,19 @@ pub const Tracker = struct {
 
     trace: StackTraceBuilder = .{},
 
+    /// Set when the last `observe` emitted a crash because `line` ended its
+    /// trace, without looking at `line` itself. Callers dispatch the event
+    /// and then feed the same line once more: it may open the next crash —
+    /// a crash loop prints its next `panic:` right after the last trace.
+    refeed: bool = false,
+
+    /// Journal mode: when the last crash began, and whether systemd's notice
+    /// of that death is still to come. systemd reports one death twice
+    /// (`Main process exited…`, then `Failed with result…`), and after an
+    /// application crash it reports it again; both are echoes.
+    last_crash_ms: i64 = 0,
+    death_reported: bool = false,
+
     pub fn init(name: []const u8, path: []const u8, now_ms: i64) Tracker {
         return .{
             .name = name,
@@ -488,12 +536,19 @@ pub const Tracker = struct {
         now_ms: i64,
     ) ?ServiceEvent {
         self.last_log_ms = now_ms;
+        self.refeed = false;
 
         if (self.state == .crash_collecting) {
-            if (self.trace.feed(line)) return null;
-            // Trace ended at this line. Emit the crash, then re-evaluate the
-            // current line as a possible new running-state observation
-            // (overlapping crashes are rare; we keep them rare on purpose).
+            if (self.trace.feed(line)) {
+                // Python names the exception last; that is the detail worth
+                // reading, not the `Traceback` banner that opened the trace.
+                if (self.trace.took_exception_line) self.copyDetail(line);
+                return null;
+            }
+            // The trace ended at this line. Emit the crash; the caller
+            // feeds the line again (`refeed`) to see whether it opens the
+            // next one.
+            self.refeed = true;
             return self.emitCrash();
         }
 
@@ -572,10 +627,20 @@ pub const Tracker = struct {
         self.copyDetail(line);
         self.pending_pid = extractPid(line);
         self.crash_count += 1;
+        self.last_crash_ms = now_ms;
+        self.death_reported = true;
         self.trace.start(now_ms);
         self.trace.free_first = marker == .rust_panic;
         self.trace.go_mode = marker == .go_panic;
+        self.trace.python_mode = marker == .python_traceback;
         return null;
+    }
+
+    /// Emits the crash being collected now instead of waiting for the trace
+    /// to end — the process is known to be gone, so no more of it is coming.
+    pub fn flush(self: *Tracker) ?ServiceEvent {
+        if (self.state != .crash_collecting) return null;
+        return self.emitCrash();
     }
 
     fn emitCrash(self: *Tracker) ServiceEvent {
@@ -1065,4 +1130,82 @@ test "Tracker: a Go panic keeps its frames end to end" {
     }) |want| {
         try testing.expect(std.mem.indexOf(u8, ev.stack_trace, want) != null);
     }
+}
+
+/// Feeds `lines` the way the watcher and journal sources do — re-feeding the
+/// line that ended a trace — and returns the crash events, copied out.
+fn runLines(t: *Tracker, det: *const Detector, lines: []const []const u8, out: *std.ArrayList([]u8)) !void {
+    for (lines, 0..) |line, i| {
+        while (t.observe(line, null, det, @intCast(i))) |ev| {
+            try out.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "{s}|{s}|{s}", .{ ev.marker, ev.detail, ev.stack_trace }));
+            if (!t.refeed) break;
+        }
+    }
+    if (t.flush()) |ev| {
+        try out.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "{s}|{s}|{s}", .{ ev.marker, ev.detail, ev.stack_trace }));
+    }
+}
+
+fn freeAll(list: *std.ArrayList([]u8)) void {
+    for (list.items) |x| testing.allocator.free(x);
+    list.deinit(testing.allocator);
+}
+
+test "Python: the exception line is the detail and part of the trace" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "/x.log", 0);
+    var got: std.ArrayList([]u8) = .empty;
+    defer freeAll(&got);
+    try runLines(&t, &det, &.{
+        "Traceback (most recent call last):",
+        "  File \"/app/main.py\", line 3, in <module>",
+        "    run()",
+        "ValueError: invalid literal for int() with base 10: 'x'",
+        "INFO next request",
+    }, &got);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try testing.expect(std.mem.startsWith(u8, got.items[0], "python_traceback|ValueError: invalid literal"));
+    try testing.expect(std.mem.indexOf(u8, got.items[0], "    run()\nValueError:") != null);
+}
+
+test "Python: a chained exception is one crash, named by the last exception" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "/x.log", 0);
+    var got: std.ArrayList([]u8) = .empty;
+    defer freeAll(&got);
+    try runLines(&t, &det, &.{
+        "Traceback (most recent call last):",
+        "  File \"/app/db.py\", line 8, in get",
+        "KeyError: 'user'",
+        "",
+        "During handling of the above exception, another exception occurred:",
+        "",
+        "Traceback (most recent call last):",
+        "  File \"/app/main.py\", line 3, in <module>",
+        "RuntimeError: lookup failed",
+    }, &got);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try testing.expect(std.mem.startsWith(u8, got.items[0], "python_traceback|RuntimeError: lookup failed|"));
+    try testing.expect(std.mem.indexOf(u8, got.items[0], "KeyError: 'user'") != null);
+}
+
+test "a crash loop: the panic right after a trace is the next crash, not lost" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.initJournal("api", "journal://api.service", 0);
+    var got: std.ArrayList([]u8) = .empty;
+    defer freeAll(&got);
+    try runLines(&t, &det, &.{
+        "panic: first",
+        "",
+        "goroutine 1 [running]:",
+        "main.main()",
+        "\t/app/main.go:9 +0x1d",
+        "panic: second",
+        "",
+        "goroutine 1 [running]:",
+        "main.main()",
+    }, &got);
+    try testing.expectEqual(@as(usize, 2), got.items.len);
+    try testing.expect(std.mem.startsWith(u8, got.items[0], "go_panic|panic: first|"));
+    try testing.expect(std.mem.startsWith(u8, got.items[1], "go_panic|panic: second|"));
 }
