@@ -26,11 +26,19 @@ pub fn build(b: *std.Build) void {
     ebpf_on_options.addOption(bool, "with_ebpf", true);
     const ebpf_on_options_mod = ebpf_on_options.createModule();
 
+    // TOML parser behind `--config`. Std-only, shared with zpeek.
+    const toml_mod = b.createModule(.{
+        .root_source_file = b.path("src/config/toml.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const flags_mod = b.createModule(.{
         .root_source_file = b.path("src/flags/flags.zig"),
         .target = target,
         .optimize = optimize,
     });
+    flags_mod.addImport("toml", toml_mod);
 
     // Shared regex module so both `reader/` and `agent/` import the same code.
     const regex_mod = b.createModule(.{
@@ -101,6 +109,7 @@ pub fn build(b: *std.Build) void {
     agent_mod.addImport("journal", journal_mod);
     agent_mod.addImport("notify", notify_mod);
     agent_mod.addImport("state", state_mod);
+    agent_mod.addImport("build_options", build_options_mod);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -162,6 +171,9 @@ pub fn build(b: *std.Build) void {
         .root_module = flags_mod,
     });
     test_step.dependOn(&b.addRunArtifact(flags_tests).step);
+
+    const toml_tests = b.addTest(.{ .root_module = toml_mod });
+    test_step.dependOn(&b.addRunArtifact(toml_tests).step);
 
     const simd_tests = b.addTest(.{ .root_module = simd_mod });
     test_step.dependOn(&b.addRunArtifact(simd_tests).step);

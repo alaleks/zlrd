@@ -173,6 +173,8 @@ pub const Event = enum {
 /// Every slice is borrowed from the caller's event and must outlive `render`.
 pub const Alert = struct {
     event: Event,
+    /// `--host-id`: which machine this came from. May be empty.
+    host: []const u8 = "",
     /// Service name for lifecycle events, the killed process for kernel
     /// events, the rule id otherwise.
     subject: []const u8,
@@ -339,15 +341,20 @@ fn renderDiscord(w: *std.Io.Writer, a: Alert) RenderError!void {
     try w.writeAll("\"}]}");
 }
 
-/// The context line: which detector, which file, which process. Written only
-/// when at least one of the three is present, so an event that carries none
+/// The context line: which host, which detector, which file, which process.
+/// Written only when at least one of them is present, so an event that carries none
 /// of them doesn't open with a blank line.
 fn writeMeta(b: *Body, a: Alert) RenderError!void {
-    if (a.marker.len == 0 and a.source.len == 0 and a.pid == null) return;
+    if (a.host.len == 0 and a.marker.len == 0 and a.source.len == 0 and a.pid == null) return;
     try b.newline();
 
     var wrote = false;
+    if (a.host.len > 0) {
+        try b.text(a.host);
+        wrote = true;
+    }
     if (a.marker.len > 0) {
+        if (wrote) try b.markup(sep);
         try b.text(a.marker);
         wrote = true;
     }
@@ -961,4 +968,13 @@ test "a trace of nothing but whitespace is not rendered at all" {
     const text = try messageText(allocator, .telegram, body);
     defer allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "<pre>") == null);
+}
+
+test "the host leads the context line in every channel" {
+    const a: Alert = .{ .event = .service_crash, .subject = "api", .source = "/var/log/api.log", .host = "web-01" };
+    var buf: [max_body_bytes]u8 = undefined;
+    for ([_]Kind{ .telegram, .slack, .discord }) |kind| {
+        const body = try render(&buf, .{ .kind = kind, .url = "u", .chat_id = "1" }, a);
+        try std.testing.expect(std.mem.indexOf(u8, body, "web-01 \u{00B7} /var/log/api.log") != null);
+    }
 }

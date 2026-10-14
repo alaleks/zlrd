@@ -8,6 +8,7 @@ const std = @import("std");
 const flags = @import("flags");
 const kernel = @import("kernel");
 const state = @import("state");
+const build_options = @import("build_options");
 
 pub const config = @import("config.zig");
 pub const metrics = @import("metrics.zig");
@@ -45,18 +46,25 @@ pub const RunError = error{
 /// null for `--no-state`. It arrives already resolved because the default
 /// depends on the environment, and reading the environment is the caller's
 /// job — the agent should not be reaching for `$HOME` on its own.
+/// `default_host` is the machine's hostname, used when `--host-id` is unset,
+/// for the same reason.
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     args: flags.Args,
     state_path: ?[]const u8,
+    default_host: []const u8,
 ) !u8 {
     if (args.files.len == 0 and args.journal_units.len == 0) return error.NoFiles;
 
     var cfg = try config.AgentConfig.fromArgs(allocator, args);
     defer cfg.deinit(allocator);
+    if (cfg.sinks.host_id.len == 0) cfg.sinks.host_id = default_host[0..@min(default_host.len, config.max_host_id)];
 
     var m = metrics.Metrics.init(nowMs(io));
+    m.version = build_options.version;
+    for (cfg.services) |s| m.registerService(s.name);
+    for (cfg.journal_units) |j| m.registerService(j.name);
 
     var rs = try rules.RuleSet.init(allocator, cfg);
     defer rs.deinit();
@@ -84,8 +92,18 @@ pub fn run(
 
     var sender_storage: ?webhook.Sender = null;
     defer if (sender_storage) |*s| s.deinit();
+    // Undeliverable webhooks wait next to the state file, so `--no-state`
+    // turns this off with everything else the agent keeps on disk.
+    const spool_path: ?[]u8 = if (state_path) |p|
+        try std.fs.path.join(allocator, &.{ std.fs.path.dirname(p) orelse ".", "webhooks.spool" })
+    else
+        null;
+    defer if (spool_path) |p| allocator.free(p);
     if (cfg.sinks.webhooks.len > 0) {
-        sender_storage = try webhook.Sender.init(allocator, io, cfg.sinks.webhook_headers);
+        sender_storage = try webhook.Sender.init(allocator, io, cfg.sinks.webhook_headers, .{
+            .secret = cfg.sinks.webhook_secret,
+            .spool_path = spool_path,
+        });
         try sender_storage.?.start();
         dispatcher.setWebhookSender(webhook.sendThunk, &sender_storage.?);
     }
@@ -107,6 +125,7 @@ pub fn run(
             .flush_interval_ms = cfg.sidecar.flush_interval_ms,
             .max_queue = cfg.sidecar.batch_size,
             .metrics = &m,
+            .resource_attrs = &.{.{ .key = "host.name", .value = .{ .string = cfg.sinks.host_id } }},
         });
         try sidecar_storage.?.start();
         dispatcher.setSidecarSink(.{
@@ -142,6 +161,7 @@ pub fn run(
         log.info("metrics on {s}", .{cfg.listen_addr});
     }
 
+    log.info("host {s}", .{cfg.sinks.host_id});
     log.info("watching {d} file(s); error_rate={s} regex={d} first_seen={s} silence={s}", .{
         args.files.len,
         if (args.alert_error_rate) |s| s else "off",

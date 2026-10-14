@@ -1,4 +1,5 @@
 const std = @import("std");
+const toml = @import("toml");
 
 pub const Level = enum(u8) {
     Trace,
@@ -166,6 +167,14 @@ pub const Args = struct {
     /// `<bot-token>:<chat-id>` pairs, not URLs — the URL is derived.
     alert_telegram: []const []const u8 = &.{},
     webhook_headers: []const []const u8 = &.{},
+    /// HMAC-SHA256 key for `X-Zlrd-Signature`. Null leaves requests unsigned.
+    webhook_secret: ?[]const u8 = null,
+    /// Stamped into every alert as `host`. Null means the machine's hostname,
+    /// which `main.zig` resolves.
+    host_id: ?[]const u8 = null,
+    /// `--config`: the TOML file the flags were merged from. Kept for the
+    /// startup log only — `parseArgsWithConfig` has already applied it.
+    config_path: ?[]const u8 = null,
     alert_exit_on_alert: bool = false,
     kernel_probes: bool = false,
     services: []const []const u8 = &.{},
@@ -218,6 +227,9 @@ pub const Args = struct {
         if (self.state_path) |s| allocator.free(s);
         for (self.webhook_headers) |s| allocator.free(s);
         allocator.free(self.webhook_headers);
+        if (self.webhook_secret) |s| allocator.free(s);
+        if (self.host_id) |s| allocator.free(s);
+        if (self.config_path) |s| allocator.free(s);
         for (self.services) |s| allocator.free(s);
         allocator.free(self.services);
         for (self.crash_markers) |s| allocator.free(s);
@@ -270,6 +282,9 @@ pub const ParseError = error{
     MissingAlertDiscord,
     MissingAlertTelegram,
     MissingWebhookHeader,
+    MissingWebhookSecret,
+    MissingHostId,
+    MissingConfig,
     MissingState,
     MissingService,
     MissingCrashMarker,
@@ -287,6 +302,179 @@ pub fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) P
     defer it.deinit();
 
     return parseArgsFromIter(allocator, &it);
+}
+
+pub const ConfigError = error{ InvalidConfig, ConfigUnreadable };
+
+/// Why `--config` was rejected, formatted for the error line.
+pub const ConfigDiagnostic = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(self: *const ConfigDiagnostic) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *ConfigDiagnostic, comptime fmt: []const u8, args: anytype) void {
+        self.len = if (std.fmt.bufPrint(&self.buf, fmt, args)) |m| m.len else |_| self.buf.len;
+    }
+
+    fn fail(self: *ConfigDiagnostic, comptime fmt: []const u8, args: anytype) ConfigError {
+        self.set(fmt, args);
+        return error.InvalidConfig;
+    }
+};
+
+/// Largest config file read. Anything bigger is not a flag list.
+const max_config_bytes = 1 << 20;
+
+/// `parseArgs` plus `--config <file.toml>`.
+///
+/// The file holds long flag names as keys (`alert-webhook = ["…"]`,
+/// `alert-first-seen = true`). It is turned back into `--key=value`
+/// arguments placed before the real ones, so it goes through the exact same
+/// parser and validation as the command line. A key that the command line
+/// also sets is dropped from the file entirely — that is what makes a
+/// repeatable flag on the command line replace the file's list instead of
+/// appending to it.
+pub fn parseArgsWithConfig(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    process_args: std.process.Args,
+    diag: *ConfigDiagnostic,
+) (ParseError || ConfigError)!Args {
+    var it = try std.process.Args.iterateAllocator(process_args, allocator);
+    defer it.deinit();
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    while (it.next()) |a| try argv.append(allocator, a);
+
+    const path = configPath(argv.items) orelse {
+        var si: SliceIter = .{ .argv = argv.items };
+        return parseArgsFromIter(allocator, &si);
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const src = std.Io.Dir.cwd().readFileAlloc(io, path, arena.allocator(), .limited(max_config_bytes)) catch |err| {
+        diag.set("{s}: {t}", .{ path, err });
+        return error.ConfigUnreadable;
+    };
+    const merged = try mergeConfig(arena.allocator(), src, argv.items, diag);
+    var si: SliceIter = .{ .argv = merged };
+    return parseArgsFromIter(allocator, &si);
+}
+
+const SliceIter = struct {
+    argv: []const []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *SliceIter) ?[]const u8 {
+        if (self.index >= self.argv.len) return null;
+        defer self.index += 1;
+        return self.argv[self.index];
+    }
+};
+
+/// The `--config` value on the command line, if any.
+fn configPath(argv: []const []const u8) ?[]const u8 {
+    for (argv, 0..) |a, i| {
+        if (i == 0) continue;
+        if (std.mem.eql(u8, a, "--")) return null;
+        if (std.mem.startsWith(u8, a, "--config=")) return a["--config=".len..];
+        if (std.mem.eql(u8, a, "--config") and i + 1 < argv.len) return argv[i + 1];
+    }
+    return null;
+}
+
+/// argv[0], then the file's keys as flags, then the rest of argv. Every
+/// string lives in `arena`.
+fn mergeConfig(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    argv: []const []const u8,
+    diag: *ConfigDiagnostic,
+) (ConfigError || error{OutOfMemory})![]const []const u8 {
+    var tdiag: toml.Diagnostic = .{};
+    const root = toml.parse(arena, src, &tdiag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SyntaxError => return diag.fail("line {d}: {s}", .{ tdiag.line, tdiag.message }),
+    };
+
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.append(arena, argv[0]);
+    var keys = root.iterator();
+    while (keys.next()) |kv| {
+        const key = kv.key_ptr.*;
+        const valued = ValuedFlag.lookup(key) != null;
+        if (std.mem.eql(u8, key, "config")) return diag.fail("'config' cannot point at another file", .{});
+        if (!valued and !isBoolLongFlag(key)) return diag.fail("unknown key '{s}'", .{key});
+        if (setOnCommandLine(argv, key)) continue;
+
+        const items: []const toml.Value = switch (kv.value_ptr.*) {
+            .array => |a| a,
+            else => kv.value_ptr[0..1],
+        };
+        for (items) |v| switch (v) {
+            .boolean => |b| {
+                if (valued) return diag.fail("'{s}' takes a value, not true/false", .{key});
+                if (b) try out.append(arena, try std.fmt.allocPrint(arena, "--{s}", .{key}));
+            },
+            .string => |s| {
+                if (!valued) return diag.fail("'{s}' is a switch: use true or false", .{key});
+                try out.append(arena, try std.fmt.allocPrint(arena, "--{s}={s}", .{ key, s }));
+            },
+            .integer => |n| {
+                if (!valued) return diag.fail("'{s}' is a switch: use true or false", .{key});
+                try out.append(arena, try std.fmt.allocPrint(arena, "--{s}={d}", .{ key, n }));
+            },
+            else => return diag.fail("'{s}': expected a string, number, boolean or array of them", .{key}),
+        };
+    }
+    try out.appendSlice(arena, argv[1..]);
+    return out.items;
+}
+
+/// True when the command line already sets `key`, under its long name, its
+/// short letter, or — for `file` — as a positional argument.
+fn setOnCommandLine(argv: []const []const u8, key: []const u8) bool {
+    const is_file = std.mem.eql(u8, key, "file");
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "--")) return is_file and i + 1 < argv.len;
+        if (std.mem.startsWith(u8, a, "--")) {
+            const eq = std.mem.indexOfScalar(u8, a, '=');
+            const name = a[2 .. eq orelse a.len];
+            if (std.mem.eql(u8, name, key)) return true;
+            // Skip the separate value so it is not mistaken for a file.
+            if (eq == null and ValuedFlag.lookup(name) != null) i += 1;
+            continue;
+        }
+        if (a.len > 1 and a[0] == '-') {
+            for (a[1..], 1..) |c, j| {
+                const long: []const u8, const takes_value = switch (c) {
+                    'f' => .{ "file", true },
+                    's' => .{ "search", true },
+                    'l' => .{ "level", true },
+                    'd' => .{ "date", true },
+                    'n' => .{ "num-lines", true },
+                    'm' => .{ "aggregate-mode", true },
+                    't' => .{ "tail", false },
+                    'a' => .{ "aggregate", false },
+                    else => break,
+                };
+                if (std.mem.eql(u8, long, key)) return true;
+                if (takes_value) {
+                    if (j == a.len - 1) i += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (is_file) return true;
+    }
+    return false;
 }
 
 /// Writes `text` to stdout, dropping ANSI CSI sequences when `colored` is
@@ -406,6 +594,12 @@ pub fn printHelp(colored: bool) void {
         "   " ++ ar ++ "<t:chat> " ++ r ++ "  Sink: Telegram bot  " ++ ar ++ "<bot-token>:<chat-id>  (repeatable)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--webhook-header" ++ r ++
         "   " ++ ar ++ "<K: V>   " ++ r ++ "  Extra header for webhooks  " ++ ar ++ "(repeatable)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--webhook-secret" ++ r ++
+        "   " ++ ar ++ "<key>    " ++ r ++ "  Sign bodies: X-Zlrd-Signature: sha256=<hmac>\n" ++
+        "      " ++ lo ++ "--host-id" ++ r ++
+        "          " ++ ar ++ "<name>   " ++ r ++ "  Host name stamped into every alert  " ++ ar ++ "(default: hostname)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--config" ++ r ++
+        "           " ++ ar ++ "<path>   " ++ r ++ "  TOML file of flags; command-line flags override it\n" ++
         "      " ++ lo ++ "--state" ++ r ++
         "            " ++ ar ++ "<path>   " ++ r ++ "  State file that survives restarts  " ++ ar ++ "(default: XDG state dir)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--no-state" ++ r ++
@@ -730,6 +924,9 @@ const ValuedFlag = enum {
     state,
     alert_webhook,
     webhook_header,
+    webhook_secret,
+    host_id,
+    config,
     service,
     crash_marker,
     journal_unit,
@@ -764,6 +961,9 @@ const ValuedFlag = enum {
             .{ .name = "alert-telegram", .kind = .alert_telegram },
             .{ .name = "state", .kind = .state },
             .{ .name = "webhook-header", .kind = .webhook_header },
+            .{ .name = "webhook-secret", .kind = .webhook_secret },
+            .{ .name = "host-id", .kind = .host_id },
+            .{ .name = "config", .kind = .config },
             .{ .name = "service", .kind = .service },
             .{ .name = "crash-marker", .kind = .crash_marker },
             .{ .name = "journal-unit", .kind = .journal_unit },
@@ -802,6 +1002,9 @@ const ValuedFlag = enum {
             .state => error.MissingState,
             .alert_webhook => error.MissingAlertWebhook,
             .webhook_header => error.MissingWebhookHeader,
+            .webhook_secret => error.MissingWebhookSecret,
+            .host_id => error.MissingHostId,
+            .config => error.MissingConfig,
             .service => error.MissingService,
             .crash_marker => error.MissingCrashMarker,
             .journal_unit => error.MissingJournalUnit,
@@ -924,6 +1127,9 @@ fn applyValuedFlag(
         .alert_telegram => try appendString(allocator, &bufs.alert_telegram, val),
         .state => try replaceOwnedString(allocator, &parsed.state_path, val),
         .webhook_header => try appendString(allocator, &bufs.webhook_headers, val),
+        .webhook_secret => try replaceOwnedString(allocator, &parsed.webhook_secret, val),
+        .host_id => try replaceOwnedString(allocator, &parsed.host_id, val),
+        .config => try replaceOwnedString(allocator, &parsed.config_path, val),
         .service => try appendString(allocator, &bufs.services, val),
         .crash_marker => try appendString(allocator, &bufs.crash_markers, val),
         .journal_unit => try appendString(allocator, &bufs.journal_units, val),
@@ -2025,4 +2231,96 @@ test "--no-state=true is rejected rather than silently toggled" {
     const fake = FakeIter{ .argv = &.{ "zlrd", "--no-state=true", "app.log" } };
     var it = fake;
     try testing.expectError(error.InvalidArgument, parseArgsFromIter(allocator, &it));
+}
+
+// ─── --config ─────────────────────────────────────────────────────────────
+
+fn parseMerged(arena: std.mem.Allocator, src: []const u8, argv: []const []const u8) !Args {
+    var diag: ConfigDiagnostic = .{};
+    const merged = try mergeConfig(arena, src, argv, &diag);
+    var si: SliceIter = .{ .argv = merged };
+    return parseArgsFromIter(testing.allocator, &si);
+}
+
+test "config: keys become flags" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\agent = true
+        \\host-id = "web-01"
+        \\alert-first-seen = true
+        \\alert-stderr = false
+        \\sidecar-batch-size = 512
+        \\alert-webhook = ["https://a.test/h", "https://b.test/h"]
+        \\file = ["/var/log/app.log"]
+    ;
+    var args = try parseMerged(arena.allocator(), src, &.{"zlrd"});
+    defer args.deinit(testing.allocator);
+    try testing.expect(args.agent_mode);
+    try testing.expect(args.alert_first_seen);
+    try testing.expect(!args.alert_stderr);
+    try testing.expectEqualStrings("web-01", args.host_id.?);
+    try testing.expectEqualStrings("512", args.sidecar_batch_size.?);
+    try testing.expectEqual(@as(usize, 2), args.alert_webhooks.len);
+    try testing.expectEqualStrings("/var/log/app.log", args.files[0]);
+}
+
+test "config: the command line overrides, lists are replaced not appended" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\host-id = "from-file"
+        \\alert-webhook = ["https://file.test/h"]
+        \\level = "error"
+        \\file = ["/from/file.log"]
+    ;
+    var args = try parseMerged(arena.allocator(), src, &.{
+        "zlrd", "--host-id", "from-cli", "--alert-webhook=https://cli.test/h", "-l", "warn", "cli.log",
+    });
+    defer args.deinit(testing.allocator);
+    try testing.expectEqualStrings("from-cli", args.host_id.?);
+    try testing.expectEqual(@as(usize, 1), args.alert_webhooks.len);
+    try testing.expectEqualStrings("https://cli.test/h", args.alert_webhooks[0]);
+    try testing.expect(args.isLevelEnabled(.Warn));
+    try testing.expect(!args.isLevelEnabled(.Error));
+    try testing.expectEqual(@as(usize, 1), args.files.len);
+    try testing.expectEqualStrings("cli.log", args.files[0]);
+}
+
+test "config: a flag's separate value is not mistaken for a positional file" {
+    const argv: []const []const u8 = &.{ "zlrd", "--state", "/tmp/s.json", "--config", "c.toml" };
+    try testing.expect(!setOnCommandLine(argv, "file"));
+    try testing.expect(setOnCommandLine(argv, "state"));
+    try testing.expect(setOnCommandLine(&.{ "zlrd", "-ta" }, "aggregate"));
+    try testing.expect(setOnCommandLine(&.{ "zlrd", "-fapp.log" }, "file"));
+    try testing.expectEqualStrings("c.toml", configPath(argv).?);
+    try testing.expectEqualStrings("x.toml", configPath(&.{ "zlrd", "--config=x.toml" }).?);
+    try testing.expect(configPath(&.{ "zlrd", "--", "--config=x.toml" }) == null);
+}
+
+test "config: bad keys and types are reported by name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "no-such-flag = 1", .want = "unknown key 'no-such-flag'" },
+        .{ .src = "agent = \"yes\"", .want = "'agent' is a switch: use true or false" },
+        .{ .src = "host-id = true", .want = "'host-id' takes a value, not true/false" },
+        .{ .src = "listen = 1.5", .want = "'listen': expected a string, number, boolean or array of them" },
+        .{ .src = "config = \"other.toml\"", .want = "'config' cannot point at another file" },
+        .{ .src = "a = 1\nb = \"x\n", .want = "line 2: unterminated string" },
+    };
+    for (cases) |c| {
+        var diag: ConfigDiagnostic = .{};
+        try testing.expectError(error.InvalidConfig, mergeConfig(arena.allocator(), c.src, &.{"zlrd"}, &diag));
+        try testing.expectEqualStrings(c.want, diag.message());
+    }
+}
+
+test "host-id and webhook-secret are valued flags" {
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--host-id=h1", "--webhook-secret", "k" } };
+    var it = fake;
+    var parsed = try parseArgsFromIter(testing.allocator, &it);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqualStrings("h1", parsed.host_id.?);
+    try testing.expectEqualStrings("k", parsed.webhook_secret.?);
 }

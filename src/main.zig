@@ -6,6 +6,7 @@ const gzip = @import("reader/gzip.zig");
 const state = @import("state");
 const status = @import("state/status.zig");
 const build_options = @import("build_options");
+const builtin = @import("builtin");
 
 pub fn main(opts: struct {
     minimal: struct {
@@ -34,10 +35,17 @@ pub fn main(opts: struct {
     const out_env = reader.theme_mod.fromMap(opts.environ_map, stdout_vt_ok and (stdout.isTty(io) catch false));
     const err_env = reader.theme_mod.fromMap(opts.environ_map, stderr_vt_ok and (stderr_file.isTty(io) catch false));
 
-    var parsed_args = flags.parseArgs(allocator, opts.minimal.args) catch |err| {
+    var config_diag: flags.ConfigDiagnostic = .{};
+    var parsed_args = flags.parseArgsWithConfig(allocator, io, opts.minimal.args, &config_diag) catch |err| {
         // `--color` and `--theme` are unavailable when parsing is what
         // failed, so this one path falls back to plain auto-detection.
         const early = reader.theme_mod.resolve(err_env, .auto, .auto);
+        if (err == error.InvalidConfig or err == error.ConfigUnreadable) {
+            var buf: [320]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "--config: {s}", .{config_diag.message()}) catch "invalid --config file";
+            fatal(io, &early, msg, "keys are long flag names: host-id = \"web-01\"");
+            std.process.exit(1);
+        }
         fatal(io, &early, parseErrorMessage(err), "run zlrd --help for usage");
         std.process.exit(1);
     };
@@ -140,7 +148,9 @@ pub fn main(opts: struct {
     }
 
     if (parsed_args.agent_mode) {
-        const exit_code = agent.run(allocator, io, parsed_args, state_path) catch |err| {
+        const host = try hostName(allocator, opts.environ_map);
+        defer allocator.free(host);
+        const exit_code = agent.run(allocator, io, parsed_args, state_path, host) catch |err| {
             fatal(io, &err_th, agentErrorMessage(err), agentErrorHint(err));
             std.process.exit(1);
         };
@@ -153,6 +163,14 @@ pub fn main(opts: struct {
         fatal(io, &err_th, runtimeErrorMessage(err), null);
         std.process.exit(1);
     };
+}
+
+/// The default `--host-id`: what `hostname` prints.
+fn hostName(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    if (builtin.os.tag == .windows) return allocator.dupe(u8, env.get("COMPUTERNAME") orelse "unknown");
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const name = std.posix.gethostname(&buf) catch "unknown";
+    return allocator.dupe(u8, if (name.len == 0) "unknown" else name);
 }
 
 /// `zlrd status` — what the agent recorded, for the morning after.
@@ -410,6 +428,9 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.MissingAlertFile => "missing value for --alert-file",
         error.MissingAlertWebhook => "missing value for --alert-webhook",
         error.MissingWebhookHeader => "missing value for --webhook-header",
+        error.MissingWebhookSecret => "missing value for --webhook-secret",
+        error.MissingHostId => "missing value for --host-id",
+        error.MissingConfig => "missing value for --config",
         error.MissingSidecarUrl => "missing value for --sidecar",
         error.MissingSidecarHeader => "missing value for --sidecar-header",
         error.MissingSidecarFlushInterval => "missing value for --sidecar-flush-interval",
@@ -433,6 +454,7 @@ fn agentErrorMessage(err: anyerror) []const u8 {
         error.InvalidBatchSize => "invalid --sidecar-batch-size (expected positive integer)",
         error.InvalidSidecarUrl => "invalid --sidecar URL (must start with https://)",
         error.InvalidUrl => "invalid URL",
+        error.InvalidHostId => "invalid --host-id (1 to 253 bytes)",
         error.TlsRequired => "sidecar requires an https:// URL",
         else => runtimeErrorMessage(err),
     };

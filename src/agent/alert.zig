@@ -126,10 +126,16 @@ pub const Dispatcher = struct {
             .restart => .service_restart,
         };
         self.metrics.observeAlert(rule_kind);
+        switch (event.kind) {
+            .crash => self.metrics.observeService(event.service_name, .crash),
+            .restart => self.metrics.observeService(event.service_name, .restart),
+            .stop => {},
+        }
 
         // Stack traces can run up to ~4 KiB; budget the payload accordingly.
         var buf: [8192]u8 = undefined;
-        const payload = formatServiceEventJson(&buf, event, now_ms) catch return;
+        var stamped: [8192 + max_host_bytes]u8 = undefined;
+        const payload = stampHost(&stamped, self.sinks.host_id, formatServiceEventJson(&buf, event, now_ms) catch return) catch return;
 
         // `.crash` is the only durability-critical kind here — `stop` and
         // `restart` are housekeeping that don't justify a per-record fsync.
@@ -180,9 +186,15 @@ pub const Dispatcher = struct {
             .panic_prev_boot => .kernel_panic,
         };
         self.metrics.observeAlert(rule_kind);
+        self.metrics.observeKernel(switch (event.kind) {
+            .oom => .oom,
+            .segfault => .segfault,
+            .panic_prev_boot => .panic,
+        });
 
         var buf: [512]u8 = undefined;
-        const payload = kernel.formatEventJson(&buf, event, now_ms) catch return;
+        var stamped: [512 + max_host_bytes]u8 = undefined;
+        const payload = stampHost(&stamped, self.sinks.host_id, kernel.formatEventJson(&buf, event, now_ms) catch return) catch return;
 
         const comm = event.comm[0..event.comm_len];
         const detail = event.detail[0..event.detail_len];
@@ -222,7 +234,8 @@ pub const Dispatcher = struct {
         // Render once into a stack buffer, reuse for all sinks. 2 KiB covers
         // the per-line cap we already enforce upstream.
         var buf: [2048]u8 = undefined;
-        const payload = formatAlert(&buf, fired, now_ms) catch return;
+        var stamped: [2048 + max_host_bytes]u8 = undefined;
+        const payload = stampHost(&stamped, self.sinks.host_id, formatAlert(&buf, fired, now_ms) catch return) catch return;
 
         // Rule alerts (error_rate, regex, first_seen, silence) don't earn
         // an fsync — they're statistical, not crash forensics. Skipping
@@ -266,8 +279,10 @@ pub const Dispatcher = struct {
     /// than in the sender: `webhook.Sender` queues `(url, body)` pairs and
     /// copies both, so a body that is already final costs it nothing new and
     /// the queue stays unaware that templating exists at all.
-    fn fanOut(self: *Dispatcher, payload: []const u8, view: notify.Alert) void {
+    fn fanOut(self: *Dispatcher, payload: []const u8, view_in: notify.Alert) void {
         const send = self.webhook_sender orelse return;
+        var view = view_in;
+        view.host = self.sinks.host_id;
         var body: [notify.max_body_bytes]u8 = undefined;
         for (self.sinks.webhooks) |target| {
             if (target.kind == .raw) {
@@ -331,6 +346,24 @@ pub const Dispatcher = struct {
         if (sync_to_disk) f.sync(self.io) catch {};
     }
 };
+
+/// Room `stampHost` needs on top of the payload: `config.max_host_id` bytes,
+/// each escaped to at most six (`\u00XX`), plus the key.
+pub const max_host_bytes: usize = config.max_host_id * 6 + 16;
+
+/// Prepends `"host":…` to a rendered `{…}` payload. Done after rendering so
+/// the three payload schemas — the kernel one lives in another package — do
+/// not each need to know about it. An empty `host` returns `payload` as is.
+pub fn stampHost(out: []u8, host: []const u8, payload: []const u8) ![]const u8 {
+    if (host.len == 0) return payload;
+    std.debug.assert(payload.len >= 2 and payload[0] == '{');
+    var w: std.Io.Writer = .fixed(out);
+    try w.writeAll("{\"host\":");
+    try writeJsonString(&w, host);
+    if (payload.len > 2) try w.writeByte(',');
+    try w.writeAll(payload[1..]);
+    return w.buffered();
+}
 
 /// Renders `fired` as a single-line JSON payload into `buf`. Returns the
 /// populated slice. Never includes a trailing newline — callers add it where
@@ -441,6 +474,46 @@ test "formatAlert: emits valid JSON with expected keys" {
     const threshold = obj.get("threshold").?.object;
     try testing.expectEqual(@as(i64, 5), threshold.get("count").?.integer);
     try testing.expectEqual(@as(i64, 60_000), threshold.get("window_ms").?.integer);
+}
+
+test "stampHost: every payload gains a host field, the rest is untouched" {
+    var buf: [256]u8 = undefined;
+    const out = try stampHost(&buf, "web-01", "{\"ts_ms\":1,\"kind\":\"oom\"}");
+    try testing.expectEqualStrings("{\"host\":\"web-01\",\"ts_ms\":1,\"kind\":\"oom\"}", out);
+
+    // Escaped like any other string, and an empty object stays valid.
+    const odd = try stampHost(&buf, "a\"b", "{}");
+    try testing.expectEqualStrings("{\"host\":\"a\\\"b\"}", odd);
+
+    // No host configured: the payload is returned as is.
+    try testing.expectEqualStrings("{}", try stampHost(&buf, "", "{}"));
+}
+
+test "dispatch stamps the host into the alert file" {
+    const allocator = testing.allocator;
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const file_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/alerts.jsonl", .{tmp.sub_path});
+
+    var m = metrics.Metrics.init(0);
+    var d = try Dispatcher.init(io, .{
+        .stderr = false,
+        .file_path = file_path,
+        .webhooks = &.{},
+        .webhook_headers = &.{},
+        .host_id = "db-02",
+    }, &m, false);
+    defer d.deinit();
+    d.dispatchKernel(kernel.makeEvent(.oom, .kmsg, 7, "java", ""), 5);
+
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(4096));
+    defer allocator.free(contents);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trimEnd(u8, contents, "\n"), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("db-02", parsed.value.object.get("host").?.string);
+    try testing.expectEqualStrings("kernel_oom", parsed.value.object.get("kind").?.string);
 }
 
 test "formatAlert: silence alert omits empty line field" {

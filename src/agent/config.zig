@@ -10,6 +10,9 @@ const log = std.log.scoped(.zlrd_agent);
 
 pub const default_listen = "127.0.0.1:9100";
 
+/// Longest `--host-id`: the DNS limit for a hostname.
+pub const max_host_id: usize = 253;
+
 /// `N/Ws` threshold: at most `count` events per `window_ms` milliseconds before
 /// the rule fires.
 pub const ThresholdSpec = struct {
@@ -38,6 +41,7 @@ pub const ParseError = error{
     InvalidBatchSize,
     InvalidSidecarUrl,
     InvalidTelegramTarget,
+    InvalidHostId,
 };
 
 pub const ServiceSpec = struct {
@@ -60,6 +64,11 @@ pub const SinkConfig = struct {
     /// decides which body each one receives.
     webhooks: []notify.Target,
     webhook_headers: []HeaderSpec,
+    /// Stamped into every payload as `host`, so alerts from several machines
+    /// that land in one place can be told apart. Empty leaves it out.
+    host_id: []const u8 = "",
+    /// HMAC-SHA256 key for `X-Zlrd-Signature`. Null sends requests unsigned.
+    webhook_secret: ?[]const u8 = null,
 
     pub fn hasAny(self: SinkConfig) bool {
         return self.stderr or self.file_path != null or self.webhooks.len > 0;
@@ -223,6 +232,8 @@ pub const AgentConfig = struct {
             journal_units[i] = try parseJournalSpec(spec);
         }
 
+        if (args.host_id) |h| if (h.len == 0 or h.len > max_host_id) return error.InvalidHostId;
+
         const sidecar_headers = try allocator.alloc(HeaderSpec, args.sidecar_headers.len);
         errdefer allocator.free(sidecar_headers);
         for (args.sidecar_headers, 0..) |spec, i| {
@@ -259,6 +270,10 @@ pub const AgentConfig = struct {
                 .file_path = args.alert_file,
                 .webhooks = targets,
                 .webhook_headers = headers,
+                // `main.zig` fills in the hostname when this is null; the
+                // agent re-checks so a library caller gets the same default.
+                .host_id = args.host_id orelse "",
+                .webhook_secret = args.webhook_secret,
             },
             .alert_exit = args.alert_exit_on_alert,
             .services = services,
@@ -483,6 +498,23 @@ test "AgentConfig.fromArgs: explicit sink suppresses default stderr" {
     defer cfg.deinit(allocator);
     try testing.expect(!cfg.sinks.stderr);
     try testing.expectEqualStrings("/tmp/alerts.jsonl", cfg.sinks.file_path.?);
+}
+
+test "AgentConfig.fromArgs: host id and webhook secret reach the sinks" {
+    const allocator = testing.allocator;
+    var args = flags.Args{};
+    args.host_id = "web-01";
+    args.webhook_secret = "k";
+    var cfg = try AgentConfig.fromArgs(allocator, args);
+    defer cfg.deinit(allocator);
+    try testing.expectEqualStrings("web-01", cfg.sinks.host_id);
+    try testing.expectEqualStrings("k", cfg.sinks.webhook_secret.?);
+
+    args.host_id = "";
+    try testing.expectError(error.InvalidHostId, AgentConfig.fromArgs(allocator, args));
+    const long: [max_host_id + 1]u8 = @splat('h');
+    args.host_id = &long;
+    try testing.expectError(error.InvalidHostId, AgentConfig.fromArgs(allocator, args));
 }
 
 test "the metrics endpoint is off until it is asked for" {

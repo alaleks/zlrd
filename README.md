@@ -114,6 +114,7 @@ the whole point is that you probably don't have a Prometheus.
   - [Aggregation modes](#aggregation-modes)
 - [Watching services](#watching-services)
   - [Quick start](#agent-quick-start)
+  - [Config file](#config-file)
   - [How it fits together](#how-it-fits-together)
   - [Service crash tracking](#service-crash-tracking)
   - [Chat alerts: Telegram, Slack, Discord](#chat-alerts-telegram-slack-discord)
@@ -162,6 +163,9 @@ the whole point is that you probably don't have a Prometheus.
 - **State that survives a restart** — counters, last crash and its trace,
   read back with `zlrd status`
 - **Alert rules** — error-rate, regex-rate, first-seen signature, silence
+- **Webhooks that don't lose alerts** — retries with backoff, an on-disk
+  spool across restarts, HMAC-signed bodies, a `host` field for fleets
+- **Config file** — the whole command line as TOML, flags override it
 - **systemd-journal sources** (`--journal-unit`), read natively — no
   `journalctl` subprocess
 - **Kernel-level probes** — OOM, segfault, prior-boot panic; eBPF when built
@@ -534,6 +538,35 @@ And if you *do* run Prometheus, one flag adds the endpoint — see
 zlrd --agent ... --metrics-token=$(openssl rand -hex 16)
 ```
 
+### Config file
+
+A long command line can live in a TOML file instead. Keys are the long flag
+names without `--`; a repeatable flag takes an array, a switch takes
+`true`/`false`:
+
+```toml
+# /etc/zlrd/agent.toml
+agent            = true
+host-id          = "web-01"
+file             = ["/var/log/api.log", "/var/log/gateway.log"]
+service          = ["api=/var/log/api.log", "gw=/var/log/gateway.log"]
+alert-error-rate = "10/60s"
+alert-regex      = ["connection refused:5/60s"]
+alert-first-seen = true
+alert-telegram   = ["123456:AAH-token:-1001234567890"]
+webhook-secret   = "change-me"
+```
+
+```bash
+zlrd --config /etc/zlrd/agent.toml
+zlrd --config /etc/zlrd/agent.toml --alert-error-rate=50/60s   # a flag wins
+```
+
+Anything given on the command line replaces the file's value — for a
+repeatable flag the whole list, not one more entry. An unknown key or a value
+of the wrong type stops startup with the key's name, rather than being
+ignored.
+
 ### How it fits together
 
 ```
@@ -661,6 +694,7 @@ so it terminates the trace like any other log line.
 
 ```json
 {
+  "host": "web-01",
   "ts_ms": 1781552666549,
   "kind": "service_crash",
   "service": "api",
@@ -676,6 +710,7 @@ so it terminates the trace like any other log line.
 
 | Field           | Notes                                                                          |
 | --------------- | ------------------------------------------------------------------------------ |
+| `host`          | `--host-id`, default: the machine's hostname. On every payload, kernel events included |
 | `kind`          | `service_crash` · `service_stop` · `service_restart`                           |
 | `marker`        | `go_panic` · `go_fatal` · `rust_panic` · `python_traceback` · `java_exception` · `native_abort` · `fatal_level` · `panic_level` · `custom_regex` · `systemd_signal` |
 | `pid`           | Parsed from `"pid":N`, `pid=N`, or `[N]:` if present in the trigger line       |
@@ -882,7 +917,9 @@ produces one JSON payload that's pushed to all enabled sinks.
 | `--alert-telegram <t:c>` | Telegram bot message       | `<bot-token>:<chat-id>`. Rendered, not raw JSON. Repeatable.      |
 | `--alert-slack <url>`    | Slack incoming webhook     | Rendered as a mrkdwn block. Repeatable.                           |
 | `--alert-discord <url>`  | Discord webhook            | Rendered as a coloured embed. Repeatable.                         |
-| `--webhook-header <K:V>` | extra header on every POST | Use for `Authorization`, signing, or custom routing. Repeatable.  |
+| `--webhook-header <K:V>` | extra header on every POST | Use for `Authorization` or custom routing. Repeatable.            |
+| `--webhook-secret <key>` | `X-Zlrd-Signature` header  | HMAC-SHA256 of the body — see [Webhook integration](#webhook-integration). |
+| `--host-id <name>`       | `host` field               | Defaults to the hostname; tells several machines apart in one channel. |
 | `--alert-exit`           | process exits non-zero     | Useful in CI / one-shot use cases. Combines with other sinks.     |
 
 If no sink is configured, agent mode defaults to **stderr** so an alert is
@@ -892,6 +929,7 @@ never silently swallowed.
 
 ```json
 {
+  "host":           "web-01",
   "ts_ms":          1781458814344,
   "kind":           "error_rate",
   "rule_id":        "error_rate",
@@ -904,6 +942,7 @@ never silently swallowed.
 
 | Field            | Notes                                                                  |
 | ---------------- | ---------------------------------------------------------------------- |
+| `host`           | `--host-id`, default: the machine's hostname                           |
 | `ts_ms`          | Wall-clock milliseconds (UTC) when the rule fired                      |
 | `kind`           | `error_rate` · `regex` · `first_seen` · `silence`                      |
 | `rule_id`        | For `regex`, the pattern that matched; otherwise the rule name         |
@@ -1009,9 +1048,41 @@ unsupported, then stays idle.
 
 ### Webhook integration
 
-Webhook delivery is best-effort — failures are logged via `std.log` and the
-watcher keeps running. The same payload is POSTed to every URL passed via
-`--alert-webhook`.
+The same payload is POSTed to every URL passed via `--alert-webhook`; the
+chat sinks get their own rendering of it. Delivery never blocks the watcher —
+a single background worker does the HTTP.
+
+#### Delivery and retries
+
+- A transport error, `5xx`, `408` or `429` is **retried with exponential
+  backoff** — 1 s, 2 s, 4 s, 8 s, 16 s — without holding up other URLs.
+- After six attempts the alert is **parked on disk** in `webhooks.spool`,
+  next to the [state file](#state-that-survives-a-restart) (mode `0600`: a
+  Telegram URL carries the bot token). The spool is retried once a minute
+  until the endpoint is back, and it survives an agent restart. It is capped
+  at 1 MiB.
+- Alerts still in memory when the agent stops are parked too.
+- Any other `4xx` is the receiver refusing the request; it is logged and
+  dropped, since sending it again would get the same answer.
+- With `--no-state` there is no spool: retries still happen, but an alert
+  that exhausts them is dropped and logged.
+
+#### Signing
+
+With `--webhook-secret`, every request carries
+
+```
+X-Zlrd-Signature: sha256=<hex HMAC-SHA256 of the raw body, keyed by the secret>
+```
+
+so the receiver can check the request came from an agent holding the key.
+Compare in constant time, and use the payload's `ts_ms` to reject replays:
+
+```python
+import hmac, hashlib
+want = "sha256=" + hmac.new(SECRET, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(want, request.headers["X-Zlrd-Signature"])
+```
 
 #### Generic receiver / Alertmanager
 
@@ -1023,7 +1094,7 @@ zlrd --agent \
      --alert-error-rate=10/60s \
      --alert-regex='panic:1/30s' \
      --alert-webhook="https://alerts.internal/zlrd/ingest" \
-     --webhook-header="Authorization: Bearer $WEBHOOK_SECRET" \
+     --webhook-secret="$WEBHOOK_SECRET" \
      --webhook-header="X-Source: prod-app-1" \
      app.log
 ```
@@ -1071,10 +1142,19 @@ Exposed metrics:
 | `zlrd_alerts_fired_total`     | counter | `rule`                | Alerts emitted, by rule kind               |
 | `zlrd_http_requests_total`    | counter | `route`, `code`       | Metrics endpoint hits                      |
 | `zlrd_file_rotation_total`    | counter | —                     | File truncations / rotations detected      |
+| `zlrd_service_crashes_total`  | counter | `service`             | Crashes per `--service` / `--journal-unit` |
+| `zlrd_service_restarts_total` | counter | `service`             | Restarts per service                       |
+| `zlrd_kernel_events_total`    | counter | `kind`                | `oom` · `segfault` · `panic`               |
+| `zlrd_build_info`             | gauge   | `version`             | Always `1`; the running version            |
 
 `level` label values: `trace`, `debug`, `info`, `warn`, `error`, `fatal`,
 `panic`, `unknown`. `rule` values: `error_rate`, `regex`, `first_seen`,
-`silence`.
+`silence`, `kernel_oom`, `kernel_segfault`, `kernel_panic`, `service_crash`,
+`service_stop`, `service_restart`.
+
+Every configured service has its `service` series from startup, at zero.
+Like every `_total` here, the counters start from zero with each agent run —
+`rate()` and `increase()` handle that; lifetime totals are in `zlrd status`.
 
 
 A working scrape configuration for the metrics endpoint:
@@ -1099,6 +1179,9 @@ sum by (instance) (rate(zlrd_lines_total{level=~"error|fatal|panic"}[1m]))
 
 # Did the agent itself fire any alerts in the last 5 minutes?
 sum by (rule) (increase(zlrd_alerts_fired_total[5m])) > 0
+
+# Which service crashed in the last hour?
+sum by (instance, service) (increase(zlrd_service_crashes_total[1h])) > 0
 
 # Have we seen file rotations recently?
 increase(zlrd_file_rotation_total[10m]) > 0
@@ -1204,6 +1287,9 @@ background, so they read either way.
 | `    --alert-slack`           | `<url>`    | Sink: Slack incoming webhook — repeatable                                    |
 | `    --alert-discord`         | `<url>`    | Sink: Discord webhook — repeatable                                           |
 | `    --webhook-header`        | `<K: V>`   | Extra header for all webhooks — repeatable                                   |
+| `    --webhook-secret`        | `<key>`    | Sign every webhook body: `X-Zlrd-Signature: sha256=<hmac>`                   |
+| `    --host-id`               | `<name>`   | `host` field on every alert — default: hostname                              |
+| `    --config`                | `<path>`   | TOML file of flags; the command line overrides it                            |
 | `    --state`                 | `<path>`   | State file that survives restarts — default: XDG state dir                   |
 | `    --no-state`              |            | Keep no state on disk                                                        |
 | `    --alert-exit`            |            | Exit non-zero on first alert                                                 |
@@ -1258,6 +1344,9 @@ Duration suffixes: `ms`, `s`, `m`, `h`.
 - [x] Parallel scan across line-aligned chunks
 - [x] Native Telegram / Slack / Discord alert bodies (no templating proxy)
 - [x] Durable agent state and `zlrd status`
+- [x] `host` on every alert, webhook retries with an on-disk spool, HMAC signing
+- [x] Per-service crash/restart, kernel-event and build-info metrics
+- [x] TOML config file (`--config`)
 
 Next:
 
