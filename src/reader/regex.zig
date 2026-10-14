@@ -11,17 +11,39 @@ pub const Match = struct { start: usize, end: usize };
 
 pub const Regex = struct {
     pattern: []const u8,
+    /// A literal every match must contain, lowercased, or empty. Checked
+    /// with one substring search before the interpreter runs, which is
+    /// what lets a line without it — nearly every line, for a search —
+    /// cost a scan instead of an attempt at every byte.
+    required: [max_required]u8 = undefined,
+    required_len: u8 = 0,
+    /// Bytes a match can start with, or null when that set says nothing
+    /// (anchored, `.`-led, or able to match empty). Positions holding any
+    /// other byte are skipped without entering the interpreter.
+    first: ?std.StaticBitSet(256) = null,
+
+    const max_required = 32;
 
     /// Compile a case-insensitive ERE pattern.
     /// Returns null if the pattern is syntactically invalid.
     pub fn compile(pattern: []const u8) ?Regex {
         if (!validate(pattern)) return null;
-        return .{ .pattern = pattern };
+        var re: Regex = .{ .pattern = pattern };
+        re.required_len = @intCast(requiredLiteral(pattern, &re.required).len);
+        var set: std.StaticBitSet(256) = .empty;
+        if (firstBytes(pattern, &set)) re.first = set;
+        return re;
     }
 
     /// Returns true if any substring of `text` matches the pattern.
     pub fn isMatch(self: *const Regex, text: []const u8) bool {
-        return matchAnywhere(self.pattern, text);
+        if (self.required_len > 0 and
+            !containsLower(text, self.required[0..self.required_len])) return false;
+        const set = self.first orelse return matchAnywhere(self.pattern, text);
+        for (text, 0..) |c, i| {
+            if (set.isSet(c) and matchAt(self.pattern, text, i) != null) return true;
+        }
+        return false;
     }
 
     /// Leftmost match at or after `from`, as a byte range.
@@ -31,7 +53,15 @@ pub const Regex = struct {
     /// the regex path claimed. `matchFrom` already computed the end offset
     /// internally; this hands it back instead of discarding it.
     pub fn findFrom(self: *const Regex, text: []const u8, from: usize) ?Match {
-        return findAnywhere(self.pattern, text, from);
+        const set = self.first orelse return findAnywhere(self.pattern, text, from);
+        if (from >= text.len) return null;
+        for (text[from..], from..) |c, i| {
+            if (!set.isSet(c)) continue;
+            // findAnywhere looks at every later start too, so its answer is
+            // final either way.
+            return findAnywhere(self.pattern, text, i);
+        }
+        return null;
     }
 
     pub fn deinit(self: *Regex) void {
@@ -107,6 +137,109 @@ fn matchAnywhere(pattern: []const u8, text: []const u8) bool {
     return false;
 }
 
+/// Case-insensitive substring test against an already-lowercased needle.
+/// A vector compare finds candidates for the first byte in both cases,
+/// sixteen bytes at a time; only those are verified.
+fn containsLower(hay: []const u8, needle: []const u8) bool {
+    if (needle.len > hay.len) return false;
+    const V = @Vector(16, u8);
+    const lo: V = @splat(needle[0]);
+    const up: V = @splat(std.ascii.toUpper(needle[0]));
+    const last = hay.len - needle.len;
+    var i: usize = 0;
+    while (i + 16 <= last + 1) : (i += 16) {
+        const chunk: V = hay[i..][0..16].*;
+        var bits: u16 = @bitCast((chunk == lo) | (chunk == up));
+        while (bits != 0) : (bits &= bits - 1) {
+            if (eqlLower(hay[i + @ctz(bits) ..][0..needle.len], needle)) return true;
+        }
+    }
+    while (i <= last) : (i += 1) {
+        if (eqlLower(hay[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn eqlLower(a: []const u8, lower: []const u8) bool {
+    for (a, lower) |x, y| if (std.ascii.toLower(x) != y) return false;
+    return true;
+}
+
+/// `pattern` at exactly `start`, any top-level branch. Only used once
+/// `firstBytes` has vouched that no branch is anchored.
+fn matchAt(pattern: []const u8, text: []const u8, start: usize) ?usize {
+    if (topAlt(pattern)) |pipe| {
+        return matchAt(pattern[0..pipe], text, start) orelse matchAt(pattern[pipe + 1 ..], text, start);
+    }
+    return matchFrom(pattern, text, start);
+}
+
+/// The longest run of literal bytes every match of `pattern` contains,
+/// lowercased into `buf`. Empty when there is a top-level `|` — no single
+/// literal is required then — or no literal at all.
+fn requiredLiteral(pattern: []const u8, buf: []u8) []const u8 {
+    if (topAlt(pattern) != null) return buf[0..0];
+    var cur: [Regex.max_required]u8 = undefined;
+    var cur_len: usize = 0;
+    var best_len: usize = 0;
+    var pp: usize = 0;
+    while (pp < pattern.len) {
+        const alen = atomLen(pattern[pp..]) orelse break;
+        const atom = pattern[pp .. pp + alen];
+        const q: u8 = if (pp + alen < pattern.len) pattern[pp + alen] else 0;
+        pp += alen + @intFromBool(q == '*' or q == '+' or q == '?');
+
+        const lit = literalByte(atom);
+        if (lit != null and q != '*' and q != '?' and cur_len < @min(buf.len, cur.len)) {
+            cur[cur_len] = std.ascii.toLower(lit.?);
+            cur_len += 1;
+        } else cur_len = 0;
+        if (cur_len > best_len) {
+            @memcpy(buf[0..cur_len], cur[0..cur_len]);
+            best_len = cur_len;
+        }
+        // `x+` may be followed by more `x`s, so a run cannot continue past
+        // it — but it does contribute its one guaranteed byte.
+        if (q == '+') cur_len = 0;
+    }
+    return buf[0..best_len];
+}
+
+/// The byte `atom` stands for when it is a plain literal, else null.
+fn literalByte(atom: []const u8) ?u8 {
+    return switch (atom[0]) {
+        '.', '[', '(', '^', '$' => null,
+        '\\' => switch (atom[1]) {
+            'd', 'D', 'w', 'W', 's', 'S', 'n', 'r', 't' => null,
+            else => atom[1],
+        },
+        else => atom[0],
+    };
+}
+
+/// Adds to `set` every byte a match of `pattern` can begin with. False when
+/// the answer is useless or unknowable: an anchor, a leading `.`, or a
+/// branch that can match the empty string.
+fn firstBytes(pattern: []const u8, set: *std.StaticBitSet(256)) bool {
+    if (topAlt(pattern)) |pipe| {
+        return firstBytes(pattern[0..pipe], set) and firstBytes(pattern[pipe + 1 ..], set);
+    }
+    const alen = atomLen(pattern) orelse return false;
+    if (alen < pattern.len and (pattern[alen] == '*' or pattern[alen] == '?')) return false;
+    const atom = pattern[0..alen];
+    switch (atom[0]) {
+        '.', '^' => return false,
+        '(' => return firstBytes(atom[1 .. atom.len - 1], set),
+        else => {
+            for (0..256) |c| {
+                const byte = [1]u8{@intCast(c)};
+                if (matchAtom(atom, &byte, 0) != null) set.set(c);
+            }
+            return true;
+        },
+    }
+}
+
 /// True when `pattern` opens with `.*` or `.+`.
 ///
 /// `.?` does not qualify: it reaches at most one position past its start, so
@@ -168,10 +301,28 @@ fn matchFrom(pattern: []const u8, text: []const u8, start: usize) ?usize {
 
         if (qp < pattern.len) {
             switch (pattern[qp]) {
-                '*' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 0),
-                '+' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 1),
-                '?' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 0),
+                '*' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 0, std.math.maxInt(usize)),
+                '+' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 1, std.math.maxInt(usize)),
+                '?' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 0, 1),
                 else => {},
+            }
+        }
+
+        // A group with alternatives: the branch that matches first is not
+        // necessarily the one the rest of the pattern can follow. `(err|
+        // error): ` against `error: x` took `err`, failed on `o`, and gave
+        // up — every branch has to be tried against the rest.
+        if (pattern[pp] == '(') {
+            var branches = pattern[pp + 1 .. qp - 1];
+            if (topAlt(branches) != null) {
+                while (true) {
+                    const pipe = topAlt(branches);
+                    const branch = branches[0 .. pipe orelse branches.len];
+                    if (matchFrom(branch, text, tp)) |mid| {
+                        if (matchFrom(pattern[qp..], text, mid)) |end| return end;
+                    }
+                    branches = branches[(pipe orelse return null) + 1 ..];
+                }
             }
         }
 
@@ -192,8 +343,9 @@ fn isFixedWidthAtom(atom_pat: []const u8) bool {
     return atom_pat.len > 0 and atom_pat[0] != '(';
 }
 
-/// Greedy repetition of `atom_pat`, then match `rest`. min ∈ {0,1}.
-/// For `?`, max is 1; for `*`/`+`, max is unbounded.
+/// Greedy repetition of `atom_pat`, at least `min` and at most `max` times,
+/// then match `rest`. `?` used to repeat without bound, so `ab?c` matched
+/// `abbbc`.
 ///
 /// Backtracking gives up one repetition at a time, and the position after
 /// `count` of them used to be recovered by replaying the atom `count` times
@@ -215,10 +367,11 @@ fn matchRepeat(
     text: []const u8,
     start: usize,
     min: usize,
+    max: usize,
 ) ?usize {
     var count: usize = 0;
     var tp = start;
-    while (tp < text.len) {
+    while (tp < text.len and count < max) {
         const new_tp = matchAtom(atom_pat, text, tp) orelse break;
         if (new_tp == tp) break; // zero-width guard
         tp = new_tp;
@@ -598,4 +751,78 @@ test "a group repetition still replays correctly when it backtracks" {
     defer alt.deinit();
     try testing.expect(alt.isMatch("abbac"));
     try testing.expect(!alt.isMatch("abba"));
+}
+
+test "? matches at most once" {
+    const re = Regex.compile("ab?c").?;
+    try std.testing.expect(re.isMatch("ac"));
+    try std.testing.expect(re.isMatch("abc"));
+    try std.testing.expect(!re.isMatch("abbc"));
+}
+
+test "a group's alternatives are each tried against the rest of the pattern" {
+    const re = Regex.compile("(err|error): ").?;
+    try std.testing.expect(re.isMatch("error: disk full"));
+    try std.testing.expect(re.isMatch("err: disk full"));
+    try std.testing.expect(!re.isMatch("errors happen"));
+    const m = re.findFrom("x error: y", 0).?;
+    try std.testing.expectEqual(@as(usize, 2), m.start);
+    try std.testing.expectEqual(@as(usize, 9), m.end);
+}
+
+test "requiredLiteral: the longest run every match must contain" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("refused", requiredLiteral("conn.*REFUSED", &buf));
+    try std.testing.expectEqualStrings("status\":5", requiredLiteral("status\":5\\d\\d", &buf));
+    try std.testing.expectEqualStrings("", requiredLiteral("a|b", &buf));
+    try std.testing.expectEqualStrings("app.log", requiredLiteral("app\\.log", &buf));
+    // An optional atom breaks a run; `x+` contributes one byte and ends it.
+    try std.testing.expectEqualStrings("meo", requiredLiteral("ti?meo+ut", &buf));
+}
+
+test "firstBytes: only when every branch starts with a known byte" {
+    var set: std.StaticBitSet(256) = .empty;
+    try std.testing.expect(firstBytes("(timeout|refused)", &set));
+    try std.testing.expect(set.isSet('t') and set.isSet('T') and set.isSet('r') and !set.isSet('x'));
+    set = .empty;
+    try std.testing.expect(firstBytes("\\d+ms", &set));
+    try std.testing.expect(set.isSet('7') and !set.isSet('m'));
+    try std.testing.expect(!firstBytes("^x", &set));
+    try std.testing.expect(!firstBytes(".*x", &set));
+    try std.testing.expect(!firstBytes("a?b", &set));
+    try std.testing.expect(!firstBytes("a|", &set));
+}
+
+test "prefilters never change the answer" {
+    const pats = [_][]const u8{ "(timeout|refused)", "status\":5\\d\\d", "job 12.*ms$", "^2026", "x?y", "[a-c]+z", "(a|ab)c", "o+k", "app\\.log" };
+    const texts = [_][]const u8{ "", "connection refused", "TIMEOUT!", "status\":503", "status\":200", "job 1234 in 5ms", "2026-10-14", "y", "bbz", "abc", "ok", "ooook", "nothing here", "/var/app.log" };
+    for (pats) |p| {
+        const re = Regex.compile(p).?;
+        for (texts) |t| {
+            try std.testing.expectEqual(matchAnywhere(p, t), re.isMatch(t));
+            const want = findAnywhere(p, t, 0);
+            const got = re.findFrom(t, 0);
+            try std.testing.expectEqual(want == null, got == null);
+            if (want) |w| try std.testing.expectEqual(w.start, got.?.start);
+        }
+    }
+}
+
+test "containsLower: both cases, both paths, edges" {
+    try std.testing.expect(containsLower("xxxxxxxxxxxxxxxxxxxxCONNECTION refused", "connection"));
+    try std.testing.expect(containsLower("Refused", "refused"));
+    try std.testing.expect(containsLower("aaaaaaaaaaaaaaaab", "ab"));
+    try std.testing.expect(!containsLower("aaaaaaaaaaaaaaaaaaaaaaaa", "ab"));
+    try std.testing.expect(!containsLower("ab", "abc"));
+}
+
+test "a group with three or more alternatives matches every branch" {
+    // The second branch used to be handed on as `b|c`, which the sequence
+    // matcher cannot read, so only the first alternative ever matched.
+    const re = Regex.compile("(timeout|refused|job 1234)").?;
+    try std.testing.expect(re.isMatch("connection timeout"));
+    try std.testing.expect(re.isMatch("connection refused"));
+    try std.testing.expect(re.isMatch("processed job 1234 in 5ms"));
+    try std.testing.expect(!re.isMatch("processed job 999"));
+    try std.testing.expect(Regex.compile("x(a|b|c)y").?.isMatch("xcy"));
 }

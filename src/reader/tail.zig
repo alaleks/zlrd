@@ -460,13 +460,24 @@ fn readToEOFInternal(
         f.position += n;
         var slice = buf[0..n];
 
-        const used_carry = carry.items.len > 0;
-        if (used_carry) {
-            try ensureLineCapacity(carry.items.len, slice.len);
-            try carry.appendSlice(allocator, slice);
-            slice = carry.items;
+        // A partial line from the last read is finished by this read's first
+        // newline, and only that much is copied onto it — not the whole read,
+        // which under a busy log is the entire stream copied twice.
+        if (carry.items.len > 0) {
+            const nl = simd.findByte(slice, 0, '\n') orelse {
+                try ensureLineCapacity(carry.items.len, slice.len);
+                try carry.appendSlice(allocator, slice);
+                continue;
+            };
+            try ensureLineCapacity(carry.items.len, nl);
+            try carry.appendSlice(allocator, slice[0..nl]);
+            filter_state.beginChunk(carry.items);
+            try processLine(allocator, args, filter_state, agg_ptr, carry.items);
+            carry.clearRetainingCapacity();
+            slice = slice[nl + 1 ..];
         }
 
+        filter_state.beginChunk(slice);
         var start: usize = 0;
         while (simd.findByte(slice, start, '\n')) |nl| {
             const line = slice[start..nl];
@@ -476,7 +487,10 @@ fn readToEOFInternal(
             start = nl + 1;
         }
 
-        try keepUnprocessedTail(allocator, carry, slice, start, used_carry);
+        if (start < slice.len) {
+            try ensureLineCapacity(0, slice.len - start);
+            try carry.appendSlice(allocator, slice[start..]);
+        }
     }
 
     if (flush_final_line and carry.items.len > 0) {
@@ -486,31 +500,6 @@ fn readToEOFInternal(
 
     if (aggregator) |*agg| {
         agg.printAll(filter_state);
-    }
-}
-
-fn keepUnprocessedTail(
-    allocator: std.mem.Allocator,
-    carry: *std.ArrayList(u8),
-    slice: []const u8,
-    start: usize,
-    used_carry: bool,
-) !void {
-    if (used_carry) {
-        if (start < carry.items.len) {
-            const rest = carry.items[start..];
-            std.mem.copyForwards(u8, carry.items[0..rest.len], rest);
-            carry.items.len = rest.len;
-        } else {
-            carry.clearRetainingCapacity();
-        }
-        return;
-    }
-
-    carry.clearRetainingCapacity();
-    if (start < slice.len) {
-        try ensureLineCapacity(0, slice.len - start);
-        try carry.appendSlice(allocator, slice[start..]);
     }
 }
 
@@ -984,4 +973,27 @@ test "filtered backfill reassembles lines split across scan chunks" {
     const stat = try file.stat(tail_io);
     const start = try findLastNMatchingStart(allocator, &of, stat.size, 1, &filter_state, scan_buf);
     try testing.expectEqual(@as(u64, hit_off), start);
+}
+
+test "readToEOF: lines split across tiny reads leave only the true remainder" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "split.log", .data = "alpha\nbeta\ngammadelta\npart" });
+    var file = try tmp.dir.openFile(tail_io, "split.log", .{});
+    defer file.close(tail_io);
+
+    var files_array = [_][]const u8{"split.log"};
+    const args = makeSilentTailArgs(files_array[0..], 0, false, .exact);
+    var filter_state = formats.FilterState.init(args, null, null);
+    var carry: std.ArrayList(u8) = .empty;
+    var buf: [4]u8 = undefined;
+
+    var of = OpenFile{ .path = "split.log", .fd = file, .position = 0 };
+    try readToEOF(allocator, &of, args, &filter_state, &carry, &buf);
+    try testing.expectEqualStrings("part", carry.items);
+    try testing.expectEqual(@as(u64, 26), of.position);
 }

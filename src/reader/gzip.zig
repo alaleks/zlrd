@@ -196,65 +196,50 @@ pub fn readGzip(
 fn processChunk(
     allocator: std.mem.Allocator,
     carry: *std.ArrayList(u8),
-    chunk: []const u8,
+    chunk_in: []const u8,
     args: flags.Args,
     filter_state: anytype,
     aggregator: ?*BatchAggregator,
     key_builder: ?AggregateKeyBuilder,
 ) !void {
-    if (chunk.len == 0) return;
+    if (chunk_in.len == 0) return;
+    var chunk = chunk_in;
 
-    // Fast path: no carry from the previous chunk.
-    if (carry.items.len == 0) {
-        var start: usize = 0;
-
-        while (simd.findByte(chunk, start, '\n')) |nl| {
-            try processLine(
-                allocator,
-                chunk[start..nl],
-                args,
-                filter_state,
-                aggregator,
-                key_builder,
-            );
-            start = nl + 1;
-        }
-
-        if (start < chunk.len) {
-            try carry.appendSlice(allocator, chunk[start..]);
+    // A line left over from the previous chunk is finished by this chunk's
+    // first newline, and only that much is copied onto it. Appending the
+    // whole chunk, as this used to, copied nearly every decompressed byte a
+    // second time: the last line of a chunk almost never ends on its edge.
+    if (carry.items.len > 0) {
+        const nl = simd.findByte(chunk, 0, '\n') orelse {
+            try carry.appendSlice(allocator, chunk);
             try ensureCarryWithinLimit(carry.items.len);
-        }
-
-        return;
+            return;
+        };
+        try carry.appendSlice(allocator, chunk[0..nl]);
+        try ensureCarryWithinLimit(carry.items.len);
+        beginChunk(filter_state, carry.items);
+        try processLine(allocator, carry.items, args, filter_state, aggregator, key_builder);
+        carry.clearRetainingCapacity();
+        chunk = chunk[nl + 1 ..];
     }
 
-    // Slow path: append the new chunk to the carry buffer and scan in-place.
-    try carry.appendSlice(allocator, chunk);
-    try ensureCarryWithinLimit(carry.items.len);
-
+    beginChunk(filter_state, chunk);
     var start: usize = 0;
-
-    while (simd.findByte(carry.items, start, '\n')) |nl| {
-        try processLine(
-            allocator,
-            carry.items[start..nl],
-            args,
-            filter_state,
-            aggregator,
-            key_builder,
-        );
+    while (simd.findByte(chunk, start, '\n')) |nl| {
+        try processLine(allocator, chunk[start..nl], args, filter_state, aggregator, key_builder);
         start = nl + 1;
     }
-
-    if (start == 0) return;
-
-    if (start < carry.items.len) {
-        const rest = carry.items[start..];
-        std.mem.copyForwards(u8, carry.items[0..rest.len], rest);
-        carry.items.len = rest.len;
-    } else {
-        carry.clearRetainingCapacity();
+    if (start < chunk.len) {
+        try carry.appendSlice(allocator, chunk[start..]);
+        try ensureCarryWithinLimit(carry.items.len);
     }
+}
+
+/// Lets the filter hoist its per-chunk checks (the literal-ANSI scan) out of
+/// the per-line path, as the plain-file reader does. The test sink has no
+/// such hook.
+fn beginChunk(filter_state: anytype, bytes: []const u8) void {
+    if (@hasDecl(@TypeOf(filter_state.*), "beginChunk")) filter_state.beginChunk(bytes);
 }
 
 /// Flushes the final unterminated line left in `carry`.
@@ -966,4 +951,25 @@ test "BatchAggregator.printAll delegates to filter_state" {
 test "BatchAggregator deinit after no additions is safe" {
     var agg = try BatchAggregator.init(testing.allocator);
     agg.deinit();
+}
+
+test "processChunk: a line split across chunks is joined, the rest stays in place" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var carry: std.ArrayList(u8) = .empty;
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try processChunk(allocator, &carry, "first\npar", makeArgs(false, .exact), &sink, null, null);
+    try processChunk(allocator, &carry, "tial\nnext\nrem", makeArgs(false, .exact), &sink, null, null);
+    try processChunk(allocator, &carry, "ain", makeArgs(false, .exact), &sink, null, null);
+    try flushFinalCarry(allocator, &carry, makeArgs(false, .exact), &sink, null, null);
+
+    try testing.expectEqual(@as(usize, 4), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("first", sink.printed_lines.items[0]);
+    try testing.expectEqualStrings("partial", sink.printed_lines.items[1]);
+    try testing.expectEqualStrings("next", sink.printed_lines.items[2]);
+    try testing.expectEqualStrings("remain", sink.printed_lines.items[3]);
 }
