@@ -1,9 +1,15 @@
 //! Multi-file follow loop for agent mode.
 //!
 //! Stays minimal on purpose: positional reads, partial-line carry, and a
-//! short sleep when nothing new arrived. Truncation (size shrank below the
-//! tracked position) is handled by resetting to the start of the file and
-//! bumping `file_rotation_total`.
+//! short sleep when nothing new arrived.
+//!
+//! Rotation is followed by path. A new inode at the path — `mv` + create,
+//! delete + recreate, `mv` then gzip — means the old file is read to its end
+//! first, then the new one from its start. In-place truncation
+//! (`copytruncate`) is caught by size or, when the file has already grown
+//! back past the old offset, by its first bytes changing. A path that does
+//! not exist yet is opened when it appears. Every one of these bumps
+//! `file_rotation_total`.
 
 const std = @import("std");
 const flags = @import("flags");
@@ -41,16 +47,25 @@ const max_bytes_per_pass: usize = 4 * 1024 * 1024;
 /// buffer in `signature.zig` is sized to match.
 const max_line_bytes = 8 * 1024;
 
+/// Bytes kept from the start of a file to recognise it after an in-place
+/// truncate. A log line's timestamp sits in its first bytes, so a rewritten
+/// file almost never starts the same way.
+const head_bytes = 64;
+
 const FileState = struct {
     path: []const u8,
-    fd: std.Io.File,
+    /// Null until the path exists.
+    fd: ?std.Io.File,
     position: u64,
     carry: std.ArrayList(u8),
     last_line_ms: i64,
     /// Inode of the file currently open under this path. Compared against a
     /// path-level stat each iteration to detect rotation / restart. Typed as
     /// `std.Io.File.INode` so Windows (signed file id) compiles too.
+    /// Meaningless while `fd` is null.
     inode: std.Io.File.INode,
+    head: [head_bytes]u8 = undefined,
+    head_len: u8 = 0,
     /// Per-file lifecycle tracker. Non-null only when the file's path is
     /// bound to a `--service NAME=PATH` mapping.
     tracker: ?service.Tracker,
@@ -87,29 +102,40 @@ pub const Watcher = struct {
         var opened: usize = 0;
         errdefer {
             for (files[0..opened]) |*f| {
-                f.fd.close(io);
+                if (f.fd) |fd| fd.close(io);
                 f.carry.deinit(allocator);
             }
         }
 
         const now = nowMs(io);
         for (paths, 0..) |path, i| {
-            const fd = try std.Io.Dir.cwd().openFile(io, path, .{});
-            errdefer fd.close(io);
-            const stat = try fd.stat(io);
             const tracker_opt: ?service.Tracker = if (cfg.serviceForPath(path)) |svc_name|
                 service.Tracker.init(svc_name, path, now)
             else
                 null;
             files[i] = .{
                 .path = path,
-                .fd = fd,
-                .position = stat.size,
+                .fd = null,
+                .position = 0,
                 .carry = .empty,
                 .last_line_ms = now,
-                .inode = stat.inode,
+                .inode = undefined,
                 .tracker = tracker_opt,
             };
+            // A file that is already there is followed from its end; one
+            // that is not yet is picked up, from its start, once it appears.
+            if (std.Io.Dir.cwd().openFile(io, path, .{})) |fd| {
+                errdefer fd.close(io);
+                const stat = try fd.stat(io);
+                files[i].fd = fd;
+                files[i].inode = stat.inode;
+                files[i].position = stat.size;
+                // Read from the end, so the head has to be fetched now.
+                try readHead(io, &files[i], fd);
+            } else |err| switch (err) {
+                error.FileNotFound => log.info("{s} does not exist yet; waiting for it", .{path}),
+                else => return err,
+            }
             opened += 1;
         }
 
@@ -151,7 +177,7 @@ pub const Watcher = struct {
 
     pub fn deinit(self: *Watcher) void {
         for (self.files) |*f| {
-            f.fd.close(self.io);
+            if (f.fd) |fd| fd.close(self.io);
             f.carry.deinit(self.allocator);
         }
         self.allocator.free(self.files);
@@ -227,32 +253,49 @@ pub const Watcher = struct {
     /// previous "one chunk per call" version cost an extra 30k+ syscalls
     /// when starting up against a large backlog.
     fn drainFile(self: *Watcher, f: *FileState) !usize {
+        var consumed: usize = 0;
         // Path-level stat catches the "logrotate / restart created a new
         // file at this path" case — the open fd still points at the old
         // (possibly unlinked) inode, so its fstat() would never notice.
         if (std.Io.Dir.cwd().statFile(self.io, f.path, .{})) |path_stat| {
-            if (path_stat.inode != f.inode) {
-                try self.handleRotation(f, path_stat.inode);
+            if (f.fd == null) {
+                try self.openAppeared(f, path_stat.inode);
+            } else if (path_stat.inode != f.inode) {
+                consumed += try self.handleRotation(f, path_stat.inode);
             }
         } else |_| {
-            // Path temporarily missing during a swap — keep using the
-            // existing fd until the path resolves again.
+            // Missing: not created yet, or mid-swap. Keep reading the open
+            // fd, if any, until the path resolves again.
         }
+        const fd = f.fd orelse return consumed;
 
-        const stat = try f.fd.stat(self.io);
-
-        // Truncation: file shrank under us (in-place truncate, not rotation).
-        if (stat.size < f.position) {
+        const stat = try fd.stat(self.io);
+        // In-place truncation. Usually the file is simply shorter than our
+        // offset; but a busy writer can refill it past that offset between
+        // two polls, and then only its first bytes give it away.
+        if (stat.size < f.position or try self.headChanged(f, fd)) {
             self.metrics.observeRotation();
             f.position = 0;
+            f.head_len = 0;
             f.carry.clearRetainingCapacity();
         }
-        if (stat.size == f.position) return 0;
+        if (stat.size == f.position) return consumed;
+        return consumed + try self.readFrom(f, fd, max_bytes_per_pass);
+    }
 
+    /// Reads and processes up to `limit` bytes from `f.position`.
+    fn readFrom(self: *Watcher, f: *FileState, fd: std.Io.File, limit: usize) !usize {
         var consumed: usize = 0;
-        while (consumed < max_bytes_per_pass) {
-            const n = try f.fd.readPositional(self.io, &.{self.read_buf}, f.position);
+        while (consumed < limit) {
+            const n = try fd.readPositional(self.io, &.{self.read_buf}, f.position);
             if (n == 0) break;
+            if (f.position < head_bytes and f.head_len < head_bytes) {
+                const take = @min(head_bytes - f.head_len, n);
+                if (f.position == f.head_len) {
+                    @memcpy(f.head[f.head_len..][0..take], self.read_buf[0..take]);
+                    f.head_len += @intCast(take);
+                }
+            }
             consumed += n;
             f.position += n;
             try self.processChunk(f, self.read_buf[0..n]);
@@ -263,12 +306,42 @@ pub const Watcher = struct {
         return consumed;
     }
 
-    fn handleRotation(self: *Watcher, f: *FileState, new_inode: std.Io.File.INode) !void {
-        f.fd.close(self.io);
+    /// True when the file no longer starts with the bytes it started with
+    /// when they were read.
+    fn headChanged(self: *Watcher, f: *const FileState, fd: std.Io.File) !bool {
+        if (f.head_len == 0) return false;
+        var buf: [head_bytes]u8 = undefined;
+        const n = try fd.readPositional(self.io, &.{buf[0..f.head_len]}, 0);
+        return n < f.head_len or !std.mem.eql(u8, buf[0..n], f.head[0..f.head_len]);
+    }
+
+    fn openAppeared(self: *Watcher, f: *FileState, inode: std.Io.File.INode) !void {
+        f.fd = try std.Io.Dir.cwd().openFile(self.io, f.path, .{});
+        f.inode = inode;
+        f.position = 0;
+        f.head_len = 0;
+        self.metrics.observeRotation();
+        log.info("{s} appeared; following it", .{f.path});
+    }
+
+    /// Switches to the new file at the path, after reading the old one to
+    /// its end. The writer may have appended right up to the rename, and the
+    /// old inode stays readable through our fd even once it is unlinked or
+    /// compressed away — closing it first is how those last lines were lost.
+    fn handleRotation(self: *Watcher, f: *FileState, new_inode: std.Io.File.INode) !usize {
+        const old = f.fd.?;
+        const drained = self.readFrom(f, old, std.math.maxInt(usize)) catch 0;
+        // The old file is finished, so an unterminated last line is whole.
+        if (f.carry.items.len > 0) {
+            try self.handleLine(f, f.carry.items);
+            f.carry.clearRetainingCapacity();
+        }
+        old.close(self.io);
+        f.fd = null;
         f.fd = try std.Io.Dir.cwd().openFile(self.io, f.path, .{});
         f.inode = new_inode;
         f.position = 0;
-        f.carry.clearRetainingCapacity();
+        f.head_len = 0;
         self.metrics.observeRotation();
 
         if (f.tracker) |*t| {
@@ -276,6 +349,7 @@ pub const Watcher = struct {
             const ev = t.observeInodeChange(now_ms);
             self.dispatcher.dispatchService(ev, now_ms);
         }
+        return drained;
     }
 
     fn processChunk(self: *Watcher, f: *FileState, chunk: []const u8) !void {
@@ -334,6 +408,12 @@ pub const Watcher = struct {
     }
 };
 
+/// Records the first `head_bytes` of the file (fewer if it is shorter).
+fn readHead(io: std.Io, f: *FileState, fd: std.Io.File) !void {
+    const n = try fd.readPositional(io, &.{f.head[0..]}, 0);
+    f.head_len = @intCast(@min(n, f.position));
+}
+
 fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
@@ -349,4 +429,116 @@ fn appendBounded(
     const room = max_line_bytes - carry.items.len;
     const slice = if (extra.len > room) extra[0..room] else extra;
     try carry.appendSlice(allocator, slice);
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// A watcher over one file in a temp dir, with nothing configured to fire.
+const Fixture = struct {
+    tmp: testing.TmpDir,
+    path_buf: [160]u8 = undefined,
+    path: []const u8 = "",
+    m: metrics.Metrics,
+    cfg: config.AgentConfig,
+    rs: rules.RuleSet,
+    d: alert.Dispatcher,
+    w: Watcher = undefined,
+    paths: [1][]const u8 = undefined,
+
+    fn init(self: *Fixture, initial: ?[]const u8) !void {
+        const io = std.Options.debug_io;
+        self.tmp = testing.tmpDir(.{});
+        self.path = try std.fmt.bufPrint(&self.path_buf, ".zig-cache/tmp/{s}/app.log", .{self.tmp.sub_path});
+        if (initial) |data| try self.write(data, .{});
+        self.m = metrics.Metrics.init(0);
+        self.cfg = try config.AgentConfig.fromArgs(testing.allocator, .{});
+        self.rs = try rules.RuleSet.init(testing.allocator, self.cfg);
+        self.d = try alert.Dispatcher.init(io, self.cfg.sinks, &self.m, false);
+        self.paths = .{self.path};
+        self.w = try Watcher.init(testing.allocator, io, &self.m, &self.rs, &self.d, &self.cfg, &self.paths);
+    }
+
+    fn deinit(self: *Fixture) void {
+        self.w.deinit();
+        self.d.deinit();
+        self.rs.deinit();
+        self.cfg.deinit(testing.allocator);
+        self.tmp.cleanup();
+    }
+
+    fn write(self: *Fixture, data: []const u8, opts: struct { append: bool = false }) !void {
+        const io = std.Options.debug_io;
+        const f = try std.Io.Dir.cwd().createFile(io, self.path, .{ .truncate = !opts.append, .read = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, data, if (opts.append) try f.length(io) else 0);
+    }
+
+    fn rename(self: *Fixture, suffix: []const u8) !void {
+        var buf: [176]u8 = undefined;
+        const to = try std.fmt.bufPrint(&buf, "{s}{s}", .{ self.path, suffix });
+        try std.Io.Dir.cwd().rename(self.path, std.Io.Dir.cwd(), to, std.Options.debug_io);
+    }
+
+    fn drain(self: *Fixture) !void {
+        _ = try self.w.drainFile(&self.w.files[0]);
+    }
+
+    fn lines(self: *Fixture) u64 {
+        var n: u64 = 0;
+        for (&self.m.lines_total) |*c| n += c.load(.monotonic);
+        return n;
+    }
+};
+
+test "mv rotation: the old file is read to its end before the new one" {
+    var fx: Fixture = undefined;
+    try fx.init("old history\n");
+    defer fx.deinit();
+
+    // Written after the last poll, right before logrotate's rename.
+    try fx.write("a\nb\nunterminated", .{ .append = true });
+    try fx.rename(".1");
+    try fx.write("c\nd\n", .{});
+    try fx.drain();
+    // a, b, the old file's unfinished last line, c, d.
+    try testing.expectEqual(@as(u64, 5), fx.lines());
+}
+
+test "delete and recreate: the unlinked file is still drained" {
+    var fx: Fixture = undefined;
+    try fx.init("");
+    defer fx.deinit();
+
+    try fx.write("a\nb\n", .{ .append = true });
+    try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, fx.path);
+    try fx.write("c\n", .{});
+    try fx.drain();
+    try testing.expectEqual(@as(u64, 3), fx.lines());
+}
+
+test "copytruncate refilled past the old offset is still seen as a restart" {
+    var fx: Fixture = undefined;
+    try fx.init("2026-10-14 10:00:00 first\n");
+    defer fx.deinit();
+    try fx.drain();
+
+    // Truncated and rewritten by the time of the next poll, already longer
+    // than before, so the size alone says nothing happened.
+    try fx.write("2026-10-14 11:00:00 new one\n2026-10-14 11:00:01 new two\n", .{});
+    try fx.drain();
+    try testing.expectEqual(@as(u64, 2), fx.lines());
+}
+
+test "a file that does not exist at start is followed from its start once it does" {
+    var fx: Fixture = undefined;
+    try fx.init(null);
+    defer fx.deinit();
+
+    try fx.drain();
+    try testing.expectEqual(@as(u64, 0), fx.lines());
+    try fx.write("a\nb\nc\n", .{});
+    try fx.drain();
+    try testing.expectEqual(@as(u64, 3), fx.lines());
 }

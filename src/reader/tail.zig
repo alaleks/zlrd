@@ -17,6 +17,9 @@ const OpenFile = struct {
     path: []const u8,
     fd: std.Io.File,
     position: u64,
+    /// The inode `fd` was opened on, to notice when the path is rotated to a
+    /// new file. Null in tests that never rotate.
+    inode: ?std.Io.File.INode = null,
 };
 
 // Read buffer size for the follow loop.
@@ -293,14 +296,15 @@ pub fn follow(
             continue;
         };
 
+        const stat = try fd.stat(tail_io);
         files_buf[files_len] = OpenFile{
             .path = path,
             .fd = fd,
             .position = 0,
+            .inode = stat.inode,
         };
         files_len += 1;
 
-        const stat = try fd.stat(tail_io);
         if (stat.size > 0) {
             const final_pos = try readLastNLines(
                 allocator,
@@ -334,6 +338,11 @@ pub fn follow(
         var any_read = false;
 
         for (files_buf[0..files_len], carries) |*f, *carry| {
+            if (followRotation(allocator, f, args, &filter_state, carry, read_buf) catch |err| blk: {
+                logTailError("rotate", f.path, err);
+                break :blk false;
+            }) any_read = true;
+
             const stat = f.fd.stat(tail_io) catch |err| {
                 logTailError("stat", f.path, err);
                 continue;
@@ -363,6 +372,36 @@ pub fn follow(
 
         std.Io.sleep(tail_io, std.Io.Duration.fromMilliseconds(100), .awake) catch continue;
     }
+}
+
+/// Switches `f` to the new file when its path now names a different inode —
+/// `mv` + create, delete + recreate, a move to `.gz`. The old file is read to
+/// its end first, last unterminated line included: the writer may have
+/// appended right up to the rename, and the old inode stays readable through
+/// our fd even once it is gone from the directory. `-t` used to keep reading
+/// the old file forever and print nothing written after the first rotation.
+///
+/// Returns true when it switched. A path that is missing for the moment is
+/// not a rotation yet; the old fd keeps being read until a new file appears.
+fn followRotation(
+    allocator: std.mem.Allocator,
+    f: *OpenFile,
+    args: flags.Args,
+    filter_state: *formats.FilterState,
+    carry: *std.ArrayList(u8),
+    buf: []u8,
+) !bool {
+    const current = f.inode orelse return false;
+    const st = std.Io.Dir.cwd().statFile(tail_io, f.path, .{}) catch return false;
+    if (st.inode == current) return false;
+
+    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, true);
+    const fresh = try std.Io.Dir.cwd().openFile(tail_io, f.path, .{});
+    f.fd.close(tail_io);
+    f.fd = fresh;
+    f.inode = st.inode;
+    f.position = 0;
+    return true;
 }
 
 /// Prints a one-line warning to stderr when a tail-follow read fails. Tail
@@ -996,4 +1035,45 @@ test "readToEOF: lines split across tiny reads leave only the true remainder" {
     try readToEOF(allocator, &of, args, &filter_state, &carry, &buf);
     try testing.expectEqualStrings("part", carry.items);
     try testing.expectEqual(@as(u64, 26), of.position);
+}
+
+test "followRotation: drains the old file, then switches to the new one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "rot.log", .data = "a\n" });
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/rot.log", .{tmp.sub_path});
+
+    const fd = try std.Io.Dir.cwd().openFile(tail_io, path, .{});
+    var of = OpenFile{ .path = path, .fd = fd, .position = 2, .inode = (try fd.stat(tail_io)).inode };
+    defer of.fd.close(tail_io);
+
+    var files_array = [_][]const u8{path};
+    const args = makeSilentTailArgs(files_array[0..], 0, false, .exact);
+    var filter_state = formats.FilterState.init(args, null, null);
+    var carry: std.ArrayList(u8) = .empty;
+    var buf: [64]u8 = undefined;
+
+    // No rotation yet.
+    try testing.expect(!try followRotation(allocator, &of, args, &filter_state, &carry, &buf));
+
+    // Appended right before the rename, unterminated, then rotated.
+    {
+        const w = try tmp.dir.openFile(tail_io, "rot.log", .{ .mode = .read_write });
+        defer w.close(tail_io);
+        try w.writePositionalAll(tail_io, "b\nlast", 2);
+    }
+    try tmp.dir.rename("rot.log", tmp.dir, "rot.log.1", tail_io);
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "rot.log", .data = "new\n" });
+
+    try testing.expect(try followRotation(allocator, &of, args, &filter_state, &carry, &buf));
+    // The old file was read to its end and its last line flushed.
+    try testing.expectEqual(@as(usize, 0), carry.items.len);
+    try testing.expectEqual(@as(u64, 0), of.position);
+    try readToEOF(allocator, &of, args, &filter_state, &carry, &buf);
+    try testing.expectEqual(@as(u64, 4), of.position);
 }

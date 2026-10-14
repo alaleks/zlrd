@@ -5,6 +5,7 @@
 //! thread (so it can return cleanly when stop conditions are met).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const flags = @import("flags");
 const kernel = @import("kernel");
 const state = @import("state");
@@ -235,6 +236,7 @@ pub fn run(
     // so we can't `return err` straight away — instead we record the
     // failure and surface it via the exit code after cleanup completes.
     var watcher_failed = false;
+    installStopHandler(&w.stop_flag);
     w.run() catch |err| {
         log.err("watcher exited unexpectedly: {t}", .{err});
         watcher_failed = true;
@@ -243,6 +245,36 @@ pub fn run(
     if (dispatcher.shouldExit()) return 1;
     if (watcher_failed) return 2;
     return 0;
+}
+
+/// The flag SIGTERM and SIGINT set. A plain global because a signal handler
+/// gets no context; it is written once, before the handler is installed.
+var stop_flag_for_signals: ?*std.atomic.Value(bool) = null;
+
+fn onStopSignal(_: std.posix.SIG) callconv(.c) void {
+    if (stop_flag_for_signals) |f| f.store(true, .monotonic);
+}
+
+/// Turns SIGTERM and SIGINT into a clean stop: the watcher loop ends, and
+/// the deferred shutdown in `run` gets to park queued webhooks in the spool,
+/// flush the state file and the sidecar queue. Without it `systemctl stop`
+/// killed the process where it stood and all of that was lost.
+///
+/// `RESETHAND` makes a second signal the default one, so an agent stuck in
+/// shutdown still dies on a second Ctrl-C.
+///
+/// shortcut: POSIX only. On Windows Ctrl-C still terminates immediately;
+/// SetConsoleCtrlHandler would be the equivalent if that ever matters.
+fn installStopHandler(flag: *std.atomic.Value(bool)) void {
+    if (comptime builtin.os.tag == .windows) return;
+    stop_flag_for_signals = flag;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onStopSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESETHAND,
+    };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
 }
 
 fn runServer(srv: *server.Server) void {

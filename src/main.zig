@@ -130,6 +130,10 @@ pub fn main(opts: struct {
             }
 
             std.Io.Dir.cwd().access(io, path, .{}) catch |err| {
+                // The agent waits for a log that is not there yet — a
+                // service that has not written its first line is normal at
+                // boot. The reader has nothing to read.
+                if (parsed_args.agent_mode and err == error.FileNotFound) continue;
                 var buf: [512]u8 = undefined;
                 const msg = switch (err) {
                     error.FileNotFound => std.fmt.bufPrint(&buf, "{s}: no such file", .{path}) catch "no such file",
