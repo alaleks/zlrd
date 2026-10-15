@@ -1209,3 +1209,113 @@ test "a crash loop: the panic right after a trace is the next crash, not lost" {
     try testing.expect(std.mem.startsWith(u8, got.items[0], "go_panic|panic: first|"));
     try testing.expect(std.mem.startsWith(u8, got.items[1], "go_panic|panic: second|"));
 }
+
+/// Feeds `lines` the way the watcher and journal sources do — re-feeding the
+/// line that ended a trace — and collects every event.
+/// An event's slices point into the tracker, so each is copied out the
+/// moment it is emitted — before a refeed can start the next crash.
+fn feedAll(t: *Tracker, det: *const Detector, lines: []const []const u8, out: *std.ArrayList(ServiceEvent)) !void {
+    for (lines, 0..) |line, i| {
+        while (t.observe(line, null, det, @intCast(i))) |ev| {
+            var copy = ev;
+            copy.detail = try arena_for_tests.allocator().dupe(u8, ev.detail);
+            copy.stack_trace = try arena_for_tests.allocator().dupe(u8, ev.stack_trace);
+            try out.append(testing.allocator, copy);
+            if (!t.refeed) break;
+        }
+    }
+}
+
+var arena_for_tests: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
+test "Python: the exception line is the detail and closes the trace" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "api.log", 0);
+    var events: std.ArrayList(ServiceEvent) = .empty;
+    defer events.deinit(testing.allocator);
+    try feedAll(&t, &det, &.{
+        "Traceback (most recent call last):",
+        "  File \"app.py\", line 7, in <module>",
+        "    main()",
+        "ValueError: invalid literal for int() with base 10: 'x'",
+        "2026-10-15 10:00:00 INFO next request",
+    }, &events);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    const ev = events.items[0];
+    try testing.expectEqualStrings("python_traceback", ev.marker);
+    try testing.expectEqualStrings("ValueError: invalid literal for int() with base 10: 'x'", ev.detail);
+    try testing.expect(std.mem.endsWith(u8, ev.stack_trace, "ValueError: invalid literal for int() with base 10: 'x'\n"));
+}
+
+test "Python: a chained exception is one crash, detailed by the final exception" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "api.log", 0);
+    var events: std.ArrayList(ServiceEvent) = .empty;
+    defer events.deinit(testing.allocator);
+    try feedAll(&t, &det, &.{
+        "Traceback (most recent call last):",
+        "  File \"app.py\", line 3, in load",
+        "KeyError: 'port'",
+        "",
+        "During handling of the above exception, another exception occurred:",
+        "",
+        "Traceback (most recent call last):",
+        "  File \"app.py\", line 9, in <module>",
+        "RuntimeError: config is incomplete",
+        "INFO shutting down",
+    }, &events);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 1), t.crash_count);
+    try testing.expectEqualStrings("RuntimeError: config is incomplete", events.items[0].detail);
+}
+
+test "crash loop: the line that ends one trace opens the next crash" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "api.log", 0);
+    var events: std.ArrayList(ServiceEvent) = .empty;
+    defer events.deinit(testing.allocator);
+    try feedAll(&t, &det, &.{
+        "panic: first",
+        "",
+        "goroutine 1 [running]:",
+        "main.main()",
+        "\t/app/main.go:5 +0x1d",
+        "panic: second",
+        "INFO unrelated",
+    }, &events);
+
+    try testing.expectEqual(@as(usize, 2), events.items.len);
+    try testing.expectEqualStrings("panic: first", events.items[0].detail);
+    try testing.expectEqualStrings("panic: second", events.items[1].detail);
+    try testing.expect(std.mem.indexOf(u8, events.items[0].stack_trace, "main.go:5") != null);
+    try testing.expectEqual(@as(u64, 2), t.crash_count);
+}
+
+test "refeed does not count a consumed line twice" {
+    // A Python exception line that happens to look like a Go banner is part
+    // of the trace; it must not open a second crash when the trace ends.
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "api.log", 0);
+    var events: std.ArrayList(ServiceEvent) = .empty;
+    defer events.deinit(testing.allocator);
+    try feedAll(&t, &det, &.{
+        "Traceback (most recent call last):",
+        "  File \"app.py\", line 1, in <module>",
+        "RuntimeError: panic: nested",
+        "INFO next",
+    }, &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+}
+
+test "flush emits a crash still collecting, and nothing otherwise" {
+    const det: Detector = .{ .customs = &.{} };
+    var t = Tracker.init("api", "api.log", 0);
+    try testing.expect(t.flush() == null);
+    _ = t.observe("panic: boom", null, &det, 1);
+    const ev = t.flush().?;
+    try testing.expectEqualStrings("panic: boom", ev.detail);
+    try testing.expect(t.flush() == null);
+    try testing.expect(t.death_reported);
+}

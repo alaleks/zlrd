@@ -3,7 +3,7 @@
 //! Each `--journal-unit NAME=PATTERN` spawns one `journalctl -fu <PATTERN>
 //! --output=json --no-pager --since now` subprocess and consumes its stdout
 //! line-by-line. Each line is one JSON-encoded journal entry; we extract a
-//! handful of fields (MESSAGE, PRIORITY, _SYSTEMD_UNIT, _PID,
+//! handful of fields (MESSAGE, PRIORITY, _SYSTEMD_UNIT, UNIT, _PID,
 //! SYSLOG_IDENTIFIER), classify it, and either:
 //!
 //!   * skip it (systemd lifecycle: `Started`, `Stopping`, `Stopped`, …);
@@ -463,7 +463,7 @@ pub const JournalSource = struct {
     /// filtered out before it is copied, so adding an `e.get` below means
     /// adding the key here too.
     const native_fields = [_][]const u8{
-        "MESSAGE", "_SYSTEMD_UNIT", "UNIT", "SYSLOG_IDENTIFIER", "PRIORITY",
+        "MESSAGE", "_SYSTEMD_UNIT", "UNIT", "SYSLOG_IDENTIFIER", "PRIORITY", "_PID",
     };
 
     fn handleNativeEntry(self: *JournalSource, e: *const native.Entry) void {
@@ -481,7 +481,7 @@ pub const JournalSource = struct {
         // journal source as a crash of its service.
         const unit = entryUnit(syslog_id, e.get("UNIT"), e.get("_SYSTEMD_UNIT")) orelse return;
         if (!native.source.matchesUnitGlob(self.pattern, unit)) return;
-        self.handleMessage(unit, syslog_id, message, e.get("PRIORITY") orelse "", now_ms);
+        self.handleMessage(unit, syslog_id, message, e.get("PRIORITY") orelse "", parsePid(e.get("_PID")), now_ms);
     }
 
     /// Classifies one entry already known to belong to this source.
@@ -491,6 +491,7 @@ pub const JournalSource = struct {
         syslog_id: []const u8,
         message: []const u8,
         priority: []const u8,
+        pid: ?u32,
         now_ms: i64,
     ) void {
         if (std.mem.eql(u8, syslog_id, "systemd")) {
@@ -510,6 +511,12 @@ pub const JournalSource = struct {
         while (tracker.observe(message, level, self.detector, now_ms)) |ev| {
             self.emit(ev, now_ms);
             if (!tracker.refeed) break;
+        }
+        // A crash that began on this very line: `_PID` is the process that
+        // wrote it, which beats anything the tracker could parse out of the
+        // text — and a Go or Python banner carries no pid at all.
+        if (tracker.state == .crash_collecting and tracker.trace.lines == 0) {
+            if (pid) |p| tracker.pending_pid = p;
         }
     }
 
@@ -646,7 +653,14 @@ pub const JournalSource = struct {
         // names no unit still belongs here.
         const unit = entryUnit(syslog_id, unit_field, systemd_unit) orelse self.pattern;
 
-        self.handleMessage(unit, syslog_id, message, findJsonStringField(json_line, "PRIORITY") orelse "", now_ms);
+        self.handleMessage(
+            unit,
+            syslog_id,
+            message,
+            findJsonStringField(json_line, "PRIORITY") orelse "",
+            parsePid(findJsonStringField(json_line, "_PID")),
+            now_ms,
+        );
     }
 
     fn trackerFor(self: *JournalSource, unit: []const u8, now_ms: i64) ?*service.Tracker {
@@ -721,6 +735,10 @@ pub const JournalSource = struct {
         }, now_ms);
     }
 };
+
+fn parsePid(raw: ?[]const u8) ?u32 {
+    return std.fmt.parseInt(u32, raw orelse return null, 10) catch null;
+}
 
 /// How long after a crash a systemd notice still counts as its echo. systemd
 /// reports a death within milliseconds; a minute leaves room for a slow
@@ -990,13 +1008,18 @@ const Harness = struct {
 
     /// An application line on stderr: journald's default priority, info.
     fn app(self: *Harness, unit: []const u8, msg: []const u8, now: i64) void {
-        self.src.tickAll(now);
-        self.src.handleMessage(unit, "api", msg, "6", now);
+        self.appPid(unit, msg, 4242, now);
     }
 
+    fn appPid(self: *Harness, unit: []const u8, msg: []const u8, pid: u32, now: i64) void {
+        self.src.tickAll(now);
+        self.src.handleMessage(unit, "api", msg, "6", pid, now);
+    }
+
+    /// PID 1 writes these; its `_PID` must not end up on the alert.
     fn systemd(self: *Harness, unit: []const u8, msg: []const u8, now: i64) void {
         self.src.tickAll(now);
-        self.src.handleMessage(unit, "systemd", msg, "5", now);
+        self.src.handleMessage(unit, "systemd", msg, "5", 1, now);
     }
 
     /// Every alert written so far. Caller frees with `freeRecords`.
@@ -1155,4 +1178,35 @@ test "messageFromEntry: string and byte-array forms" {
         messageFromEntry("{\"MESSAGE\":[27,91,51,49,109,112,97,110,105,99,58,32,120],\"_PID\":\"1\"}", &buf).?,
     );
     try testing.expect(messageFromEntry("{\"_PID\":\"1\"}", &buf) == null);
+}
+
+test "the crash carries the _PID of the line that opened it" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    const u = "api.service";
+
+    h.appPid(u, "panic: boom", 777, 100);
+    h.appPid(u, "", 777, 101);
+    h.appPid(u, "goroutine 1 [running]:", 777, 102);
+    h.systemd(u, "api.service: Main process exited, code=exited, status=2/INVALIDARGUMENT", 103);
+    h.systemd(u, "api.service: Failed with result 'exit-code'.", 104);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 1), rs.len);
+    try testing.expectEqual(@as(i64, 777), field(rs[0], "pid").integer);
+}
+
+test "a pid in the text wins over nothing, _PID wins over the text" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+    h.appPid("api.service", "{\"level\":\"fatal\",\"pid\":12,\"msg\":\"db gone\"}", 34, 100);
+    h.systemd("api.service", "api.service: Failed with result 'exit-code'.", 101);
+
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 1), rs.len);
+    try testing.expectEqual(@as(i64, 34), field(rs[0], "pid").integer);
 }
