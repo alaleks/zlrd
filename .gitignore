@@ -30,3 +30,9 @@ zig-out/
 # Coverage / profiling
 *.prof
 *.cov
+
+# Field tests (bench/) — kept local
+__pycache__/
+bench/field_test.py
+bench/remote_field_test.sh
+bench/field-results/

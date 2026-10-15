@@ -126,7 +126,6 @@ the whole point is that you probably don't have a Prometheus.
   - [Webhook integration](#webhook-integration)
   - [Optional: Prometheus endpoint](#optional-prometheus-endpoint)
   - [Production deployment](#production-deployment)
-  - [Field tests](#field-tests)
 - [CLI reference](#cli-reference)
 - [Roadmap](#roadmap)
   - [Status](#status)
@@ -1257,31 +1256,6 @@ Tips:
 - **`systemctl stop` is a clean stop.** SIGTERM and SIGINT end the watcher;
   queued webhooks are parked in the spool and the state file is flushed. A
   second signal kills immediately.
-
-### Field tests
-
-`bench/field_test.py` (Python 3, std-lib only; `openssl` for the sidecar
-step) measures what unit tests cannot: hours of runtime, real rotation, real
-garbage. One command runs everything in a temp directory and removes it at
-the end — on success, on failure and on Ctrl-C — keeping only a small
-results directory:
-
-```bash
-python3 bench/field_test.py --zlrd ./zig-out/bin/zlrd all \
-    --hours 8 --src /var/log/some-real.log --results ./field-results
-# → field-results/REPORT.md, soak.csv, *.json
-```
-
-| Step        | What it does | Passes when |
-| ----------- | ------------ | ----------- |
-| `rotation`  | Numbered lines through 20 rotations of each kind: `mv` + create, `copytruncate`, delete + recreate, `mv` + gzip; `zlrd -t` and the agent read side by side | every number printed exactly once; the agent's `zlrd_lines_total` equals the lines written |
-| `malformed` | 1 MiB lines, 32 MiB of random bytes, broken and 100k-deep JSON, mixed formats with CRLF and NUL, a file created after start | exit 0, agent alive, every line counted, peak RSS < 256 MiB |
-| `soak`      | The agent under `--rate` lines/s replayed from `--src`, rotating through all four kinds every 10 min; RSS, fds and threads sampled every minute | RSS of the last hour within 10% of the first, fds and threads flat, and at the end lines counted = lines written |
-| `sidecar`   | `--with-sidecar`: a local OTLP/HTTPS collector that goes up → 503 → down → up while one alert a second fires | every alert received exactly once |
-
-The steps also run on their own (`rotation`, `malformed`, `soak <files>`,
-`sidecar`, `report`); `--help` lists their options. The sidecar step needs
-its self-signed certificate trusted once — it prints the two commands.
 
 ---
 
