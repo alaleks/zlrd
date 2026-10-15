@@ -20,7 +20,31 @@ const OpenFile = struct {
     /// The inode `fd` was opened on, to notice when the path is rotated to a
     /// new file. Null in tests that never rotate.
     inode: ?std.Io.File.INode = null,
+    /// The file's first bytes as last seen. A `copytruncate` that the
+    /// writer refills to exactly the old offset between two polls leaves the
+    /// size unchanged; only these bytes show the file is a different one.
+    head: [head_bytes]u8 = undefined,
+    head_len: u8 = 0,
+
+    /// Records up to `head_bytes` from offset 0, never past what has been
+    /// read, so the comparison is always against bytes that were there.
+    fn refreshHead(self: *OpenFile) void {
+        if (self.head_len == head_bytes or self.position == self.head_len) return;
+        const want: usize = @intCast(@min(head_bytes, self.position));
+        const n = readAt(self.fd, 0, self.head[0..want]) catch return;
+        self.head_len = @intCast(n);
+    }
+
+    /// True when the file no longer starts the way it did.
+    fn headChanged(self: *const OpenFile) bool {
+        if (self.head_len == 0) return false;
+        var buf: [head_bytes]u8 = undefined;
+        const n = readAt(self.fd, 0, buf[0..self.head_len]) catch return false;
+        return n < self.head_len or !std.mem.eql(u8, buf[0..n], self.head[0..self.head_len]);
+    }
 };
+
+const head_bytes = 64;
 
 // Read buffer size for the follow loop.
 // 64 KB gives good throughput without excessive stack usage.
@@ -316,6 +340,7 @@ pub fn follow(
             );
             files_buf[files_len - 1].position = final_pos;
         }
+        files_buf[files_len - 1].refreshHead();
     }
 
     if (files_len == 0) return;
@@ -348,9 +373,12 @@ pub fn follow(
                 continue;
             };
 
-            if (f.position > stat.size) {
-                // File was truncated — reset to beginning.
+            if (f.position > stat.size or f.headChanged()) {
+                // Truncated in place: start over, and drop any partial line
+                // carried from the content that is gone.
                 f.position = 0;
+                f.head_len = 0;
+                carry.clearRetainingCapacity();
             } else if (f.position == stat.size) {
                 continue;
             }
@@ -359,6 +387,7 @@ pub fn follow(
                 logTailError("read", f.path, err);
                 continue;
             };
+            f.refreshHead();
             if (bytes_read > 0) any_read = true;
         }
 
@@ -401,6 +430,7 @@ fn followRotation(
     f.fd = fresh;
     f.inode = st.inode;
     f.position = 0;
+    f.head_len = 0;
     return true;
 }
 
@@ -1076,4 +1106,21 @@ test "followRotation: drains the old file, then switches to the new one" {
     try testing.expectEqual(@as(u64, 0), of.position);
     try readToEOF(allocator, &of, args, &filter_state, &carry, &buf);
     try testing.expectEqual(@as(u64, 4), of.position);
+}
+
+test "OpenFile: a copytruncate refilled to the same size is noticed by its head" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "ct.log", .data = "seq=000000001 old\n" });
+    const fd = try tmp.dir.openFile(tail_io, "ct.log", .{});
+    defer fd.close(tail_io);
+
+    var of = OpenFile{ .path = "ct.log", .fd = fd, .position = 18 };
+    of.refreshHead();
+    try testing.expect(!of.headChanged());
+
+    // Same length, different content: the size says nothing happened.
+    try tmp.dir.writeFile(tail_io, .{ .sub_path = "ct.log", .data = "seq=000000002 new\n" });
+    try testing.expectEqual(@as(u64, 18), (try fd.stat(tail_io)).size);
+    try testing.expect(of.headChanged());
 }
