@@ -1,0 +1,35 @@
+# promtool test rules alerts_test.yml
+rule_files: [alerts.yml]
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'zlrd_service_crashes_total{job="zlrd",instance="web-01:9100",service="api"}'
+        values: '0 0 1 1 1 1 1 1 1 1'
+      # The agent restarted at minute 4: its counter drops back to 0.
+      - series: 'zlrd_service_crashes_total{job="zlrd",instance="web-02:9100",service="api"}'
+        values: '5 5 5 5 0 0 0 0 0 0'
+      - series: 'up{job="zlrd",instance="web-03:9100"}'
+        values: '1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ZlrdServiceCrashed
+        exp_alerts:
+          - exp_labels: {severity: warning, job: zlrd, instance: "web-01:9100", service: api}
+            exp_annotations:
+              summary: "api crashed on web-01:9100"
+              description: "The stack trace is in the zlrd alert itself (chat, webhook or alert file), and in `zlrd status` on that host."
+      - eval_time: 6m
+        alertname: ZlrdServiceCrashLoop
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: ZlrdAgentDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: ZlrdAgentDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: zlrd, instance: "web-03:9100"}
+            exp_annotations:
+              summary: "zlrd agent on web-03:9100 is not answering"
+              description: "Prometheus cannot scrape it: the agent stopped, the host is down, or the token in zlrd.token no longer matches --metrics-token."

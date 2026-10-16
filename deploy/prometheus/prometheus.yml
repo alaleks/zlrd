@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager:9093]
+
+scrape_configs:
+  - job_name: zlrd
+    # The same secret the agent got as --metrics-token.
+    authorization:
+      credentials_file: /etc/prometheus/zlrd.token
+    static_configs:
+      # One line per host. A remote agent needs `--listen 0.0.0.0:9100`;
+      # keep the port off the internet, the token is the only lock on it.
+      - targets: [host.docker.internal:9100]

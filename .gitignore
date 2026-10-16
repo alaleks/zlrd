@@ -36,3 +36,6 @@ __pycache__/
 bench/field_test.py
 bench/remote_field_test.sh
 bench/field-results/
+
+# deploy/: the agent token, created per install
+deploy/zlrd.token

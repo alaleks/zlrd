@@ -1,0 +1,52 @@
+# Prometheus + Alertmanager + Grafana with the zlrd dashboard provisioned.
+# The agent runs on the host (brew / apt), not in here — see README.md.
+#
+# Images come from mirror.gcr.io, Google's pull-through cache of Docker Hub:
+# the same images, and it answers where Docker Hub is slow or blocked. Drop
+# the prefix to pull from Docker Hub directly.
+services:
+  prometheus:
+    image: mirror.gcr.io/prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./zlrd.token:/etc/prometheus/zlrd.token:ro
+      - prometheus-data:/prometheus
+    # Docker Desktop / OrbStack resolve this name already; on Linux it is
+    # what makes the host reachable from the container.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:9090:9090
+    restart: unless-stopped
+
+  alertmanager:
+    image: mirror.gcr.io/prom/alertmanager:v0.28.1
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - 127.0.0.1:9093:9093
+    restart: unless-stopped
+
+  grafana:
+    image: mirror.gcr.io/grafana/grafana:12.1.1
+    environment:
+      # Ports are bound to 127.0.0.1, so read-only anonymous access opens
+      # the dashboard without a login. Sign in as admin/admin to edit.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/zlrd.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - 127.0.0.1:3000:3000
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

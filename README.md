@@ -1207,6 +1207,11 @@ off the default `127.0.0.1:9100`. Without either flag no port is opened, and
 `--listen` on its own is refused rather than exposing an unauthenticated
 endpoint.
 
+No Prometheus yet? [`deploy/`](deploy/README.md) starts Prometheus,
+Alertmanager and Grafana with a zlrd dashboard and alert rules in one
+`docker compose up` — about two minutes from `brew install` to a dashboard
+with data.
+
 | Method | Path             | Auth   | Returns                                                  |
 | ------ | ---------------- | ------ | -------------------------------------------------------- |
 | GET    | `/metrics`       | Bearer | Prometheus text exposition (`text/plain; version=0.0.4`) |

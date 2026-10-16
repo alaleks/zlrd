@@ -1,0 +1,66 @@
+# Prometheus alerting rules for zlrd. Prometheus evaluates them and hands
+# firing alerts to Alertmanager. Copy into any Prometheus as-is: they only
+# assume the scrape job is named `zlrd`.
+#
+# The agent's counters restart from zero when the agent restarts;
+# increase() accounts for that, so a restart does not fire anything.
+groups:
+  - name: zlrd
+    rules:
+      - alert: ZlrdAgentDown
+        expr: up{job="zlrd"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "zlrd agent on {{ $labels.instance }} is not answering"
+          description: "Prometheus cannot scrape it: the agent stopped, the host is down, or the token in zlrd.token no longer matches --metrics-token."
+
+      - alert: ZlrdServiceCrashed
+        expr: increase(zlrd_service_crashes_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} crashed on {{ $labels.instance }}"
+          description: "The stack trace is in the zlrd alert itself (chat, webhook or alert file), and in `zlrd status` on that host."
+
+      - alert: ZlrdServiceCrashLoop
+        expr: increase(zlrd_service_crashes_total[15m]) >= 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} on {{ $labels.instance }} is crash-looping"
+          description: "{{ $value | humanize }} crashes in the last 15 minutes."
+
+      - alert: ZlrdKernelOOM
+        expr: increase(zlrd_kernel_events_total{kind="oom"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "The kernel OOM-killed a process on {{ $labels.instance }}"
+          description: "Needs --kernel-probes and read access to /dev/kmsg. The victim's pid and name are in the zlrd alert."
+
+      - alert: ZlrdKernelSegfault
+        expr: increase(zlrd_kernel_events_total{kind="segfault"}[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A process segfaulted on {{ $labels.instance }}"
+
+      - alert: ZlrdKernelPanicPreviousBoot
+        expr: increase(zlrd_kernel_events_total{kind="panic"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} rebooted after a kernel panic"
+          description: "Found in pstore at agent start; the dump name is in the zlrd alert."
+
+      # Tune the threshold to your traffic: 1 error line a second for
+      # 10 minutes is a starting point, not a recommendation.
+      - alert: ZlrdErrorRateHigh
+        expr: sum by (instance) (rate(zlrd_lines_total{level=~"error|fatal|panic"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} logs {{ $value | humanize }} errors a second"

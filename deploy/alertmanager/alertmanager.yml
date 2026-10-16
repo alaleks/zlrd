@@ -1,0 +1,28 @@
+# Routes the alerts from prometheus/alerts.yml. Out of the box they are
+# visible at http://localhost:9093 and go nowhere else; uncomment one
+# receiver below to get them in a chat.
+route:
+  receiver: default
+  group_by: [alertname, instance, service]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: default
+    # telegram_configs:
+    #   - bot_token: "123456789:AA..."
+    #     chat_id: -1001234567890
+    # slack_configs:
+    #   - api_url: https://hooks.slack.com/services/T000/B000/XXXX
+    #     channel: "#alerts"
+    #     send_resolved: true
+
+# A crash loop already says the service crashed; do not page twice.
+inhibit_rules:
+  - source_matchers: [alertname = ZlrdServiceCrashLoop]
+    target_matchers: [alertname = ZlrdServiceCrashed]
+    equal: [instance, service]
+  - source_matchers: [alertname = ZlrdAgentDown]
+    target_matchers: [severity = warning]
+    equal: [instance]
