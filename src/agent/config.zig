@@ -131,6 +131,8 @@ pub const SidecarConfig = struct {
     headers: []HeaderSpec,
     flush_interval_ms: u64,
     batch_size: u32,
+    /// PEM file trusted on top of the system store.
+    ca_file: ?[]const u8 = null,
 
     pub fn enabled(self: SidecarConfig) bool {
         return self.url != null;
@@ -284,6 +286,7 @@ pub const AgentConfig = struct {
                 .headers = sidecar_headers,
                 .flush_interval_ms = sidecar_flush_ms,
                 .batch_size = sidecar_batch_size,
+                .ca_file = args.sidecar_ca,
             },
         };
     }

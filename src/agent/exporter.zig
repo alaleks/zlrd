@@ -68,6 +68,9 @@ pub const Options = struct {
     resource_attrs: []const otlp.Attr = &.{},
     /// Metrics reference — snapshotted on every flush.
     metrics: *const metrics_mod.Metrics,
+    /// PEM bundle trusted on top of the system store (`--sidecar-ca`).
+    ca_file: ?[]const u8 = null,
+    timeout_ms: u64 = transport.default_timeout_ms,
 };
 
 pub const Sidecar = struct {
@@ -137,6 +140,8 @@ pub const Sidecar = struct {
         var tr = try transport.Transport.init(allocator, io, .{
             .base_url = opts.base_url,
             .headers = opts.headers,
+            .ca_file = opts.ca_file,
+            .timeout_ms = opts.timeout_ms,
         });
         errdefer tr.deinit();
 
@@ -181,6 +186,11 @@ pub const Sidecar = struct {
             self.thread = null;
         }
         self.flushOnce();
+        // shortcut: the retry queue lives in memory; a collector still down
+        // at shutdown loses it. A disk spool like the webhook one would not.
+        if (self.active.queue.items.len > 0) {
+            log.warn("sidecar: {d} records not delivered at shutdown", .{self.active.queue.items.len});
+        }
     }
 
     fn joinWithWatchdog(self: *Sidecar, t: std.Thread) void {
@@ -203,6 +213,8 @@ pub const Sidecar = struct {
                     // Re-init a fresh client so subsequent flushOnce calls
                     // from `stop()` (after join returns) don't double-free.
                     s.transport.client = .{ .allocator = s.allocator, .io = s.io };
+                    // The fresh client knows only the system store.
+                    s.transport.installCa() catch {};
                 }
             }
         };
@@ -420,20 +432,31 @@ pub const Sidecar = struct {
     /// size limits (typically 4 MiB); without chunking a max_queue=1024
     /// flush could produce an oversized payload that gets rejected with
     /// 413 — every event in the batch lost.
+    ///
+    /// A chunk that fails transiently (collector down, 5xx, timeout) goes
+    /// back on the queue with everything after it, for the next flush; the
+    /// rest is not tried, so an outage costs one timeout per flush, not one
+    /// per chunk. `max_queue` still bounds memory: past it, `pushClone`
+    /// drops and counts. A non-retryable rejection is dropped — sending the
+    /// same bytes again would be rejected again.
     fn sendLogs(self: *Sidecar, items: []const QueuedLog) void {
         const max_records_per_batch: usize = 256;
         var off: usize = 0;
         while (off < items.len) {
             const end = @min(off + max_records_per_batch, items.len);
-            self.sendLogsChunk(items[off..end]);
+            if (!self.sendLogsChunk(items[off..end])) {
+                for (items[off..]) |q| self.pushClone(q.time_unix_nano, q.severity, q.severity_text, q.body, q.attrs);
+                return;
+            }
             off = end;
         }
     }
 
-    fn sendLogsChunk(self: *Sidecar, items: []const QueuedLog) void {
+    /// False when the chunk should be retried later.
+    fn sendLogsChunk(self: *Sidecar, items: []const QueuedLog) bool {
         const records = self.allocator.alloc(otlp.LogRecord, items.len) catch {
             _ = self.failed_retryable.fetchAdd(1, .monotonic);
-            return;
+            return false;
         };
         defer self.allocator.free(records);
         for (items, 0..) |q, i| {
@@ -448,15 +471,20 @@ pub const Sidecar = struct {
 
         const payload = otlp.encodeLogsRequest(self.allocator, self.resource_attrs, records) catch {
             _ = self.failed_retryable.fetchAdd(1, .monotonic);
-            return;
+            return false;
         };
         defer self.allocator.free(payload);
 
         switch (self.transport.send(.logs, payload)) {
             .success => _ = self.sent.fetchAdd(@intCast(items.len), .monotonic),
-            .retryable_exhausted, .encoding_failed => _ = self.failed_retryable.fetchAdd(1, .monotonic),
+            .retryable_exhausted => {
+                _ = self.failed_retryable.fetchAdd(1, .monotonic);
+                return false;
+            },
+            .encoding_failed => _ = self.failed_retryable.fetchAdd(1, .monotonic),
             .non_retryable => _ = self.failed_non_retryable.fetchAdd(1, .monotonic),
         }
+        return true;
     }
 
     fn sendMetrics(self: *Sidecar) void {
@@ -756,6 +784,31 @@ test "pushClone: borrows static attribute keys, clones transient values" {
     try testing.expectEqualStrings("first", rec.attrs[0].value.string);
     // Same for the body.
     try testing.expectEqualStrings("body", rec.body);
+}
+
+test "flushOnce: records the collector never got are queued again, within the cap" {
+    const allocator = testing.allocator;
+    var m = metrics_mod.Metrics.init(0);
+    // Port 1: connection refused, the outage case.
+    var s = try Sidecar.init(allocator, testing.io, .{
+        .base_url = "https://127.0.0.1:1",
+        .headers = &.{},
+        .max_queue = 4,
+        .metrics = &m,
+    });
+    defer s.deinit();
+
+    for (0..3) |_| s.pushClone(1, .@"error", "ERROR", "boom", &.{.{ .key = "k", .value = .{ .string = "v" } }});
+    s.flushOnce();
+    try testing.expectEqual(@as(u64, 0), s.sent.load(.monotonic));
+    try testing.expectEqual(@as(usize, 3), s.active.queue.items.len);
+    // Cloned into the new arena: the old one is gone after the flush.
+    try testing.expectEqualStrings("boom", s.active.queue.items[0].body);
+    try testing.expectEqualStrings("v", s.active.queue.items[0].attrs[0].value.string);
+
+    for (0..3) |_| s.pushClone(2, .info, "INFO", "new", &.{});
+    try testing.expectEqual(@as(usize, 4), s.active.queue.items.len);
+    try testing.expectEqual(@as(u64, 2), s.dropped_queue_full.load(.monotonic));
 }
 
 test "pushClone: honours the queue cap and counts the drops" {

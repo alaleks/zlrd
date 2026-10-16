@@ -439,6 +439,7 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.MissingSidecarHeader => "missing value for --sidecar-header",
         error.MissingSidecarFlushInterval => "missing value for --sidecar-flush-interval",
         error.MissingSidecarBatchSize => "missing value for --sidecar-batch-size",
+        error.MissingSidecarCa => "missing value for --sidecar-ca",
         else => @errorName(err),
     };
 }
@@ -460,6 +461,7 @@ fn agentErrorMessage(err: anyerror) []const u8 {
         error.InvalidUrl => "invalid URL",
         error.InvalidHostId => "invalid --host-id (1 to 253 bytes)",
         error.TlsRequired => "sidecar requires an https:// URL",
+        error.CaFileUnreadable => "cannot load --sidecar-ca (expected a PEM file)",
         else => runtimeErrorMessage(err),
     };
 }

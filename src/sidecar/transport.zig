@@ -45,7 +45,13 @@ pub const Error = error{
     InvalidUrl,
     TlsRequired,
     UrlTooLong,
+    CaFileUnreadable,
 } || std.mem.Allocator.Error;
+
+/// Bound on one POST attempt, connect through response headers.
+/// `std.http.Client` has no timeout of its own: a collector that accepts the
+/// connection and then stalls would hold the flush thread forever.
+pub const default_timeout_ms: u64 = 10_000;
 
 /// Hard upper bound for the rendered endpoint URL. Generous for any real
 /// collector hostname + signal path.
@@ -86,6 +92,10 @@ pub const Transport = struct {
     /// zero-capacity `Allocating` panics on the first compress in any
     /// safety-checked build.
     gzip_out: std.Io.Writer.Allocating,
+    /// Owned copy of `Options.ca_file`; kept so `installCa` can run again
+    /// on a client the shutdown watchdog had to replace.
+    ca_file: ?[]u8,
+    timeout_ms: u64,
 
     pub const Options = struct {
         /// Base URL like `https://collector.example.com:4318`. The `/v1/*`
@@ -96,6 +106,10 @@ pub const Transport = struct {
         headers: []const std.http.Header,
         max_retries: u8 = 3,
         max_payload_bytes: usize = default_max_payload_bytes,
+        /// PEM bundle trusted in addition to the system store: a private CA
+        /// or a self-signed collector.
+        ca_file: ?[]const u8 = null,
+        timeout_ms: u64 = default_timeout_ms,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: Options) Error!Transport {
@@ -122,7 +136,10 @@ pub const Transport = struct {
         var gzip_out: std.Io.Writer.Allocating = try .initCapacity(allocator, gzip_out_initial_capacity);
         errdefer gzip_out.deinit();
 
-        return .{
+        const ca_copy: ?[]u8 = if (opts.ca_file) |p| try allocator.dupe(u8, p) else null;
+        errdefer if (ca_copy) |p| allocator.free(p);
+
+        var t: Transport = .{
             .allocator = allocator,
             .io = io,
             .client = .{ .allocator = allocator, .io = io },
@@ -132,7 +149,12 @@ pub const Transport = struct {
             .max_payload_bytes = opts.max_payload_bytes,
             .gzip_window = window,
             .gzip_out = gzip_out,
+            .ca_file = ca_copy,
+            .timeout_ms = opts.timeout_ms,
         };
+        errdefer t.client.deinit();
+        try t.installCa();
+        return t;
     }
 
     pub fn deinit(self: *Transport) void {
@@ -141,7 +163,30 @@ pub const Transport = struct {
         self.allocator.free(self.extra_headers);
         self.allocator.free(self.gzip_window);
         self.gzip_out.deinit();
+        if (self.ca_file) |p| self.allocator.free(p);
         self.* = undefined;
+    }
+
+    /// Loads the system store plus `ca_file` into the client. Setting
+    /// `client.now` is what stops `std.http.Client` from rescanning the
+    /// system store on its own and dropping the extra CA. A no-op without
+    /// `ca_file`: the client then scans the system store lazily as before.
+    pub fn installCa(self: *Transport) Error!void {
+        const path = self.ca_file orelse return;
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        errdefer bundle.deinit(self.allocator);
+        const now = std.Io.Clock.real.now(self.io);
+        bundle.rescan(self.allocator, self.io, now) catch |err| {
+            log.warn("--sidecar-ca: loading the system CA store failed: {t}", .{err});
+            return error.CaFileUnreadable;
+        };
+        bundle.addCertsFromFilePath(self.allocator, self.io, now, std.Io.Dir.cwd(), path) catch |err| {
+            log.warn("--sidecar-ca {s}: {t}", .{ path, err });
+            return error.CaFileUnreadable;
+        };
+        self.client.ca_bundle.deinit(self.allocator);
+        self.client.ca_bundle = bundle;
+        self.client.now = now;
     }
 
     /// Posts `payload` to `<base_url><signal.path()>` with retries on
@@ -176,15 +221,7 @@ pub const Transport = struct {
                 std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
             }
 
-            const result = self.client.fetch(.{
-                .location = .{ .url = url },
-                .method = .POST,
-                .payload = compressed,
-                .headers = .{
-                    .content_type = .{ .override = "application/x-protobuf" },
-                },
-                .extra_headers = self.extra_headers,
-            }) catch |err| {
+            const result = self.post(url, compressed) catch |err| {
                 if (attempt == self.max_retries) {
                     log.warn("sidecar POST {s} failed after {d} retries: {t}", .{ url, attempt, err });
                     return .retryable_exhausted;
@@ -204,6 +241,41 @@ pub const Transport = struct {
             }
         }
         return .retryable_exhausted;
+    }
+
+    const Attempt = union(enum) {
+        done: std.http.Client.FetchError!std.http.Client.FetchResult,
+        timeout: std.Io.Cancelable!void,
+    };
+
+    /// One POST, raced against `timeout_ms`. The loser is canceled and
+    /// waited for, so the client is never used by two threads at once.
+    fn post(self: *Transport, url: []const u8, body: []const u8) !std.http.Client.FetchResult {
+        var buf: [2]Attempt = undefined;
+        var sel: std.Io.Select(Attempt) = .init(self.io, &buf);
+        defer sel.cancelDiscard();
+        sel.concurrent(.done, fetchOnce, .{ self, url, body }) catch return self.fetchOnce(url, body);
+        // shortcut: no spare unit of concurrency means no deadline; the
+        // shutdown watchdog is then the only bound.
+        sel.concurrent(.timeout, std.Io.sleep, .{
+            self.io, std.Io.Duration.fromMilliseconds(@intCast(self.timeout_ms)), .awake,
+        }) catch {};
+        return switch (try sel.await()) {
+            .done => |r| r,
+            .timeout => error.Timeout,
+        };
+    }
+
+    fn fetchOnce(self: *Transport, url: []const u8, body: []const u8) std.http.Client.FetchError!std.http.Client.FetchResult {
+        return self.client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .headers = .{
+                .content_type = .{ .override = "application/x-protobuf" },
+            },
+            .extra_headers = self.extra_headers,
+        });
     }
 
     /// Compresses `src` into the retained output buffer. The returned slice
@@ -245,6 +317,38 @@ fn backoffMs(attempt: u8) u64 {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "send: a collector that accepts and never answers is cut off by the timeout" {
+    const io = testing.io;
+    // Never accept()ed: the kernel completes the handshake, the TLS
+    // ClientHello goes out, and no reply ever comes — a wedged collector.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}", .{server.socket.address.getPort()});
+
+    var t = try Transport.init(testing.allocator, io, .{
+        .base_url = url,
+        .headers = &.{},
+        .max_retries = 0,
+        .timeout_ms = 1_000,
+    });
+    defer t.deinit();
+
+    const start = std.Io.Clock.awake.now(io);
+    try testing.expectEqual(SendResult.retryable_exhausted, t.send(.logs, "x"));
+    const ms = start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(ms >= 1_000 and ms < 10_000);
+}
+
+test "Transport.init: an unreadable --sidecar-ca fails init" {
+    try testing.expectError(error.CaFileUnreadable, Transport.init(testing.allocator, testing.io, .{
+        .base_url = "https://collector:4318",
+        .headers = &.{},
+        .ca_file = "/nonexistent/ca.pem",
+    }));
+}
 
 test "Signal: paths" {
     try testing.expectEqualStrings("/v1/logs", Signal.logs.path());

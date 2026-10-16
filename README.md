@@ -124,6 +124,7 @@ the whole point is that you probably don't have a Prometheus.
   - [systemd journal sources](#systemd-journal-sources)
   - [Kernel-level probes](#kernel-level-probes)
   - [Webhook integration](#webhook-integration)
+  - [Sidecar: OTLP export](#sidecar-otlp-export)
   - [Optional: Prometheus endpoint](#optional-prometheus-endpoint)
   - [Production deployment](#production-deployment)
 - [CLI reference](#cli-reference)
@@ -1150,6 +1151,54 @@ Passing one of their URLs to `--alert-webhook` anyway is caught at startup
 with a line naming the flag you probably wanted, because the alternative is a
 `400` visible only in the agent's own log.
 
+### Sidecar: OTLP export
+
+`--sidecar <url>` streams everything the agent alerts on — rule hits,
+service crashes and restarts, kernel events — to an OpenTelemetry collector
+as **OTLP log records**, and the agent's own counters as **OTLP metrics**.
+The transport is **OTLP/HTTP**: protobuf, gzip, HTTPS only, posted to
+`<url>/v1/logs` and `<url>/v1/metrics`. Not gRPC — point it at the
+collector's HTTP port (`4318`), not `4317`.
+
+```bash
+zlrd --agent --alert-first-seen \
+  --sidecar https://otel.internal:4318 \
+  --sidecar-header 'Authorization: Bearer <token>' \
+  /var/log/app.log
+```
+
+| Flag                       | Default | What it does |
+| -------------------------- | ------- | ------------ |
+| `--sidecar <url>`          | off     | Collector base URL; must be `https://` |
+| `--sidecar-header 'K: V'`  |         | Extra header on every request (auth, tenant); repeatable |
+| `--sidecar-flush-interval` | `5s`    | How often the queue is sent |
+| `--sidecar-batch-size <N>` | `1024`  | Records held between flushes, including ones waiting for a retry |
+| `--sidecar-ca <file>`      |         | PEM CA trusted in addition to the system store — a private CA or a self-signed collector |
+
+Every record carries the resource attributes `service.name=zlrd` and
+`host.name` (the [`--host-id`](#alert-sinks)). Rule hits add `alert.kind`,
+`alert.rule_id`, `log.file.path`, `log.line`; service events add
+`service.name`, `process.pid`, `exception.stacktrace`,
+`service.crash_count`; kernel events add `kernel.source`, `process.pid`,
+`process.executable.name`.
+
+**Delivery.** Each request has a 10 s deadline and is retried three times
+(100, 200, 400 ms apart) on a connection error, a timeout, `408`, `429` or
+`5xx`. A batch that still fails goes **back on the queue** for the next
+flush, so an outage of the collector delays records instead of losing them.
+The queue is bounded by `--sidecar-batch-size`: records past it are dropped
+and counted in `zlrd_sidecar_dropped_total`. Any other `4xx` is a
+configuration error and the batch is dropped (`zlrd_sidecar_failed_total`,
+`category="non_retryable"`). The queue lives in memory — records still
+undelivered when the agent stops are lost, and the agent logs how many. A
+request that times out after the collector did process it is sent again, so
+delivery is at-least-once.
+
+Checked against a real collector on Linux 6.8 and macOS: one alert a second
+for six minutes while the collector went up → `503` → down → up → accepting
+but never answering → up, 50 s per phase. All 340 records arrived, none
+twice.
+
 ### Optional: Prometheus endpoint
 
 Everything above works with no HTTP server at all. If you already run a
@@ -1367,6 +1416,16 @@ background, so they read either way.
 | `    --crash-marker`          | `<regex>`      | Additional crash pattern (extends the built-in set) — repeatable             |
 | `    --journal-unit`          | `<NAME=PATTERN>` | Track a systemd unit (glob supported) via `journalctl` — Linux, repeatable |
 | `    --kernel-probes`         |                | Enable OOM / segfault / prior-boot panic detection (Linux)                   |
+
+### Sidecar options
+
+| Flag                          | Value          | Description                                                                  |
+| ----------------------------- | -------------- | ---------------------------------------------------------------------------- |
+| `    --sidecar`               | `<url>`        | OTLP/HTTP collector base URL, `https://` only — see [Sidecar](#sidecar-otlp-export) |
+| `    --sidecar-header`        | `<K: V>`       | Extra header on every OTLP request — repeatable                              |
+| `    --sidecar-flush-interval`| `<dur>`        | Flush cadence (default `5s`)                                                 |
+| `    --sidecar-batch-size`    | `<N>`          | Max records queued, retries included (default `1024`)                        |
+| `    --sidecar-ca`            | `<file>`       | PEM CA trusted on top of the system store                                    |
 
 Build-time options:
 

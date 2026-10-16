@@ -195,6 +195,7 @@ pub const Args = struct {
     sidecar_headers: []const []const u8 = &.{},
     sidecar_flush_interval: ?[]const u8 = null,
     sidecar_batch_size: ?[]const u8 = null,
+    sidecar_ca: ?[]const u8 = null,
 
     /// Frees all owned slices and invalidates `self` via `undefined`. Taking
     /// `*Args` (rather than `Args`) means a debug build will trip
@@ -239,6 +240,7 @@ pub const Args = struct {
         if (self.sidecar_url) |s| allocator.free(s);
         if (self.sidecar_flush_interval) |s| allocator.free(s);
         if (self.sidecar_batch_size) |s| allocator.free(s);
+        if (self.sidecar_ca) |s| allocator.free(s);
         for (self.sidecar_headers) |s| allocator.free(s);
         allocator.free(self.sidecar_headers);
 
@@ -293,6 +295,7 @@ pub const ParseError = error{
     MissingSidecarHeader,
     MissingSidecarFlushInterval,
     MissingSidecarBatchSize,
+    MissingSidecarCa,
     UnknownArgument,
     OutOfMemory,
 };
@@ -628,6 +631,8 @@ pub fn printHelp(colored: bool) void {
         " " ++ ar ++ "<dur>" ++ r ++ "    Flush cadence  " ++ ar ++ "(default 5s)" ++ r ++ "\n" ++
         "      " ++ lo ++ "--sidecar-batch-size" ++ r ++
         "     " ++ ar ++ "<N>  " ++ r ++ "    Max queued events between flushes  " ++ ar ++ "(default 1024)" ++ r ++ "\n" ++
+        "      " ++ lo ++ "--sidecar-ca" ++ r ++
+        "       " ++ ar ++ "<file>   " ++ r ++ "  Also trust these PEM CAs  " ++ ar ++ "(private or self-signed collector)" ++ r ++ "\n" ++
         "\n" ++
         b ++ "Examples" ++ r ++ "\n" ++
         "  " ++ gr ++ "zlrd app.log" ++ r ++ "\n" ++
@@ -934,6 +939,7 @@ const ValuedFlag = enum {
     sidecar_header,
     sidecar_flush_interval,
     sidecar_batch_size,
+    sidecar_ca,
 
     fn lookup(name: []const u8) ?ValuedFlag {
         const table = comptime [_]struct { name: []const u8, kind: ValuedFlag }{
@@ -971,6 +977,7 @@ const ValuedFlag = enum {
             .{ .name = "sidecar-header", .kind = .sidecar_header },
             .{ .name = "sidecar-flush-interval", .kind = .sidecar_flush_interval },
             .{ .name = "sidecar-batch-size", .kind = .sidecar_batch_size },
+            .{ .name = "sidecar-ca", .kind = .sidecar_ca },
         };
         for (table) |e| if (std.mem.eql(u8, e.name, name)) return e.kind;
         return null;
@@ -1012,6 +1019,7 @@ const ValuedFlag = enum {
             .sidecar_header => error.MissingSidecarHeader,
             .sidecar_flush_interval => error.MissingSidecarFlushInterval,
             .sidecar_batch_size => error.MissingSidecarBatchSize,
+            .sidecar_ca => error.MissingSidecarCa,
         };
     }
 };
@@ -1139,6 +1147,7 @@ fn applyValuedFlag(
         .color => try parseColorChoice(parsed, val),
         .theme => try parseThemeChoice(parsed, val),
         .sidecar_batch_size => try replaceOwnedString(allocator, &parsed.sidecar_batch_size, val),
+        .sidecar_ca => try replaceOwnedString(allocator, &parsed.sidecar_ca, val),
     }
 }
 
@@ -2323,4 +2332,16 @@ test "host-id and webhook-secret are valued flags" {
     defer parsed.deinit(testing.allocator);
     try testing.expectEqualStrings("h1", parsed.host_id.?);
     try testing.expectEqualStrings("k", parsed.webhook_secret.?);
+}
+
+test "sidecar-ca is a valued flag" {
+    const fake = FakeIter{ .argv = &.{ "zlrd", "--sidecar-ca=/etc/zlrd/ca.pem" } };
+    var it = fake;
+    var parsed = try parseArgsFromIter(testing.allocator, &it);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqualStrings("/etc/zlrd/ca.pem", parsed.sidecar_ca.?);
+
+    const missing = FakeIter{ .argv = &.{ "zlrd", "--sidecar-ca" } };
+    var it2 = missing;
+    try testing.expectError(error.MissingSidecarCa, parseArgsFromIter(testing.allocator, &it2));
 }

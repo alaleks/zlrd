@@ -163,6 +163,7 @@ fn isAgentModeRequested(args: flags.Args) bool {
     if (args.sidecar_headers.len > 0) return true;
     if (args.sidecar_flush_interval != null) return true;
     if (args.sidecar_batch_size != null) return true;
+    if (args.sidecar_ca != null) return true;
     return false;
 }
 

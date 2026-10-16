@@ -125,6 +125,7 @@ pub fn run(
             .headers = sidecar_headers_storage,
             .flush_interval_ms = cfg.sidecar.flush_interval_ms,
             .max_queue = cfg.sidecar.batch_size,
+            .ca_file = cfg.sidecar.ca_file,
             .metrics = &m,
             .resource_attrs = &.{.{ .key = "host.name", .value = .{ .string = cfg.sinks.host_id } }},
         });
