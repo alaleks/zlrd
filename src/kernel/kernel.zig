@@ -122,6 +122,11 @@ pub const Monitor = struct {
     /// platform has no eventfd or creation failed; backends then fall back to
     /// a timed poll.
     stop_fd: i32,
+    /// kmsg and eBPF both report the same OOM kill; the last few
+    /// (kind, pid) pairs let the second report be dropped.
+    recent: [8]struct { kind: KernelEvent.Kind, pid: u32 } = @splat(.{ .kind = .oom, .pid = 0 }),
+    recent_next: usize = 0,
+    recent_mutex: std.Io.Mutex = .init,
 
     pub fn init(io: std.Io, sink: Sink, ctx: ?*anyopaque) Monitor {
         return .{
@@ -162,6 +167,27 @@ pub const Monitor = struct {
                 _ = std.os.linux.write(self.stop_fd, std.mem.asBytes(&one), @sizeOf(u64));
             }
         }
+    }
+
+    /// The sink the background backends report through: forwards an event
+    /// unless another backend already reported the same kill. pid 0 (no pid
+    /// known) is never treated as a repeat.
+    fn dedupSink(ctx: ?*anyopaque, event: KernelEvent) void {
+        const self: *Monitor = @ptrCast(@alignCast(ctx.?));
+        if (self.seenRecently(event)) return;
+        self.sink(self.ctx, event);
+    }
+
+    fn seenRecently(self: *Monitor, event: KernelEvent) bool {
+        if (event.pid == 0) return false;
+        self.recent_mutex.lockUncancelable(self.io);
+        defer self.recent_mutex.unlock(self.io);
+        for (self.recent) |r| {
+            if (r.pid == event.pid and r.kind == event.kind) return true;
+        }
+        self.recent[self.recent_next] = .{ .kind = event.kind, .pid = event.pid };
+        self.recent_next = (self.recent_next + 1) % self.recent.len;
+        return false;
     }
 
     pub fn join(self: *Monitor) void {
@@ -213,7 +239,7 @@ fn linuxStart(self: *Monitor) !void {
 fn kmsgThread(self: *Monitor, stop: *std.atomic.Value(bool)) void {
     if (comptime !is_supported) return;
     const kmsg = @import("kmsg.zig");
-    kmsg.run(self.io, self.sink, self.ctx, stop, self.stop_fd) catch |err| {
+    kmsg.run(self.io, Monitor.dedupSink, self, stop, self.stop_fd) catch |err| {
         log.warn("kmsg backend exited: {t}", .{err});
     };
 }
@@ -221,7 +247,7 @@ fn kmsgThread(self: *Monitor, stop: *std.atomic.Value(bool)) void {
 fn ebpfThread(self: *Monitor, stop: *std.atomic.Value(bool)) void {
     if (comptime !with_ebpf) return;
     const ebpf = @import("ebpf.zig");
-    ebpf.run(self.io, self.sink, self.ctx, stop, self.stop_fd) catch |err| {
+    ebpf.run(self.io, Monitor.dedupSink, self, stop, self.stop_fd) catch |err| {
         log.warn("ebpf backend exited: {t}", .{err});
     };
 }
@@ -274,6 +300,26 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 }
 
 const testing = std.testing;
+
+test "Monitor: an OOM kill reported by kmsg and eBPF alerts once" {
+    const Cap = struct {
+        var n: usize = 0;
+        fn cb(_: ?*anyopaque, _: KernelEvent) void {
+            n += 1;
+        }
+    };
+    var m = Monitor.init(testing.io, Cap.cb, null);
+    Monitor.dedupSink(&m, makeEvent(.oom, .kmsg, 954437, "python3", "Killed process 954437"));
+    Monitor.dedupSink(&m, makeEvent(.oom, .ebpf, 954437, "", ""));
+    try testing.expectEqual(@as(usize, 1), Cap.n);
+    Monitor.dedupSink(&m, makeEvent(.segfault, .kmsg, 954437, "python3", ""));
+    Monitor.dedupSink(&m, makeEvent(.oom, .ebpf, 954438, "", ""));
+    try testing.expectEqual(@as(usize, 3), Cap.n);
+    // No pid to match on: never a repeat.
+    Monitor.dedupSink(&m, makeEvent(.segfault, .kmsg, 0, "", "general protection"));
+    Monitor.dedupSink(&m, makeEvent(.segfault, .kmsg, 0, "", "general protection"));
+    try testing.expectEqual(@as(usize, 5), Cap.n);
+}
 
 test "makeEvent: truncates comm and detail to fixed buffers" {
     const long_message: [200]u8 = @splat('x');

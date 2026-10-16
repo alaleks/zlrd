@@ -75,7 +75,12 @@ pub const Dispatcher = struct {
             // which needs FILE_READ_ATTRIBUTES and fails with AccessDenied.
             // POSIX does not care, so the alert file sink was dead on Windows
             // for every release until CI started running the tests there.
-            file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
+            // The caller only prints the error name; without the path a
+            // unit with an unwritable log dir just says "permission denied".
+            file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true }) catch |err| {
+                std.log.scoped(.zlrd_alert).err("--alert-file {s}: {t}", .{ path, err });
+                return err;
+            };
             offset = try file.?.length(io);
         }
         return .{

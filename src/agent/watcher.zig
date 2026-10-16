@@ -134,7 +134,10 @@ pub const Watcher = struct {
                 try readHead(io, &files[i], fd);
             } else |err| switch (err) {
                 error.FileNotFound => log.info("{s} does not exist yet; waiting for it", .{path}),
-                else => return err,
+                else => {
+                    log.err("{s}: {t}", .{ path, err });
+                    return err;
+                },
             }
             opened += 1;
         }

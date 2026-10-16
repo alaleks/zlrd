@@ -52,9 +52,15 @@ fn freeStandingLevel(line: []const u8) ?flags.Level {
         from = tok.end;
         const len = tok.end - tok.start;
         if (len < 3 or len > 8) continue;
-        if (tok.start > 0 and !isSpace(line[tok.start - 1])) continue;
-        if (tok.end < line.len and !isLevelTrailer(line[tok.end])) continue;
-        if (!isAllUpper(line[tok.start..tok.end])) continue;
+        // `2026-10-16 10:00:00 [ERROR] msg`, nginx's `[error]`: brackets are
+        // structure, not prose, so any case is a level.
+        const bracketed = tok.start > 0 and line[tok.start - 1] == '[' and
+            tok.end < line.len and line[tok.end] == ']';
+        if (!bracketed) {
+            if (tok.start > 0 and !isSpace(line[tok.start - 1])) continue;
+            if (tok.end < line.len and !isLevelTrailer(line[tok.end])) continue;
+            if (!isAllUpper(line[tok.start..tok.end])) continue;
+        }
         if (flags.parseLevelInsensitive(line[tok.start..tok.end])) |lvl| return lvl;
     }
     return null;
@@ -166,6 +172,13 @@ test "extractLevel: bracketed" {
     // Same shape the reader package recognizes: bracketed level must lead the line.
     const line = "[ERROR] something broke";
     try testing.expectEqual(flags.Level.Error, extractLevel(line).?);
+}
+
+test "extractLevel: bracketed after a timestamp" {
+    try testing.expectEqual(flags.Level.Error, extractLevel("2026-10-16 10:00:01 [ERROR] db down").?);
+    try testing.expectEqual(flags.Level.Error, extractLevel("2026/10/16 10:00:01 [error] 12#0: upstream").?);
+    try testing.expect(extractLevel("2026-10-16 10:00:01 [main] started") == null);
+    try testing.expect(extractLevel("GET /api/panic:status 200") == null);
 }
 
 test "extractLevel: logfmt" {

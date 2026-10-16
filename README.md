@@ -272,6 +272,29 @@ zlrd earns its time when the question is about *log structure* — levels, time
 windows, repeated messages, crash markers — and it no longer costs you
 throughput to ask.
 
+**The agent over a day and a half**
+
+`zlrd agent` following one log on a 1-vCPU Linux 6.8 x86_64 VM (ReleaseFast,
+musl) for 32.6 hours, at ~6 000 lines/s, with the file rotated every 10
+minutes through all four kinds below. RSS, fds and threads sampled every
+minute.
+
+| | |
+| --- | --- |
+| Lines written / counted by the agent | 704 457 011 / 704 457 011 — none lost or doubled |
+| Rotations followed | 195 |
+| RSS | 1.9 MB at start, 2.72 MB from hour 11.5 to the end — flat for the last 21 h and ~455 M lines |
+| Open fds / threads | 6–7 / 3 the whole run |
+
+Rotation on its own — 105 000 numbered lines through 20 rotations of each
+kind, read by both `zlrd -t` and the agent: `mv` + create, `copytruncate`,
+delete + recreate, `mv` + gzip. Every line arrived exactly once in every mode.
+
+Bad input — 1 MiB lines, 32 MiB of random bytes, broken JSON, mixed formats
+with CRLF and NUL, a file that appears only after start: the reader exits 0
+and peaks at 2.5 MB, and the agent stays up, counts every line and peaks at
+2.1 MB.
+
 ---
 
 ## Installation
@@ -892,7 +915,8 @@ connection refused to 10.0.0.7:5400 in 2200ms
 …hash to the **same signature** and only alert once. A completely new
 message — `permission denied`, say — fires again.
 
-The seen-set lives in process memory; restarting the agent clears it.
+The seen-set is kept in the [state file](#state-that-survives-a-restart),
+so a restart does not announce old errors as new again.
 
 #### `--alert-silence <Ws>` — heartbeat / dead-shipper
 
@@ -1021,8 +1045,10 @@ Three backends layered for accuracy vs. portability:
 | Backend  | What it catches                                       | Requirements                                  |
 | -------- | ----------------------------------------------------- | --------------------------------------------- |
 | `pstore` | **Prior-boot kernel panic** — scans `/sys/fs/pstore/` and the `TAINT_DIE` bit of `/proc/sys/kernel/tainted` at agent startup | Linux, pstore enabled                         |
-| `kmsg`   | **OOM** (always-on), **segfault** (when `kernel.print-fatal-signals=1`) | Linux, read access to `/dev/kmsg` (CAP_SYSLOG or `adm` group) |
-| `ebpf`   | **OOM** via tracepoint `oom:mark_victim`; segfault tracepoint coming next | Linux ≥ 5.8, CAP_BPF + CAP_PERFMON, `zig build -Dwith-ebpf=true` |
+| `kmsg`   | **OOM**, global and cgroup (`MemoryMax=`, containers); **segfault** from the kernel's `segfault at` line, logged by default on x86_64 | Linux, read access to `/dev/kmsg`: CAP_SYSLOG when `kernel.dmesg_restrict=1` (the Ubuntu default), otherwise the `adm` group |
+| `ebpf`   | **OOM** via tracepoint `oom:mark_victim`; segfault tracepoint coming next | Linux ≥ 5.8, CAP_BPF + CAP_PERFMON + CAP_DAC_READ_SEARCH, `zig build -Dwith-ebpf=true` |
+
+kmsg and eBPF both see the same OOM kill; it is reported once.
 
 ```bash
 # Stock build (kmsg + pstore)
@@ -1030,7 +1056,9 @@ zlrd --agent --kernel-probes /var/log/app.log
 
 # With eBPF backend compiled in
 zig build -Doptimize=ReleaseFast -Dwith-ebpf=true
-sudo setcap cap_bpf,cap_perfmon,cap_syslog+ep ./zig-out/bin/zlrd
+# cap_dac_read_search: the tracepoint id lives in /sys/kernel/tracing,
+# which is root-only (0700) — without it eBPF stays off as non-root.
+sudo setcap cap_bpf,cap_perfmon,cap_syslog,cap_dac_read_search+ep ./zig-out/bin/zlrd
 zlrd --agent --kernel-probes /var/log/app.log
 ```
 
@@ -1229,8 +1257,16 @@ Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/log/zlrd
+# Not ReadWritePaths=: that leaves the directory root-owned, and the dynamic
+# user cannot create alerts.jsonl in it. LogsDirectory= hands it over.
+LogsDirectory=zlrd
 DynamicUser=true
+# Logs under /var/log are usually root:adm 0640; the dynamic user reads
+# them only through the group.
+SupplementaryGroups=adm
+# Only with --kernel-probes: /dev/kmsg needs CAP_SYSLOG.
+# AmbientCapabilities=CAP_SYSLOG
+# CapabilityBoundingSet=CAP_SYSLOG
 
 [Install]
 WantedBy=multi-user.target

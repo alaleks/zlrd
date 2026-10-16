@@ -188,13 +188,19 @@ pub const OomInfo = struct {
     comm: []const u8,
 };
 
-/// Matches the canonical OOM-killer line:
+/// Matches the OOM-killer line:
 ///   "Killed process <pid> (<comm>)..."
+/// Since 5.0 the kernel prefixes it with "Out of memory: " (global OOM) or
+/// "Memory cgroup out of memory: " (MemoryMax, containers).
 /// Returns null on no match. The `comm` slice borrows from the input.
 pub fn parseOomKilled(msg: []const u8) ?OomInfo {
+    var line = msg;
+    for ([_][]const u8{ "Out of memory: ", "Memory cgroup out of memory: " }) |p| {
+        if (std.mem.startsWith(u8, line, p)) line = line[p.len..];
+    }
     const prefix = "Killed process ";
-    if (!std.mem.startsWith(u8, msg, prefix)) return null;
-    var rest = msg[prefix.len..];
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    var rest = line[prefix.len..];
     const space = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
     const pid = std.fmt.parseInt(u32, rest[0..space], 10) catch return null;
     rest = rest[space + 1 ..];
@@ -253,6 +259,16 @@ test "parseOomKilled: comm with spaces and brackets" {
     const out = parseOomKilled("Killed process 99 (my proc), UID 0").?;
     try testing.expectEqual(@as(u32, 99), out.pid);
     try testing.expectEqualStrings("my proc", out.comm);
+}
+
+test "parseOomKilled: global and cgroup prefixes of kernels >= 5.0" {
+    const global = parseOomKilled("Out of memory: Killed process 4242 (java) total-vm:9000kB, UID:0").?;
+    try testing.expectEqual(@as(u32, 4242), global.pid);
+    try testing.expectEqualStrings("java", global.comm);
+    // Captured from Linux 6.8 under systemd-run -p MemoryMax=64M.
+    const memcg = parseOomKilled("Memory cgroup out of memory: Killed process 953949 (python3) total-vm:542360kB, anon-rss:65280kB, file-rss:6528kB, shmem-rss:0kB, UID:0 pgtables:204kB oom_score_adj:0").?;
+    try testing.expectEqual(@as(u32, 953949), memcg.pid);
+    try testing.expectEqualStrings("python3", memcg.comm);
 }
 
 test "parseOomKilled: rejects non-matching lines" {
