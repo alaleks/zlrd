@@ -43,7 +43,7 @@ pub const Out = struct {
     /// read loops poll this and stop early instead of formatting the rest of
     /// a file nobody will read.
     broken: bool = false,
-    /// When set, `flush` appends here instead of writing to `file`. The
+    /// When set, writes append here directly instead of buffering for `file`. The
     /// parallel scan gives every worker its own sink, so formatting happens
     /// on all cores while one thread writes the pieces out in order.
     sink: ?*std.ArrayList(u8) = null,
@@ -71,21 +71,21 @@ pub const Out = struct {
     /// (no-colour) theme every palette entry is `""`, so this turns each
     /// styling call into a single predictable branch instead of a memcpy.
     pub fn write(self: *Out, s: []const u8) void {
-        if (s.len == 0) return;
+        if (self.broken or s.len == 0) return;
+        if (self.sink) |dst| {
+            dst.appendSlice(self.allocator, s) catch {
+                self.broken = true;
+            };
+            return;
+        }
         if (s.len > self.buf.len - self.len) {
             self.flush();
             if (s.len > self.buf.len) {
                 // Bigger than the whole buffer: hand it straight to the sink
                 // rather than growing without bound.
-                if (self.sink) |dst| {
-                    dst.appendSlice(self.allocator, s) catch {
-                        self.broken = true;
-                    };
-                } else {
-                    self.file.writeStreamingAll(debug_io, s) catch {
-                        self.broken = true;
-                    };
-                }
+                self.file.writeStreamingAll(debug_io, s) catch {
+                    self.broken = true;
+                };
                 return;
             }
         }
@@ -94,6 +94,11 @@ pub const Out = struct {
     }
 
     pub fn writeByte(self: *Out, c: u8) void {
+        if (self.broken) return;
+        if (self.sink != null) {
+            self.write(&.{c});
+            return;
+        }
         if (self.len == self.buf.len) self.flush();
         self.buf[self.len] = c;
         self.len += 1;
@@ -1198,10 +1203,8 @@ const ChunkWorker = struct {
         th: *const Theme,
         since_cut: ?civil.Cutoff,
     ) !ChunkWorker {
-        var out = try Out.init(allocator, std.Io.File.stdout(), th);
-        errdefer out.deinit();
         var w = ChunkWorker{
-            .out = out,
+            .out = .{ .allocator = allocator, .file = std.Io.File.stdout(), .theme = th, .buf = &.{} },
             .filter_state = undefined,
             .expander = if (wantsJsonExpansion(args, th))
                 try JsonExpander.init(allocator, .{})
@@ -1261,7 +1264,15 @@ fn parallelEligible(args: flags.Args, path: []const u8, size: u64) bool {
 
 fn writeChunkToOut(ctx: *anyopaque, bytes: []const u8) bool {
     const out: *Out = @ptrCast(@alignCast(ctx));
-    out.write(bytes);
+    out.flush();
+    if (out.broken) return false;
+    if (out.sink != null) {
+        out.write(bytes);
+    } else if (bytes.len > 0) {
+        out.file.writeStreamingAll(debug_io, bytes) catch {
+            out.broken = true;
+        };
+    }
     return !out.broken;
 }
 
@@ -4217,4 +4228,51 @@ test "parallel reader releases workers once when pool allocation fails" {
     const file = try tmp.dir.openFile(debug_io, "empty.log", .{});
     defer file.close(debug_io);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkParallelAllocationFailure, .{file});
+}
+
+test "worker output writes directly without a staging allocation" {
+    var empty: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&empty);
+    var worker = try ChunkWorker.init(failing.allocator(), .{ .files = &.{} }, &Theme.plain, null);
+    defer worker.deinit();
+    worker.rebind();
+    try std.testing.expectEqual(@as(usize, 0), worker.out.buf.len);
+    var dst: std.ArrayList(u8) = .empty;
+    defer dst.deinit(std.testing.allocator);
+    try dst.ensureTotalCapacity(std.testing.allocator, 1024);
+    worker.process("hello\nworld\n", &dst);
+    try std.testing.expectEqualStrings("hello\n\nworld\n\n", dst.items);
+    try std.testing.expect(!worker.out.broken);
+    try std.testing.expectEqual(@as(usize, 0), worker.out.len);
+}
+
+test "direct array output preserves byte writes and reports allocation failure" {
+    var empty: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&empty);
+    var dst: std.ArrayList(u8) = .empty;
+    var out = Out{ .allocator = failing.allocator(), .file = std.Io.File.stdout(), .theme = &Theme.plain, .buf = &.{}, .sink = &dst };
+    defer out.deinit();
+    out.writeByte('x');
+    try std.testing.expect(out.broken);
+    out.write("ignored");
+    try std.testing.expectEqual(@as(usize, 0), dst.items.len);
+}
+
+test "direct chunk writes preserve buffered prefix and trailing output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(debug_io, "output", .{ .read = true });
+    defer file.close(debug_io);
+    var out = try Out.init(std.testing.allocator, file, &Theme.plain);
+    defer out.deinit();
+    out.write("prefix\n");
+    try std.testing.expect(writeChunkToOut(&out, "chunk\n"));
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+    out.write("suffix\n");
+    out.flush();
+    var bytes: [64]u8 = undefined;
+    const n = try file.readPositionalAll(debug_io, &bytes, 0);
+    try std.testing.expectEqualStrings("prefix\nchunk\nsuffix\n", bytes[0..n]);
+    out.broken = true;
+    try std.testing.expect(!writeChunkToOut(&out, "ignored"));
 }
