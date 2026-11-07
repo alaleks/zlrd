@@ -589,6 +589,7 @@ pub const FilterState = struct {
     has_regex: bool,
     regex_list: regex.RegexList,
     search_expr: ?[]const u8,
+    literal_search: PreparedSearch = .{},
     output_json: bool,
     /// Whether `analyzeLine` has to extract the date and time.
     needs_timestamps: bool = true,
@@ -638,6 +639,7 @@ pub const FilterState = struct {
             .has_regex = has_rx,
             .regex_list = rx_list,
             .search_expr = args.search,
+            .literal_search = if (has_search and !has_rx) PreparedSearch.init(args.search.?) else .{},
             .output_json = args.output_json,
             // `analyzeLine` only needs the date and time when something
             // downstream will read them. Skipping the two scans on every
@@ -679,7 +681,7 @@ pub const FilterState = struct {
         if (self.has_regex) {
             if (!self.regex_list.allMatch(line)) return null;
         } else if (self.has_search_filter) {
-            if (!matchSearch(line, self.search_expr.?)) return null;
+            if (!self.literal_search.matches(line, self.search_expr.?)) return null;
         }
 
         const info = analyzeLine(line, self.needs_timestamps);
@@ -2300,6 +2302,49 @@ fn clearScreen(out: *Out) void {
     out.flush();
 }
 
+/// Owns lowercase bytes and offsets so moving FilterState never invalidates terms.
+const PreparedSearch = struct {
+    lower: [256]u8 = undefined,
+    terms: [128]struct { start: u16, end: u16 } = undefined,
+    count: usize = 0,
+    all: bool = false,
+    ready: bool = false,
+
+    fn init(expr: []const u8) PreparedSearch {
+        var result: PreparedSearch = .{};
+        // shortcut: expressions over 256 bytes use the original matcher; expand only if profiling warrants it.
+        if (expr.len > result.lower.len) return result;
+        for (expr, 0..) |c, i| result.lower[i] = std.ascii.toLower(c);
+        const separator: ?u8 = if (std.mem.indexOfScalar(u8, expr, '|') != null)
+            '|'
+        else if (std.mem.indexOfScalar(u8, expr, '&') != null)
+            '&'
+        else
+            null;
+        result.all = separator == '&';
+        var start: usize = 0;
+        for (0..expr.len + 1) |end| {
+            if (end != expr.len and (separator == null or expr[end] != separator.?)) continue;
+            if (end > start) {
+                result.terms[result.count] = .{ .start = @intCast(start), .end = @intCast(end) };
+                result.count += 1;
+            }
+            start = end + 1;
+        }
+        result.ready = true;
+        return result;
+    }
+
+    fn matches(self: *const PreparedSearch, line: []const u8, expr: []const u8) bool {
+        if (!self.ready) return matchSearch(line, expr);
+        for (self.terms[0..self.count]) |term| {
+            const found = containsLowercase(line, self.lower[term.start..term.end]);
+            if (found != self.all) return found;
+        }
+        return self.all;
+    }
+};
+
 /// Matches `line` against a search expression.
 /// Supports `|` (OR) and `&` (AND) operators; without either, plain substring match.
 /// Matching is always case-insensitive.
@@ -2351,12 +2396,16 @@ fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
     if (needle.len > lower_buf.len) return containsIgnoreCaseScalar(hay, needle);
 
     for (needle, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
-    const lneedle = lower_buf[0..needle.len];
+    return containsLowercase(hay, lower_buf[0..needle.len]);
+}
+
+fn containsLowercase(hay: []const u8, lneedle: []const u8) bool {
+    if (lneedle.len == 0 or lneedle.len > hay.len) return false;
 
     const first_lo = lneedle[0];
     const first_hi: u8 = if (first_lo >= 'a' and first_lo <= 'z') first_lo - 32 else first_lo;
 
-    const max = hay.len - needle.len;
+    const max = hay.len - lneedle.len;
     var i: usize = 0;
     while (i <= max) {
         const pos = simd.findEither(hay, i, first_lo, first_hi) orelse return false;
@@ -4275,4 +4324,36 @@ test "direct chunk writes preserve buffered prefix and trailing output" {
     try std.testing.expectEqualStrings("prefix\nchunk\nsuffix\n", bytes[0..n]);
     out.broken = true;
     try std.testing.expect(!writeChunkToOut(&out, "ignored"));
+}
+
+test "prepared literal search preserves operators empty terms and case" {
+    for ([_][]const u8{ "", "hello", "HELLO", "hello|missing", "hello&world", "hello||world", "hello&&world", "|", "&", "hello&world|missing", " café ", "  " }) |expr| {
+        const prepared = PreparedSearch.init(expr);
+        for ([_][]const u8{ "", "HELLO world", "hello", "hello&world", "missing", " café ", "  " }) |line| {
+            try std.testing.expectEqual(matchSearch(line, expr), prepared.matches(line, expr));
+        }
+    }
+}
+
+test "prepared literal search handles capacity boundary and long fallback" {
+    var expr: [257]u8 = @splat('A');
+    const long = PreparedSearch.init(&expr);
+    try std.testing.expect(!long.ready);
+    try std.testing.expect(long.matches(&expr, &expr));
+    const boundary = PreparedSearch.init(expr[0..256]);
+    try std.testing.expect(boundary.ready);
+    try std.testing.expect(boundary.matches(&expr, expr[0..256]));
+    for (0..128) |i| expr[i * 2 + 1] = '|';
+    const many = PreparedSearch.init(expr[0..256]);
+    try std.testing.expectEqual(@as(usize, 128), many.count);
+    try std.testing.expect(many.matches("a", expr[0..256]));
+}
+
+test "prepared search survives FilterState moves and ANSI stripping" {
+    var original = FilterState.init(.{ .files = &.{}, .search = "HeLLo&WoRLD" }, null, null);
+    var moved = original;
+    original = undefined;
+    defer moved.deinit();
+    try std.testing.expect(moved.checkLine("hello #033[31mWORLD#033[0m") != null);
+    try std.testing.expect(moved.checkLine("hello only") == null);
 }
