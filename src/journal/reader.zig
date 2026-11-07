@@ -393,8 +393,9 @@ pub const Iterator = struct {
                 continue;
             }
 
+            const entry = try self.readEntry(allocator, item_offset);
             self.array_index += 1;
-            return try self.readEntry(allocator, item_offset);
+            return entry;
         }
     }
 
@@ -548,6 +549,7 @@ pub const Iterator = struct {
     /// will ask for.
     pub fn setFieldFilter(self: *Iterator, keys: []const []const u8) void {
         self.field_filter = keys;
+        if (self.cache) |c| c.reset();
     }
 
     inline fn wantsKey(self: *const Iterator, key: []const u8) bool {
@@ -620,6 +622,8 @@ pub const Iterator = struct {
             break :blk buf;
         };
 
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
         var kept: usize = 0;
         for (0..n_items) |i| {
             const raw_item = items[i * item_sz ..][0..item_sz];
@@ -629,7 +633,8 @@ pub const Iterator = struct {
                 std.mem.readInt(u32, raw_item[0..4], .little)
             else
                 std.mem.readInt(u64, raw_item[0..8], .little);
-            if (try self.readDataField(a, data_offset, compact)) |f| {
+            _ = scratch.reset(.retain_capacity);
+            if (try self.readDataField(a, scratch.allocator(), data_offset, compact)) |f| {
                 fields[kept] = f;
                 kept += 1;
             }
@@ -653,7 +658,7 @@ pub const Iterator = struct {
     /// cache, whose storage is recycled — so it stays valid for the whole
     /// life of the entry.
     /// Returns null when the field is filtered out — see `setFieldFilter`.
-    fn readDataField(self: *Iterator, arena: std.mem.Allocator, offset: u64, compact: bool) Error!?Field {
+    fn readDataField(self: *Iterator, arena: std.mem.Allocator, scratch: std.mem.Allocator, offset: u64, compact: bool) Error!?Field {
         if (self.cache) |c| {
             switch (c.lookup(offset)) {
                 // Already known to be a field the caller does not want: no
@@ -706,11 +711,11 @@ pub const Iterator = struct {
         if (probed.len >= payload_len) {
             raw = probed[0..payload_len];
         } else {
-            const buf = try arena.alloc(u8, @intCast(payload_len));
+            const buf = try (if (compression == 0) arena else scratch).alloc(u8, @intCast(payload_len));
             @memcpy(buf[0..probed.len], probed);
             try self.reader.readAt(offset + payload_start + probed.len, buf[probed.len..]);
             raw = buf;
-            raw_in_arena = true;
+            raw_in_arena = compression == 0;
         }
 
         // Decode without taking ownership yet. `view` may point into the
@@ -722,8 +727,11 @@ pub const Iterator = struct {
         switch (compression) {
             0 => view = raw,
             fmt.obj_compressed_lz4 => {
-                view = lz4.decompressSystemd(arena, raw) catch return error.UnsupportedCompression;
-                view_in_arena = true;
+                view = lz4.decompressSystemd(scratch, raw) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.UnsupportedCompression,
+                };
+                view_in_arena = false;
             },
             else => return error.UnsupportedCompression,
         }
@@ -2610,4 +2618,85 @@ test "a filtered-out field is rejected before it is copied" {
     // Eight entries each carrying a 64 KB field the filter drops: without an
     // early verdict those bytes land in every entry's arena.
     try testing.expect(used[1] * 2 < used[0]);
+}
+
+test "changing field filter invalidates cached hits and skips" {
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+    const a = try b.writeDataShared("MESSAGE=hello", 2);
+    const c = try b.writeDataShared("PRIORITY=6", 2);
+    const e = try b.writeEntry(1, 1, &.{ a, c });
+    const arr = try b.writeEntryArray(&.{ e, e });
+    b.patchHeaderEntryArray(arr);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "filter-change.journal");
+    var r = try Reader.open(debug_io, tmp.dir, "filter-change.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    try it.enableCache(testing.allocator);
+    defer it.disableCache(testing.allocator);
+    it.setFieldFilter(&.{"MESSAGE"});
+    var first = (try it.next(testing.allocator)).?;
+    defer first.deinit();
+    try testing.expectEqualStrings("hello", first.get("MESSAGE").?);
+    it.setFieldFilter(&.{"PRIORITY"});
+    var second = (try it.next(testing.allocator)).?;
+    defer second.deinit();
+    try testing.expectEqualStrings("6", second.get("PRIORITY").?);
+    try testing.expect(second.get("MESSAGE") == null);
+}
+
+fn readCompressedWithAllocationFailures(allocator: std.mem.Allocator, r: *Reader) !void {
+    var it = r.iterator();
+    var entry = (it.next(allocator) catch |err| {
+        try testing.expectEqual(@as(u64, 0), it.array_index);
+        var retry = (try it.next(testing.allocator)).?;
+        defer retry.deinit();
+        try testing.expectEqual(@as(u64, 99), retry.seqnum);
+        return err;
+    }).?;
+    defer entry.deinit();
+    try testing.expectEqualStrings("hello", entry.get("MESSAGE").?);
+}
+
+test "compressed entry propagates OOM and can be retried" {
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(fmt.incompat.compressed_lz4);
+    const d = try b.writeDataLz4("MESSAGE=hello");
+    const e = try b.writeEntry(99, 1, &.{d});
+    const arr = try b.writeEntryArray(&.{e});
+    b.patchHeaderEntryArray(arr);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "oom.journal");
+    var r = try Reader.open(debug_io, tmp.dir, "oom.journal");
+    defer r.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, readCompressedWithAllocationFailures, .{&r});
+}
+
+test "rejected compressed fields do not consume entry arena storage" {
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(fmt.incompat.compressed_lz4);
+    var payload: [64 * 1024]u8 = @splat('x');
+    @memcpy(payload[0..6], "NOISE=");
+    const d = try b.writeDataLz4(&payload);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "scratch.journal");
+    var r = try Reader.open(debug_io, tmp.dir, "scratch.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    it.setFieldFilter(&.{"MESSAGE"});
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var no_storage: [0]u8 = .{};
+    var entry_allocator = std.heap.FixedBufferAllocator.init(&no_storage);
+    for (0..3) |_| {
+        _ = scratch.reset(.retain_capacity);
+        try testing.expect((try it.readDataField(entry_allocator.allocator(), scratch.allocator(), d, false)) == null);
+    }
 }
