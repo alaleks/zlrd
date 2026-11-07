@@ -184,8 +184,13 @@ pub fn run(
     // one inside a worker would have to be reported across a thread boundary
     // for no gain.
     const reserve = opts.chunk_bytes + opts.chunk_bytes / 4;
-    for (slots) |*s| {
-        try s.in.ensureTotalCapacity(allocator, reserve);
+    for (slots, 0..) |*s, worker_index| {
+        var input_capacity: usize = 0;
+        var chunk_index = worker_index;
+        while (chunk_index < chunk_count) : (chunk_index += worker_count) {
+            input_capacity = @max(input_capacity, @as(usize, @intCast(bounds[chunk_index + 1] - bounds[chunk_index])));
+        }
+        try s.in.ensureTotalCapacity(allocator, input_capacity);
         try s.out.ensureTotalCapacity(allocator, reserve);
     }
 
@@ -205,7 +210,7 @@ pub fn run(
 
     while (started < worker_count) : (started += 1) {
         threads[started] = try std.Thread.spawn(.{}, workerMain, .{
-            Worker,            allocator, &shared, &slots[started],
+            Worker,            &shared, &slots[started],
             &workers[started], started,
         });
     }
@@ -261,7 +266,6 @@ const Shared = struct {
 
 fn workerMain(
     comptime Worker: type,
-    allocator: std.mem.Allocator,
     shared: *Shared,
     slot: *Slot,
     worker: *Worker,
@@ -280,7 +284,7 @@ fn workerMain(
         const len: usize = @intCast(end - start);
 
         slot.in.clearRetainingCapacity();
-        slot.in.ensureTotalCapacity(allocator, len) catch return;
+        std.debug.assert(len <= slot.in.capacity);
         slot.in.items.len = len;
 
         var got: usize = 0;
@@ -524,4 +528,23 @@ test "suggestedWorkers declines to spin up a pool for small input" {
     try testing.expectEqual(@as(usize, 1), suggestedWorkers(0, 1 << 20, 8));
     // Capped by the caller's ceiling even on a large file.
     try testing.expect(suggestedWorkers(1 << 30, 1 << 20, 2) <= 2);
+}
+
+fn checkPoolAllocationFailure(allocator: std.mem.Allocator) !void {
+    const Noop = struct {
+        pub fn process(_: *@This(), _: []const u8, _: *std.ArrayList(u8)) void {}
+        fn write(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var storage: [4096]u8 = undefined;
+    @memset(&storage, 97);
+    const data: []const u8 = &storage;
+    var workers = [_]Noop{ .{}, .{} };
+    var context: u8 = 0;
+    try run(Noop, allocator, Source.fromSlice(&data), &.{ 0, 2048, 4096 }, &workers, &context, Noop.write, .{ .chunk_bytes = 8 });
+}
+
+test "pool reserves oversized chunks before starting and cleans up on OOM" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkPoolAllocationFailure, .{});
 }

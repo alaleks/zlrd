@@ -242,13 +242,16 @@ const BatchAggregator = struct {
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.order.ensureUnusedCapacity(self.allocator, 1);
 
-        const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
+        const owned_key = if (key.ptr == sample_line.ptr and key.len == sample_line.len)
+            owned_line
+        else
+            try self.arena.allocator().dupe(u8, key);
 
         self.entries.putAssumeCapacityNoClobber(owned_key, .{
             .count = 1,
             .sample_line = owned_line,
-            .sample_info = info,
+            .sample_info = info.relocated(sample_line, owned_line),
         });
         self.order.appendAssumeCapacity(owned_key);
     }

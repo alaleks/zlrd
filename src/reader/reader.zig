@@ -153,6 +153,20 @@ pub const LineInfo = struct {
     time: ?[]const u8,
     is_json: bool,
     starts_with_bracket: bool,
+
+    /// Rebind borrowed timestamps when the owning line is copied.
+    pub fn relocated(self: LineInfo, old: []const u8, new: []const u8) LineInfo {
+        var result = self;
+        if (self.date) |d| {
+            const offset = @intFromPtr(d.ptr) - @intFromPtr(old.ptr);
+            result.date = new[offset..][0..d.len];
+        }
+        if (self.time) |t| {
+            const offset = @intFromPtr(t.ptr) - @intFromPtr(old.ptr);
+            result.time = new[offset..][0..t.len];
+        }
+        return result;
+    }
 };
 
 /// Analyzes a line and returns a fully populated `LineInfo`.
@@ -806,13 +820,16 @@ pub const Aggregator = struct {
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.order.ensureUnusedCapacity(self.allocator, 1);
 
-        const owned_key = try self.arena.allocator().dupe(u8, key);
         const owned_line = try self.arena.allocator().dupe(u8, sample_line);
+        const owned_key = if (key.ptr == sample_line.ptr and key.len == sample_line.len)
+            owned_line
+        else
+            try self.arena.allocator().dupe(u8, key);
 
         self.entries.putAssumeCapacityNoClobber(owned_key, .{
             .count = 1,
             .sample_line = owned_line,
-            .sample_info = info,
+            .sample_info = info.relocated(sample_line, owned_line),
         });
         self.order.appendAssumeCapacity(owned_key);
     }
@@ -1181,8 +1198,10 @@ const ChunkWorker = struct {
         th: *const Theme,
         since_cut: ?civil.Cutoff,
     ) !ChunkWorker {
+        var out = try Out.init(allocator, std.Io.File.stdout(), th);
+        errdefer out.deinit();
         var w = ChunkWorker{
-            .out = try Out.init(allocator, std.Io.File.stdout(), th),
+            .out = out,
             .filter_state = undefined,
             .expander = if (wantsJsonExpansion(args, th))
                 try JsonExpander.init(allocator, .{})
@@ -1276,12 +1295,11 @@ fn readParallel(
     defer allocator.free(workers);
 
     var built: usize = 0;
-    errdefer for (workers[0..built]) |*w| w.deinit();
+    defer for (workers[0..built]) |*w| w.deinit();
     while (built < worker_count) : (built += 1) {
         workers[built] = try ChunkWorker.init(allocator, args, out.theme, since_cut);
     }
     for (workers) |*w| w.rebind();
-    defer for (workers) |*w| w.deinit();
 
     try parallel.run(ChunkWorker, allocator, source, bounds, workers, out, writeChunkToOut, .{
         .chunk_bytes = chunk_bytes,
@@ -1317,6 +1335,18 @@ pub fn readStreaming(
     out: *Out,
     since_cut: ?civil.Cutoff,
 ) !void {
+    const opened = if (gzip.isGzip(path)) null else try std.Io.Dir.cwd().openFile(debug_io, path, .{});
+    defer if (opened) |file| file.close(debug_io);
+
+    if (opened) |file| {
+        if (parallelEligible(args, path, file.length(debug_io) catch 0)) {
+            const size = file.length(debug_io) catch 0;
+            // A pool that cannot be built is not an error: the serial path is
+            // still right, just slower, and a failed allocation here says the
+            // machine is in no state to run eight of them anyway.
+            if (readParallel(allocator, file, size, args, counter, out, since_cut, parallel_chunk_bytes) catch false) return;
+        }
+    }
     var expander: ?JsonExpander = if (wantsJsonExpansion(args, out.theme))
         try JsonExpander.init(allocator, .{})
     else
@@ -1333,16 +1363,7 @@ pub fn readStreaming(
         return;
     }
 
-    const file = try std.Io.Dir.cwd().openFile(debug_io, path, .{});
-    defer file.close(debug_io);
-
-    if (parallelEligible(args, path, file.length(debug_io) catch 0)) {
-        const size = file.length(debug_io) catch 0;
-        // A pool that cannot be built is not an error: the serial path is
-        // still right, just slower, and a failed allocation here says the
-        // machine is in no state to run eight of them anyway.
-        if (readParallel(allocator, file, size, args, counter, out, since_cut, parallel_chunk_bytes) catch false) return;
-    }
+    const file = opened.?;
 
     if (args.aggregate) {
         var handler = try AggregateHandler.init(allocator, args, counter, &filter_state, out, expander_ptr);
@@ -4155,4 +4176,45 @@ test "the fast path never runs when a JSON block would be expanded" {
     const got = try h.take();
     defer std.testing.allocator.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"id\": 5") != null);
+}
+
+test "aggregation owns timestamps and shares exact key storage" {
+    var line = "2026-11-07T12:34:56Z [INFO] hello".*;
+    var agg = try Aggregator.init(std.testing.allocator);
+    defer agg.deinit();
+    try agg.add(&line, &line, analyzeLine(&line, true));
+    @memset(&line, 'x');
+    const key = agg.order.items[0];
+    const entry = agg.entries.get(key).?;
+    try std.testing.expectEqualStrings("2026-11-07", entry.sample_info.date.?);
+    try std.testing.expectEqualStrings("12:34:56", entry.sample_info.time.?);
+    try std.testing.expect(key.ptr == entry.sample_line.ptr);
+}
+
+fn checkWorkerAllocationFailure(allocator: std.mem.Allocator) !void {
+    const th = Theme.forMode(.truecolor, theme.Glyphs.ascii, .dark);
+    var worker = try ChunkWorker.init(allocator, .{ .files = &.{} }, &th, null);
+    defer worker.deinit();
+}
+
+test "worker initialization cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkWorkerAllocationFailure, .{});
+}
+
+fn checkParallelAllocationFailure(allocator: std.mem.Allocator, file: std.Io.File) !void {
+    var out = try Out.init(std.testing.allocator, std.Io.File.stdout(), &Theme.plain);
+    defer out.deinit();
+    var counter: LevelCounter = .{};
+    _ = try readParallel(allocator, file, 4096, .{ .files = &.{} }, &counter, &out, null, 512);
+}
+
+test "parallel reader releases workers once when pool allocation fails" {
+    if (parallel.suggestedWorkers(4096, 512, parallel_max_workers) < 2) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content: [4096]u8 = @splat('\n');
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "empty.log", .data = &content });
+    const file = try tmp.dir.openFile(debug_io, "empty.log", .{});
+    defer file.close(debug_io);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkParallelAllocationFailure, .{file});
 }
