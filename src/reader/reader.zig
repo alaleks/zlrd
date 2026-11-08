@@ -593,12 +593,9 @@ pub const FilterState = struct {
     output_json: bool,
     /// Whether `analyzeLine` has to extract the date and time.
     needs_timestamps: bool = true,
-    /// Whether the current read chunk contains any byte that could open a
-    /// literal `#033[` escape. Set once per chunk by `beginChunk`; when
-    /// false, `checkLine` skips the per-line strip scan entirely.
-    ///
-    /// Defaults to true so callers that never call `beginChunk` (tail,
-    /// gzip) keep stripping unconditionally.
+    /// Whether the current line may contain a literal `#033[` escape.
+    /// The line scanner supplies this hint; other readers use `beginChunk`
+    /// or leave the conservative default so stripping remains enabled.
     chunk_may_have_ansi: bool = true,
     /// Sink used by `printIfMatch` / `printChecked`. Null for filter-only use.
     out: ?*Out = null,
@@ -1234,11 +1231,11 @@ const ChunkWorker = struct {
     pub fn process(self: *ChunkWorker, chunk: []const u8, dst: *std.ArrayList(u8)) void {
         self.out.sink = dst;
         self.out.len = 0;
-        self.filter_state.beginChunk(chunk);
-
         var start: usize = 0;
         while (start < chunk.len) {
-            const nl = simd.findByte(chunk, start, '\n') orelse chunk.len;
+            const boundary = findLineEnd(chunk, start);
+            self.filter_state.chunk_may_have_ansi = boundary.has_hash;
+            const nl = boundary.end orelse chunk.len;
             const line = chunk[start..nl];
             if (line.len > 0) {
                 if (self.filter_state.checkLine(line)) |ck| {
@@ -1409,6 +1406,14 @@ fn wantsJsonExpansion(args: flags.Args, th: *const Theme) bool {
     return th.colored;
 }
 
+/// Stop tracking hashes after the first one; only the newline still matters.
+fn findLineEnd(bytes: []const u8, start: usize) struct { end: ?usize, has_hash: bool } {
+    const first = simd.findEither(bytes, start, '\n', '#') orelse
+        return .{ .end = null, .has_hash = false };
+    if (bytes[first] == '\n') return .{ .end = first, .has_hash = false };
+    return .{ .end = simd.findByte(bytes, first + 1, '\n'), .has_hash = true };
+}
+
 /// Splits `file` into lines and hands each to `handler.line(bytes)`.
 ///
 /// One buffer holds both the freshly read bytes and the partial line left
@@ -1426,6 +1431,7 @@ fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) 
 
     // Bytes of an unfinished line sitting at the front of `buf`.
     var carry: usize = 0;
+    var carry_has_hash = false;
 
     while (true) {
         const n = file.readStreaming(debug_io, &.{buf[carry..]}) catch |err| switch (err) {
@@ -1435,9 +1441,14 @@ fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) 
         if (n == 0) break;
 
         const filled = buf[0 .. carry + n];
-        if (@hasDecl(@TypeOf(handler.*), "beginChunk")) handler.beginChunk(filled);
         var start: usize = 0;
-        while (simd.findByte(filled, start, '\n')) |nl| {
+        while (true) {
+            const boundary = findLineEnd(filled, start);
+            const nl = boundary.end orelse {
+                carry_has_hash = boundary.has_hash;
+                break;
+            };
+            if (@hasDecl(@TypeOf(handler.*), "prepareLine")) handler.prepareLine(boundary.has_hash);
             try handler.line(filled[start..nl]);
             start = nl + 1;
         }
@@ -1454,7 +1465,10 @@ fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) 
         }
     }
 
-    if (carry > 0) try handler.line(buf[0..carry]);
+    if (carry > 0) {
+        if (@hasDecl(@TypeOf(handler.*), "prepareLine")) handler.prepareLine(carry_has_hash);
+        try handler.line(buf[0..carry]);
+    }
 }
 
 /// Raised by a line handler when the output sink has gone away. Caught by
@@ -1472,8 +1486,8 @@ const PrintHandler = struct {
     batch: usize = 0,
     page: usize = 1,
 
-    fn beginChunk(self: *PrintHandler, chunk: []const u8) void {
-        self.filter_state.beginChunk(chunk);
+    fn prepareLine(self: *PrintHandler, has_hash: bool) void {
+        self.filter_state.chunk_may_have_ansi = has_hash;
     }
 
     fn line(self: *PrintHandler, bytes: []const u8) !void {
@@ -1534,8 +1548,8 @@ const AggregateHandler = struct {
         self.aggregator.deinit();
     }
 
-    fn beginChunk(self: *AggregateHandler, chunk: []const u8) void {
-        self.filter_state.beginChunk(chunk);
+    fn prepareLine(self: *AggregateHandler, has_hash: bool) void {
+        self.filter_state.chunk_may_have_ansi = has_hash;
     }
 
     fn line(self: *AggregateHandler, bytes: []const u8) !void {
@@ -4356,4 +4370,79 @@ test "prepared search survives FilterState moves and ANSI stripping" {
     defer moved.deinit();
     try std.testing.expect(moved.checkLine("hello #033[31mWORLD#033[0m") != null);
     try std.testing.expect(moved.checkLine("hello only") == null);
+}
+
+test "combined line scan reports hashes only before the newline" {
+    for (0..40) |padding| {
+        var bytes: [80]u8 = @splat('x');
+        bytes[padding] = '\n';
+        bytes[padding + 1] = '#';
+        const plain = findLineEnd(&bytes, 0);
+        try std.testing.expectEqual(@as(?usize, padding), plain.end);
+        try std.testing.expect(!plain.has_hash);
+        bytes[padding] = '#';
+        bytes[padding + 2] = '\n';
+        const hashed = findLineEnd(&bytes, 0);
+        try std.testing.expectEqual(@as(?usize, padding + 2), hashed.end);
+        try std.testing.expect(hashed.has_hash);
+    }
+    try std.testing.expect(findLineEnd("plain", 0).end == null);
+    try std.testing.expect(!findLineEnd("plain", 0).has_hash);
+    try std.testing.expect(findLineEnd("#033[31m", 0).has_hash);
+    try std.testing.expect(!findLineEnd("#\n", 2).has_hash);
+}
+
+test "serial combined scan preserves ANSI across read boundaries and EOF" {
+    const Handler = struct {
+        fs: FilterState,
+        count: usize = 0,
+        fn prepareLine(self: *@This(), has_hash: bool) void {
+            self.fs.chunk_may_have_ansi = has_hash;
+        }
+        fn line(self: *@This(), bytes: []const u8) !void {
+            if (bytes.len == 0) return;
+            const checked = self.fs.checkLine(bytes) orelse return error.Missing;
+            if (self.count == 0) {
+                try std.testing.expectEqualStrings("red", checked.line);
+            } else {
+                try std.testing.expectEqualStrings("tail", checked.line);
+            }
+            self.count += 1;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try std.testing.allocator.alloc(u8, 256 * 1024 + 40);
+    defer std.testing.allocator.free(data);
+    @memset(data, '\n');
+    const offset = 256 * 1024 - 2;
+    const ending = "#033[31mred#033[0m\ntail";
+    @memcpy(data[offset..][0..ending.len], ending);
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "ansi", .data = data[0 .. offset + ending.len] });
+    const file = try tmp.dir.openFile(debug_io, "ansi", .{});
+    defer file.close(debug_io);
+    var handler = Handler{ .fs = FilterState.init(.{ .files = &.{} }, null, null) };
+    defer handler.fs.deinit();
+    try scanLines(std.testing.allocator, file, &handler);
+    try std.testing.expectEqual(@as(usize, 2), handler.count);
+}
+
+test "parallel combined scan strips ANSI and preserves adjacent plain lines" {
+    const a = std.testing.allocator;
+    const args: flags.Args = .{ .files = &.{}, .output_json = true };
+    var worker = try ChunkWorker.init(a, args, &Theme.plain, null);
+    defer worker.deinit();
+    worker.rebind();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(a);
+    worker.process("plain\n#033[31mred#033[0m\ntail", &got);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    var out = try Out.init(a, std.Io.File.stdout(), &Theme.plain);
+    defer out.deinit();
+    out.sink = &expected;
+    var fs = FilterState.init(args, &out, null);
+    defer fs.deinit();
+    for ([_][]const u8{ "plain", "#033[31mred#033[0m", "tail" }) |line| fs.printIfMatch(line);
+    try std.testing.expectEqualStrings(expected.items, got.items);
 }
