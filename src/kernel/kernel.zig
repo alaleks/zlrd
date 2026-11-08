@@ -123,8 +123,8 @@ pub const Monitor = struct {
     /// a timed poll.
     stop_fd: i32,
     /// kmsg and eBPF both report the same OOM kill; the last few
-    /// (kind, pid) pairs let the second report be dropped.
-    recent: [8]struct { kind: KernelEvent.Kind, pid: u32 } = @splat(.{ .kind = .oom, .pid = 0 }),
+    /// (kind, pid, source, time) records let the second report be dropped.
+    recent: [8]struct { kind: KernelEvent.Kind = .oom, pid: u32 = 0, source: KernelEvent.Source = .kmsg, at_ms: i64 = 0 } = @splat(.{}),
     recent_next: usize = 0,
     recent_mutex: std.Io.Mutex = .init,
 
@@ -174,18 +174,24 @@ pub const Monitor = struct {
     /// known) is never treated as a repeat.
     fn dedupSink(ctx: ?*anyopaque, event: KernelEvent) void {
         const self: *Monitor = @ptrCast(@alignCast(ctx.?));
-        if (self.seenRecently(event)) return;
+        if (self.seenRecently(event, @intCast(std.Io.Timestamp.now(self.io, .awake).toMilliseconds()))) return;
         self.sink(self.ctx, event);
     }
 
-    fn seenRecently(self: *Monitor, event: KernelEvent) bool {
+    fn seenRecently(self: *Monitor, event: KernelEvent, now_ms: i64) bool {
         if (event.pid == 0) return false;
         self.recent_mutex.lockUncancelable(self.io);
         defer self.recent_mutex.unlock(self.io);
-        for (self.recent) |r| {
-            if (r.pid == event.pid and r.kind == event.kind) return true;
+        // shortcut: PID reuse within two seconds is ambiguous; use event IDs if backends gain them.
+        for (&self.recent) |*r| {
+            if (r.pid == event.pid and r.kind == event.kind and r.source != event.source and
+                now_ms >= r.at_ms and now_ms - r.at_ms <= 2000)
+            {
+                r.pid = 0; // Consume the pair so a reused PID can report again.
+                return true;
+            }
         }
-        self.recent[self.recent_next] = .{ .kind = event.kind, .pid = event.pid };
+        self.recent[self.recent_next] = .{ .kind = event.kind, .pid = event.pid, .source = event.source, .at_ms = now_ms };
         self.recent_next = (self.recent_next + 1) % self.recent.len;
         return false;
     }
@@ -380,4 +386,18 @@ test "writeJsonString: preserves printable ASCII including '!' and '~'" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeJsonString(&w, "hello !~");
     try testing.expectEqualStrings("\"hello !~\"", w.buffered());
+}
+
+test "dedup expires and only consumes a pair from different backends" {
+    const Noop = struct {
+        fn sink(_: ?*anyopaque, _: KernelEvent) void {}
+    };
+    var m = Monitor.init(testing.io, Noop.sink, null);
+    const k = makeEvent(.oom, .kmsg, 42, "", "");
+    const b = makeEvent(.oom, .ebpf, 42, "", "");
+    try testing.expect(!m.seenRecently(k, 0));
+    try testing.expect(!m.seenRecently(b, 3000));
+    try testing.expect(m.seenRecently(k, 3001));
+    try testing.expect(!m.seenRecently(k, 3002));
+    try testing.expect(!m.seenRecently(k, 3003));
 }

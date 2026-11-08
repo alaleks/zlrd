@@ -1,7 +1,7 @@
 //! Post-boot reconciliation: detects a kernel panic that happened on the
 //! previous boot by inspecting `/sys/fs/pstore/` (persistent storage area
-//! kept across reboots by EFI vars / RAM oops region) and the panic bit of
-//! `/proc/sys/kernel/tainted`.
+//! kept across reboots by EFI vars / RAM oops region). Current-boot taint
+//! is included only as diagnostic context, never as prior-panic evidence.
 //!
 //! Runs synchronously once at agent startup; never allocates. Non-Linux
 //! platforms compile to a no-op.
@@ -16,9 +16,8 @@ const log = std.log.scoped(.zlrd_pstore);
 const pstore_dir_path = "/sys/fs/pstore";
 const tainted_path = "/proc/sys/kernel/tainted";
 
-/// Bit 9 of `/proc/sys/kernel/tainted` indicates the kernel has at some point
-/// fired a panic since boot (TAINT_DIE in linux/kernel.h).
-pub const taint_die_bit: u64 = 1 << 9;
+/// TAINT_DIE records an OOPS/BUG during the current boot, not a prior panic.
+pub const taint_die_bit: u64 = 1 << 7;
 
 /// Maximum number of pstore filenames we'll report in the detail field.
 const max_dumps_in_detail = 4;
@@ -51,7 +50,7 @@ pub fn scan(io: std.Io, sink: kernel.Sink, ctx: ?*anyopaque) !void {
     var dump_count: usize = 0;
     countPstoreDumps(&dump_count, &detail_w, has_taint_die);
 
-    if (!has_taint_die and dump_count == 0) return;
+    if (dump_count == 0) return;
 
     sink(ctx, kernel.makeEvent(
         .panic_prev_boot,
@@ -116,12 +115,12 @@ fn countPstoreDumps(out_count: *usize, detail_w: *std.Io.Writer, detail_has_pref
             off += d.reclen;
 
             if (name.len == 0 or name[0] == '.') continue;
-            // Only count pstore dump prefixes — guarantees we don't false-fire
-            // on stale test files left in the directory.
-            if (!std.mem.startsWith(u8, name, "dmesg-") and
-                !std.mem.startsWith(u8, name, "console-") and
-                !std.mem.startsWith(u8, name, "pmsg-") and
-                !std.mem.startsWith(u8, name, "ftrace-")) continue;
+            if (!std.mem.startsWith(u8, name, "dmesg-")) continue;
+            var dump_path: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&dump_path, "{s}/{s}", .{ pstore_dir_path, name }) catch continue;
+            var header: [512]u8 = undefined;
+            const contents = readFileFully(path, &header) catch continue;
+            if (!isPanicDump(name, contents)) continue;
 
             out_count.* += 1;
             if (emitted < max_dumps_in_detail) {
@@ -138,8 +137,7 @@ fn countPstoreDumps(out_count: *usize, detail_w: *std.Io.Writer, detail_has_pref
     }
 }
 
-/// Reads a small file (kernel sysctl) fully into `buf` and returns the slice.
-/// Errors if the file can't be opened or doesn't fit.
+/// Reads up to `buf.len` bytes for a sysctl value or a dump header.
 fn readFileFully(path: []const u8, buf: []u8) ![]const u8 {
     if (comptime builtin.os.tag != .linux) return error.Unsupported;
     const linux = std.os.linux;
@@ -171,7 +169,7 @@ fn readFileFully(path: []const u8, buf: []u8) ![]const u8 {
 const testing = std.testing;
 
 test "taint_die_bit value matches kernel TAINT_DIE" {
-    try testing.expectEqual(@as(u64, 0x200), taint_die_bit);
+    try testing.expectEqual(@as(u64, 0x80), taint_die_bit);
 }
 
 test "scan: no-op on non-Linux compiles cleanly" {
@@ -209,10 +207,10 @@ fn buildDetail(buf: []u8, tainted: ?u64, names: []const []const u8) []const u8 {
 
 test "detail: taint alone, dumps alone, and both joined" {
     var buf: [detail_buf_size]u8 = undefined;
-    try testing.expectEqualStrings("tainted=0x200", buildDetail(&buf, 0x200, &.{}));
+    try testing.expectEqualStrings("tainted=0x80", buildDetail(&buf, 0x80, &.{}));
     // No dangling separator when there is no taint half.
     try testing.expectEqualStrings("dump1,dump2", buildDetail(&buf, null, &.{ "dump1", "dump2" }));
-    try testing.expectEqualStrings("tainted=0x200; dump1,dump2", buildDetail(&buf, 0x200, &.{ "dump1", "dump2" }));
+    try testing.expectEqualStrings("tainted=0x80; dump1,dump2", buildDetail(&buf, 0x80, &.{ "dump1", "dump2" }));
 }
 
 test "detail: the taint value survives a full complement of long dump names" {
@@ -227,11 +225,11 @@ test "detail: the taint value survives a full complement of long dump names" {
         "dmesg-efi-165234567890123003",
         "dmesg-efi-165234567890123004",
     };
-    const out = buildDetail(&buf, 0x200, &long);
+    const out = buildDetail(&buf, 0x80, &long);
     try testing.expect(out.len <= detail_buf_size);
-    try testing.expect(std.mem.startsWith(u8, out, "tainted=0x200"));
+    try testing.expect(std.mem.startsWith(u8, out, "tainted=0x80"));
     // Whatever names did fit are whole, never cut mid-token.
-    var it = std.mem.tokenizeAny(u8, out["tainted=0x200".len..], ";, ");
+    var it = std.mem.tokenizeAny(u8, out["tainted=0x80".len..], ";, ");
     while (it.next()) |name| {
         try testing.expectEqual(@as(usize, 28), name.len);
     }
@@ -241,4 +239,25 @@ test "detail: caps the number of names but keeps counting them" {
     var buf: [detail_buf_size]u8 = undefined;
     const out = buildDetail(&buf, null, &.{ "a", "b", "c", "d", "e", "f" });
     try testing.expectEqualStrings("a,b,c,d", out);
+}
+
+fn isPanicDump(name: []const u8, header: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "dmesg-")) return false;
+    // pstore prefixes dmesg records with the dump reason; ramoops may prepend a timestamp.
+    var lines = std.mem.splitScalar(u8, header, '\n');
+    const first = lines.next() orelse return false;
+    const reason = if (std.mem.startsWith(u8, first, "====")) lines.next() orelse return false else first;
+    return std.mem.startsWith(u8, reason, "Panic#");
+}
+
+test "only panic dmesg records count as prior panic evidence" {
+    try testing.expect(isPanicDump("dmesg-ramoops-0", "Panic#1 Part1\n"));
+    try testing.expect(isPanicDump("dmesg-ramoops-0", "====123.456\nPanic#1 Part1\n"));
+    for ([_][]const u8{ "Oops#1 Part1\n", "Shutdown#1 Part1\n", "normal log\nPanic#1 Part1\n", "" }) |contents| {
+        try testing.expect(!isPanicDump("dmesg-ramoops-0", contents));
+    }
+    for ([_][]const u8{ "pmsg-ramoops-0", "console-ramoops-0", "ftrace-ramoops-0" }) |name| {
+        try testing.expect(!isPanicDump(name, "Panic#1 Part1\n"));
+    }
+    try testing.expectEqual(@as(u64, 0), taint_die_bit & 0x200);
 }

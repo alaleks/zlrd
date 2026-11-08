@@ -46,9 +46,8 @@ pub fn run(
     stop: *std.atomic.Value(bool),
     stop_fd: i32,
 ) !void {
-    _ = io;
     if (comptime !kernel.with_ebpf or builtin.os.tag != .linux) return;
-    return runLinux(sink, ctx, stop, stop_fd);
+    return runLinux(io, sink, ctx, stop, stop_fd);
 }
 
 /// Reasonable upper bound on number of CPUs we attach to. 1024 covers any
@@ -56,7 +55,7 @@ pub fn run(
 /// (4 KiB) so we avoid an allocator dependency for startup.
 const max_cpus: usize = 1024;
 
-fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool), stop_fd: i32) !void {
+fn runLinux(io: std.Io, sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool), stop_fd: i32) !void {
     if (comptime builtin.os.tag != .linux) return;
 
     const linux = std.os.linux;
@@ -87,8 +86,12 @@ fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool), 
     // We open one perf event per online CPU, attach the BPF program to each,
     // and close them all on exit. Without this we'd miss OOM events that fire
     // on every CPU but the first one.
-    const nr_cpus = std.Thread.getCpuCount() catch 1;
-    const cpus = @min(nr_cpus, max_cpus);
+    const cpu_file = try std.Io.Dir.cwd().openFile(io, "/sys/devices/system/cpu/online", .{});
+    defer cpu_file.close(io);
+    var cpu_buf: [8192]u8 = undefined;
+    const cpu_len = try cpu_file.readPositionalAll(io, &cpu_buf, 0);
+    if (cpu_len == cpu_buf.len) return error.CpuListTooLarge;
+    const cpus = try parseOnlineCpus(cpu_buf[0..cpu_len]);
     var perf_fds: [max_cpus]i32 = undefined;
     var attached: usize = 0;
     defer {
@@ -96,7 +99,9 @@ fn runLinux(sink: kernel.Sink, ctx: ?*anyopaque, stop: *std.atomic.Value(bool), 
         while (i < attached) : (i += 1) _ = linux.close(perf_fds[i]);
     }
 
-    for (0..cpus) |cpu| {
+    // Snapshot at startup; restart the monitor after CPU hotplug.
+    for (cpus, 0..) |online, cpu| {
+        if (!online) continue;
         const fd = openTracepoint(tp_id, @intCast(cpu)) catch continue;
         setBpfAndEnable(fd, oom_prog_fd) catch {
             _ = linux.close(fd);
@@ -350,8 +355,8 @@ fn drainBuffer(data: []const u8, ring_size: usize, cpos_in: u64, ppos: u64, sink
     while (cpos < ppos) {
         const off: usize = @intCast(cpos & mask);
         if (off + 8 > data.len) break;
-        const hdr_ptr: *const [8]u8 = @ptrCast(&data[off]);
-        const len_raw: u32 = std.mem.readInt(u32, hdr_ptr[0..4], .little);
+        const len_ptr: *const u32 = @ptrCast(@alignCast(&data[off]));
+        const len_raw = std.mem.littleToNative(u32, @atomicLoad(u32, len_ptr, .acquire));
         if ((len_raw & busy_bit) != 0) break;
 
         const discarded = (len_raw & discard_bit) != 0;
@@ -384,7 +389,7 @@ const test_ring: usize = 128;
 /// A ring the same shape the kernel hands us: the data area mapped twice,
 /// back to back, so a record straddling the end reads contiguously.
 const TestRing = struct {
-    bytes: [test_ring * 2]u8 = undefined,
+    bytes: [test_ring * 2]u8 align(8) = undefined,
 
     fn init() TestRing {
         var r = TestRing{};
@@ -424,7 +429,7 @@ fn writeRingbufRecord(buf: []u8, off: usize, payload: []const u8, discard: bool,
 
 test "drainBuffer: emits committed records and advances cpos correctly" {
     // Doubled ring: 128 logical bytes mapped twice.
-    var data: [256]u8 = undefined;
+    var data: [256]u8 align(8) = undefined;
     @memset(&data, 0);
 
     var pid1_bytes: [4]u8 = undefined;
@@ -453,7 +458,7 @@ test "drainBuffer: emits committed records and advances cpos correctly" {
 
 test "drainBuffer: DISCARDed record is skipped but advances cpos" {
     // Doubled ring: 128 logical bytes mapped twice.
-    var data: [256]u8 = undefined;
+    var data: [256]u8 align(8) = undefined;
     @memset(&data, 0);
 
     var pid_bytes: [4]u8 = undefined;
@@ -482,7 +487,7 @@ test "drainBuffer: DISCARDed record is skipped but advances cpos" {
 
 test "drainBuffer: stops at a BUSY record without advancing past it" {
     // Doubled ring: 128 logical bytes mapped twice.
-    var data: [256]u8 = undefined;
+    var data: [256]u8 align(8) = undefined;
     @memset(&data, 0);
 
     var pid_bytes: [4]u8 = undefined;
@@ -578,4 +583,51 @@ test "drainBuffer: refuses a record longer than the ring" {
     const new_cpos = drainBuffer(&ring.bytes, test_ring, 0, 512, Cap.cb, null);
     try testing.expectEqual(@as(usize, 0), Cap.calls);
     try testing.expectEqual(@as(u64, 0), new_cpos);
+}
+
+fn parseOnlineCpus(text: []const u8) ![max_cpus]bool {
+    var result: [max_cpus]bool = @splat(false);
+    var it = std.mem.splitScalar(u8, std.mem.trim(u8, text, " \n\r\t"), ',');
+    while (it.next()) |part| {
+        var range = std.mem.splitScalar(u8, part, '-');
+        const first = try std.fmt.parseInt(usize, range.next().?, 10);
+        const last = if (range.next()) |end| try std.fmt.parseInt(usize, end, 10) else first;
+        if (range.next() != null or first > last) return error.InvalidCpuRange;
+        if (last >= max_cpus) return error.CpuListTooLarge;
+        @memset(result[first .. last + 1], true);
+    }
+    return result;
+}
+
+test "online CPU IDs preserve sparse ranges independent of affinity" {
+    const cpus = try parseOnlineCpus("8-9,12,31-32\n");
+    for (cpus, 0..) |on, id| try testing.expectEqual(id == 8 or id == 9 or id == 12 or id == 31 or id == 32, on);
+    try testing.expectError(error.CpuListTooLarge, parseOnlineCpus("1024"));
+    try testing.expectError(error.InvalidCpuRange, parseOnlineCpus("9-8"));
+}
+
+test "ringbuf acquire sees payload published by a concurrent commit" {
+    var ring = TestRing.init();
+    var initial: [4]u8 = @splat(0);
+    const end = ring.put(0, &initial, false, true);
+    const Producer = struct {
+        fn run(bytes: *[test_ring * 2]u8) void {
+            std.mem.writeInt(u32, bytes[8..12], 12345, .little);
+            const len: *u32 = @ptrCast(@alignCast(&bytes[0]));
+            @atomicStore(u32, len, std.mem.nativeToLittle(u32, 4), .release);
+        }
+    };
+    const Capture = struct {
+        fn sink(ctx: ?*anyopaque, event: kernel.KernelEvent) void {
+            const pid: *u32 = @ptrCast(@alignCast(ctx.?));
+            pid.* = event.pid;
+        }
+    };
+    const producer = try std.Thread.spawn(.{}, Producer.run, .{&ring.bytes});
+    defer producer.join();
+    var pid: u32 = 0;
+    while (drainBuffer(&ring.bytes, test_ring, 0, end, Capture.sink, &pid) == 0) {
+        std.atomic.spinLoopHint();
+    }
+    try testing.expectEqual(@as(u32, 12345), pid);
 }
