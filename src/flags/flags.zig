@@ -135,6 +135,8 @@ pub const Args = struct {
     /// `--since` window in milliseconds. The cutoff itself is computed by the
     /// reader, which anchors it on the newest timestamp in the input.
     since_ms: ?u64 = null,
+    /// Every nonempty line has a full timestamp, in nondecreasing order.
+    assume_sorted_timestamps: bool = false,
     tail_mode: bool = false,
     help: bool = false,
     version: bool = false,
@@ -537,6 +539,9 @@ pub fn printHelp(colored: bool) void {
         "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
         "      " ++ lo ++ "--to" ++ r ++
         "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
+        "      --assume-sorted-timestamps  Accelerate --since for timestamped, sorted lines\n" ++
+        "                                Requires full timestamps on every nonempty line\n" ++
+        "                                Unchecked: do not use with multiline/unsorted logs\n" ++
         "      " ++ lo ++ "--since" ++ r ++
         "            " ++ ar ++ "<window> " ++ r ++ "  Last 5m / 90s / 2h / 7d of the log\n" ++
         "                                     " ++
@@ -681,6 +686,9 @@ pub fn printHelpLite(colored: bool) void {
         "             " ++ ar ++ "<time>   " ++ r ++ "  Time range start (HH:MM or HH:MM:SS)\n" ++
         "      " ++ lo ++ "--to" ++ r ++
         "               " ++ ar ++ "<time>   " ++ r ++ "  Time range end   (HH:MM or HH:MM:SS)\n" ++
+        "      --assume-sorted-timestamps  Accelerate --since for timestamped, sorted lines\n" ++
+        "                                Requires full timestamps on every nonempty line\n" ++
+        "                                Unchecked: do not use with multiline/unsorted logs\n" ++
         "      " ++ lo ++ "--since" ++ r ++
         "            " ++ ar ++ "<window> " ++ r ++ "  Last 5m / 90s / 2h / 7d of the log\n" ++
         "                                     " ++
@@ -1029,9 +1037,9 @@ const ValuedFlag = enum {
 /// silently dropping the value.
 fn isBoolLongFlag(flag: []const u8) bool {
     const names = [_][]const u8{
-        "tail",         "aggregate",  "agent",         "alert-first-seen",
-        "alert-stderr", "alert-exit", "kernel-probes", "no-expand-json",
-        "no-state",     "status",
+        "tail",                     "aggregate",  "agent",         "alert-first-seen",
+        "alert-stderr",             "alert-exit", "kernel-probes", "no-expand-json",
+        "assume-sorted-timestamps", "no-state",   "status",
     };
     for (names) |n| if (std.mem.eql(u8, flag, n)) return true;
     return false;
@@ -1087,6 +1095,10 @@ fn parseLongFlag(
     }
     if (std.mem.eql(u8, flag, "kernel-probes")) {
         parsed.kernel_probes = true;
+        return;
+    }
+    if (std.mem.eql(u8, flag, "assume-sorted-timestamps")) {
+        parsed.assume_sorted_timestamps = true;
         return;
     }
     if (std.mem.eql(u8, flag, "no-expand-json")) {
@@ -2344,4 +2356,13 @@ test "sidecar-ca is a valued flag" {
     const missing = FakeIter{ .argv = &.{ "zlrd", "--sidecar-ca" } };
     var it2 = missing;
     try testing.expectError(error.MissingSidecarCa, parseArgsFromIter(testing.allocator, &it2));
+}
+
+test "sorted timestamp assumption is opt-in and composes with since" {
+    var it = FakeIter{ .argv = &.{ "zlrd", "--assume-sorted-timestamps", "--since", "5m", "app.log" } };
+    var args = try parseArgsFromIter(std.testing.allocator, &it);
+    defer args.deinit(std.testing.allocator);
+    try std.testing.expect(args.assume_sorted_timestamps);
+    try std.testing.expectEqual(@as(?u64, 300_000), args.since_ms);
+    try std.testing.expect(!(@as(Args, .{ .files = &.{} })).assume_sorted_timestamps);
 }

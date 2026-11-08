@@ -1138,6 +1138,40 @@ pub fn sinceCutoff(files: []const []const u8, window_ms: u64) ?civil.Cutoff {
     return civil.cutoffBefore(&d, &t, window_ms);
 }
 
+/// Opt-in lower-bound search. Ambiguous probes fall back to the full scan.
+fn sortedSinceStart(source: parallel.Source, cut: *const civil.Cutoff) u64 {
+    var low: u64 = 0;
+    var high = source.size;
+    var buf: [64 * 1024]u8 = undefined;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const want: usize = @intCast(@min(source.size - mid, buf.len));
+        const n = source.readAt(mid, buf[0..want]);
+        if (n != want) return 0;
+        const start = if (mid == low) 0 else (simd.findByte(buf[0..n], 0, '\n') orelse return 0) + 1;
+        if (mid + start >= high) {
+            high = mid;
+            continue;
+        }
+        const end = simd.findByte(buf[0..n], start, '\n') orelse blk: {
+            if (mid + n != source.size) return 0;
+            break :blk n;
+        };
+        const line = std.mem.trimEnd(u8, buf[start..end], "\r");
+        if (std.mem.indexOfScalar(u8, line, '#') != null) return 0;
+        const info = analyzeLine(line, true);
+        const date = info.date orelse return 0;
+        const time = info.time orelse return 0;
+        if (time.len < 8 or civil.toSeconds(date, time) == null) return 0;
+        if (civil.atOrAfter(date, time, cut)) {
+            high = mid;
+        } else {
+            low = @min(source.size, mid + end + 1);
+        }
+    }
+    return low;
+}
+
 const AnchorStamp = struct { date: [10]u8, time: [8]u8 };
 
 /// Last line in `chunk` that carries both a date and a time.
@@ -1286,14 +1320,15 @@ fn readParallel(
     out: *Out,
     since_cut: ?civil.Cutoff,
     chunk_bytes: usize,
+    start_offset: u64,
 ) !bool {
-    const worker_count = parallel.suggestedWorkers(size, chunk_bytes, parallel_max_workers);
+    const worker_count = parallel.suggestedWorkers(size - start_offset, chunk_bytes, parallel_max_workers);
     if (worker_count < 2) return false;
 
-    var file_ctx = FileSource{ .file = file };
+    var file_ctx = FileSource{ .file = file, .base = start_offset };
     const source = parallel.Source{
         .ctx = &file_ctx,
-        .size = size,
+        .size = size - start_offset,
         .read_at = FileSource.readAt,
     };
 
@@ -1327,10 +1362,11 @@ fn readParallel(
 /// can read its own range without a shared cursor.
 const FileSource = struct {
     file: std.Io.File,
+    base: u64 = 0,
 
     fn readAt(ctx: *anyopaque, pos: u64, dst: []u8) usize {
         const self: *FileSource = @ptrCast(@alignCast(ctx));
-        return self.file.readPositional(debug_io, &.{dst}, pos) catch 0;
+        return self.file.readPositional(debug_io, &.{dst}, self.base + pos) catch 0;
     }
 };
 
@@ -1348,13 +1384,20 @@ pub fn readStreaming(
     const opened = if (gzip.isGzip(path)) null else try std.Io.Dir.cwd().openFile(debug_io, path, .{});
     defer if (opened) |file| file.close(debug_io);
 
+    var start_offset: u64 = 0;
     if (opened) |file| {
+        if (args.assume_sorted_timestamps and !args.tail_mode) {
+            if (since_cut) |cut| {
+                var ctx = FileSource{ .file = file };
+                start_offset = sortedSinceStart(.{ .ctx = &ctx, .size = file.length(debug_io) catch 0, .read_at = FileSource.readAt }, &cut);
+            }
+        }
         if (parallelEligible(args, path, file.length(debug_io) catch 0)) {
             const size = file.length(debug_io) catch 0;
             // A pool that cannot be built is not an error: the serial path is
             // still right, just slower, and a failed allocation here says the
             // machine is in no state to run eight of them anyway.
-            if (readParallel(allocator, file, size, args, counter, out, since_cut, parallel_chunk_bytes) catch false) return;
+            if (readParallel(allocator, file, size, args, counter, out, since_cut, parallel_chunk_bytes, start_offset) catch false) return;
         }
     }
     var expander: ?JsonExpander = if (wantsJsonExpansion(args, out.theme))
@@ -1378,7 +1421,7 @@ pub fn readStreaming(
     if (args.aggregate) {
         var handler = try AggregateHandler.init(allocator, args, counter, &filter_state, out, expander_ptr);
         defer handler.deinit();
-        try scanLines(allocator, file, &handler);
+        try scanLinesFrom(allocator, file, &handler, start_offset);
         handler.finish();
         return;
     }
@@ -1390,7 +1433,7 @@ pub fn readStreaming(
         .out = out,
         .paginate = args.num_lines > 0,
     };
-    scanLines(allocator, file, &handler) catch |err| switch (err) {
+    scanLinesFrom(allocator, file, &handler, start_offset) catch |err| switch (err) {
         error.OutputClosed => {},
         else => return err,
     };
@@ -1426,6 +1469,11 @@ fn findLineEnd(bytes: []const u8, start: usize) struct { end: ?usize, has_hash: 
 ///
 /// The slice handed to `handler.line` stays valid only until the next read.
 fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) !void {
+    return scanLinesFrom(allocator, file, handler, 0);
+}
+
+fn scanLinesFrom(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype, start_offset: u64) !void {
+    var position = start_offset;
     var buf = try allocator.alloc(u8, getOptimalBufferSize(file));
     defer allocator.free(buf);
 
@@ -1434,11 +1482,12 @@ fn scanLines(allocator: std.mem.Allocator, file: std.Io.File, handler: anytype) 
     var carry_has_hash = false;
 
     while (true) {
-        const n = file.readStreaming(debug_io, &.{buf[carry..]}) catch |err| switch (err) {
+        const n = if (start_offset == 0) file.readStreaming(debug_io, &.{buf[carry..]}) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
-        };
+        } else try file.readPositional(debug_io, &.{buf[carry..]}, position);
         if (n == 0) break;
+        position += n;
 
         const filled = buf[0 .. carry + n];
         var start: usize = 0;
@@ -3826,7 +3875,7 @@ fn bothScanPaths(
     defer par_out.deinit();
     par_out.sink = &par_buf;
     var par_counter = LevelCounter{};
-    const ran = try readParallel(allocator, file, size, args, &par_counter, &par_out, null, chunk_bytes);
+    const ran = try readParallel(allocator, file, size, args, &par_counter, &par_out, null, chunk_bytes, 0);
     try std.testing.expect(ran);
     par_out.flush();
 
@@ -3908,7 +3957,7 @@ test "a chunk size that yields one chunk falls back instead of splitting" {
 
     var args = flags.Args{ .files = &files };
     args.files = &files;
-    try std.testing.expect(!try readParallel(a, file, 9, args, &counter, &out, null, 1 << 20));
+    try std.testing.expect(!try readParallel(a, file, 9, args, &counter, &out, null, 1 << 20, 0));
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
@@ -4279,7 +4328,7 @@ fn checkParallelAllocationFailure(allocator: std.mem.Allocator, file: std.Io.Fil
     var out = try Out.init(std.testing.allocator, std.Io.File.stdout(), &Theme.plain);
     defer out.deinit();
     var counter: LevelCounter = .{};
-    _ = try readParallel(allocator, file, 4096, .{ .files = &.{} }, &counter, &out, null, 512);
+    _ = try readParallel(allocator, file, 4096, .{ .files = &.{} }, &counter, &out, null, 512, 0);
 }
 
 test "parallel reader releases workers once when pool allocation fails" {
@@ -4445,4 +4494,58 @@ test "parallel combined scan strips ANSI and preserves adjacent plain lines" {
     defer fs.deinit();
     for ([_][]const u8{ "plain", "#033[31mred#033[0m", "tail" }) |line| fs.printIfMatch(line);
     try std.testing.expectEqualStrings(expected.items, got.items);
+}
+
+test "sorted since seeks to inclusive boundary and keeps duplicate timestamps" {
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(std.testing.allocator);
+    const old = "2026-11-08T10:00:00Z [INFO] old\n";
+    const recent = "2026-11-08T11:00:00Z [INFO] recent\n";
+    for (0..10000) |_| try data.appendSlice(std.testing.allocator, old);
+    const boundary = data.items.len;
+    for (0..100) |_| try data.appendSlice(std.testing.allocator, recent);
+    const bytes: []const u8 = data.items;
+    const cut: civil.Cutoff = .{ .date = "2026-11-08".*, .time = "11:00:00".* };
+    try std.testing.expectEqual(@as(u64, boundary), sortedSinceStart(parallel.Source.fromSlice(&bytes), &cut));
+    const early: civil.Cutoff = .{ .date = "2026-11-08".*, .time = "09:00:00".* };
+    try std.testing.expectEqual(@as(u64, 0), sortedSinceStart(parallel.Source.fromSlice(&bytes), &early));
+    const missing: []const u8 = "a stack frame\nno timestamp\n";
+    try std.testing.expectEqual(@as(u64, 0), sortedSinceStart(parallel.Source.fromSlice(&missing), &cut));
+}
+
+test "sorted since output matches full scan in serial and parallel modes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(a);
+    for (0..200) |_| try data.appendSlice(a, "2026-11-08T10:00:00Z [INFO] old\n");
+    const offset = data.items.len;
+    for (0..200) |_| try data.appendSlice(a, "2026-11-08T11:00:00Z [INFO] recent\n");
+    try data.appendSlice(a, "2026-11-08T11:00:00Z [INFO] last");
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "sorted", .data = data.items });
+    const cut: civil.Cutoff = .{ .date = "2026-11-08".*, .time = "11:00:00".* };
+    var outputs: [3]std.ArrayList(u8) = @splat(.empty);
+    defer for (&outputs) |*output| output.deinit(a);
+    for (&outputs, 0..) |*output, mode| {
+        const file = try tmp.dir.openFile(debug_io, "sorted", .{});
+        defer file.close(debug_io);
+        var out = try Out.init(a, std.Io.File.stdout(), &Theme.plain);
+        defer out.deinit();
+        out.sink = output;
+        const args: flags.Args = .{ .files = &.{}, .since_ms = 1000, .output_json = true };
+        var counter: LevelCounter = .{};
+        if (mode == 2) {
+            if (!try readParallel(a, file, data.items.len, args, &counter, &out, cut, 512, offset)) continue;
+        } else {
+            var fs = FilterState.init(args, &out, null);
+            defer fs.deinit();
+            fs.since_cut = cut;
+            var handler = PrintHandler{ .args = args, .counter = &counter, .filter_state = &fs, .out = &out, .paginate = false };
+            try scanLinesFrom(a, file, &handler, if (mode == 0) 0 else offset);
+        }
+    }
+    try std.testing.expect(outputs[0].items.len > 0);
+    try std.testing.expectEqualStrings(outputs[0].items, outputs[1].items);
+    if (outputs[2].items.len > 0) try std.testing.expectEqualStrings(outputs[0].items, outputs[2].items);
 }
