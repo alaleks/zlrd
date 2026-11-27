@@ -198,16 +198,17 @@ const Chroma = struct {
     bool_null: u24,
 };
 
-/// Tuned for a dark terminal background: every colour clears 6:1 against
-/// One Dark (#282c34) and 5.7:1 against Nord (#2e3440), the lightest dark
-/// theme in common use. Unusable on white by design — that is what the
+/// Tuned for a dark terminal background: every colour clears 4.5:1 against
+/// Nord (#2e3440), the lightest dark theme in common use, and 5.1:1 against
+/// One Dark (#282c34), with restrained chroma so text stays calm rather than
+/// glaring on dark displays. Unusable on white by design — that is what the
 /// light set below is for.
 const dark_chroma: Chroma = .{
-    .muted = 0xb5b5b5,
-    .key = 0x8fb5ff,
-    .string = 0x00cbba,
-    .number = 0xd99dfc,
-    .bool_null = 0x00d207,
+    .muted = 0x9d9d9d,
+    .key = 0x809dd5,
+    .string = 0x4aaca3,
+    .number = 0xb88cd4,
+    .bool_null = 0x62ae69,
 };
 
 /// Tuned for a white or near-white background: every colour clears 7:1
@@ -233,30 +234,44 @@ const Indices = struct {
     bool_null: u8,
 };
 
-const dark_indices: Indices = .{ .muted = 249, .key = 111, .string = 43, .number = 183, .bool_null = 40 };
+const dark_indices: Indices = .{ .muted = 247, .key = 110, .string = 73, .number = 176, .bool_null = 71 };
 const light_indices: Indices = .{ .muted = 240, .key = 19, .string = 23, .number = 57, .bool_null = 22 };
 
-/// Badge backgrounds carry white text at 5.9:1–7.4:1, so they read on any
-/// terminal theme — they bring their own background, which is exactly why
-/// they are shared between the light and dark palettes untouched.
+/// Off-white badge text avoids harsh pure-white bloom on dark backgrounds
+/// while keeping 6.4:1–8.0:1 contrast against every badge fill.
+const badge_fg: u24 = 0xeceff4;
+const match_badge_bg: u24 = 0x1e5a61;
+const level_badge_bgs = [7]u24{
+    0x4c5259, // Trace
+    0x1e528e, // Debug
+    0x1f5e3b, // Info
+    0x764c14, // Warn
+    0x9b2c2c, // Error
+    0x7b226a, // Fatal
+    0x7b226a, // Panic
+};
+
+/// Badge backgrounds carry soft-white text at 6.4:1–8.0:1, so they read on
+/// any terminal theme — they bring their own background, which is exactly
+/// why they are shared between the light and dark palettes untouched.
 const level_badges = [7][]const u8{
-    badge(0x595f66, 0xffffff), // Trace
-    badge(0x0d5bbd, 0xffffff), // Debug
-    badge(0x11713c, 0xffffff), // Info
-    badge(0x8a5300, 0xffffff), // Warn
-    badge(0xc02626, 0xffffff), // Error
-    badge(0x9c1382, 0xffffff), // Fatal
-    badge(0x9c1382, 0xffffff), // Panic
+    badge(level_badge_bgs[0], badge_fg), // Trace
+    badge(level_badge_bgs[1], badge_fg), // Debug
+    badge(level_badge_bgs[2], badge_fg), // Info
+    badge(level_badge_bgs[3], badge_fg), // Warn
+    badge(level_badge_bgs[4], badge_fg), // Error
+    badge(level_badge_bgs[5], badge_fg), // Fatal
+    badge(level_badge_bgs[6], badge_fg), // Panic
 };
 
 const ansi256_level_badges = [7][]const u8{
-    esc ++ "48;5;59m" ++ esc ++ "38;5;231m",
-    esc ++ "48;5;25m" ++ esc ++ "38;5;231m",
-    esc ++ "48;5;22m" ++ esc ++ "38;5;231m",
-    esc ++ "48;5;94m" ++ esc ++ "38;5;231m",
-    esc ++ "48;5;124m" ++ esc ++ "38;5;231m",
-    esc ++ "48;5;90m" ++ esc ++ "38;5;231m",
-    esc ++ "48;5;90m" ++ esc ++ "38;5;231m",
+    esc ++ "48;5;59m" ++ esc ++ "38;5;255m",
+    esc ++ "48;5;24m" ++ esc ++ "38;5;255m",
+    esc ++ "48;5;22m" ++ esc ++ "38;5;255m",
+    esc ++ "48;5;94m" ++ esc ++ "38;5;255m",
+    esc ++ "48;5;88m" ++ esc ++ "38;5;255m",
+    esc ++ "48;5;89m" ++ esc ++ "38;5;255m",
+    esc ++ "48;5;89m" ++ esc ++ "38;5;255m",
 };
 
 fn idx(comptime i: u8) []const u8 {
@@ -280,7 +295,7 @@ fn truecolorPalette(comptime c: Chroma) Palette {
         .json_number = fg(c.number),
         .json_bool_null = fg(c.bool_null),
         .json_punct = esc ++ "2m",
-        .match_on = badge(0x146b73, 0xffffff),
+        .match_on = badge(match_badge_bg, badge_fg),
         .level = level_badges,
     };
 }
@@ -299,7 +314,7 @@ fn ansi256Palette(comptime c: Indices) Palette {
         .json_number = idx(c.number),
         .json_bool_null = idx(c.bool_null),
         .json_punct = esc ++ "2m",
-        .match_on = esc ++ "48;5;23m" ++ esc ++ "38;5;231m",
+        .match_on = esc ++ "48;5;23m" ++ esc ++ "38;5;255m",
         .level = ansi256_level_badges,
     };
 }
@@ -747,14 +762,14 @@ test "each palette clears 4.5:1 on the backgrounds it is for" {
     }
 }
 
-test "level badges keep white legible on their own background" {
+test "level badges keep foreground legible on their own background" {
     // Badges carry their own background, so unlike the foreground colours
     // above they are free to clear the full 4.5:1 — and must, since the
     // level is the one token a reader scans for.
-    const badge_bgs = [_]u24{ 0x595f66, 0x0d5bbd, 0x11713c, 0x8a5300, 0xc02626, 0x9c1382 };
-    for (badge_bgs) |bg| {
-        try std.testing.expect(contrastRatio(0xffffff, bg) >= 4.5);
+    for (level_badge_bgs) |bg| {
+        try std.testing.expect(contrastRatio(badge_fg, bg) >= 4.5);
     }
+    try std.testing.expect(contrastRatio(badge_fg, match_badge_bg) >= 4.5);
 }
 
 /// Hue angle in degrees, 0–360.
