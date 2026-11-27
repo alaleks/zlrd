@@ -36,15 +36,17 @@ const std = @import("std");
 /// same one the rest of the reader uses.
 const io = std.Options.debug_io;
 
+pub const ReadError = error{IoError};
+
 /// A byte source the scan can read at arbitrary offsets. Backed by a file in
 /// production and by a slice in the tests, so none of the logic below needs a
 /// filesystem to exercise.
 pub const Source = struct {
     ctx: *anyopaque,
     size: u64,
-    read_at: *const fn (ctx: *anyopaque, pos: u64, dst: []u8) usize,
+    read_at: *const fn (ctx: *anyopaque, pos: u64, dst: []u8) ReadError!usize,
 
-    pub fn readAt(self: Source, pos: u64, dst: []u8) usize {
+    pub fn readAt(self: Source, pos: u64, dst: []u8) ReadError!usize {
         if (pos >= self.size) return 0;
         const want: usize = @intCast(@min(@as(u64, dst.len), self.size - pos));
         return self.read_at(self.ctx, pos, dst[0..want]);
@@ -55,7 +57,7 @@ pub const Source = struct {
             .ctx = @ptrCast(@constCast(data)),
             .size = data.len,
             .read_at = struct {
-                fn f(ctx: *anyopaque, pos: u64, dst: []u8) usize {
+                fn f(ctx: *anyopaque, pos: u64, dst: []u8) ReadError!usize {
                     const d: *const []const u8 = @ptrCast(@alignCast(ctx));
                     const from: usize = @intCast(pos);
                     const n = @min(dst.len, d.len - from);
@@ -98,7 +100,7 @@ pub fn computeBoundaries(
     var probe: [probe_bytes]u8 = undefined;
     var split: u64 = chunk_bytes;
     while (split < source.size) : (split += chunk_bytes) {
-        if (lineStartAtOrAfter(source, split, max_line_bytes, &probe)) |b| {
+        if (try lineStartAtOrAfter(source, split, max_line_bytes, &probe)) |b| {
             // Zero-length chunks help nobody, and a boundary that lands on
             // the end of the file is the end of the file.
             if (b > bounds.items[bounds.items.len - 1] and b < source.size) {
@@ -113,11 +115,12 @@ pub fn computeBoundaries(
 
 /// Offset just past the first newline at or after `pos`, or null when there
 /// is none within `limit` bytes.
-fn lineStartAtOrAfter(source: Source, pos: u64, limit: usize, probe: []u8) ?u64 {
+fn lineStartAtOrAfter(source: Source, pos: u64, limit: usize, probe: []u8) ReadError!?u64 {
     var at = pos;
     var scanned: usize = 0;
     while (scanned < limit and at < source.size) {
-        const n = source.readAt(at, probe);
+        const want = @min(probe.len, limit - scanned);
+        const n = try source.readAt(at, probe[0..want]);
         if (n == 0) return null;
         if (std.mem.indexOfScalar(u8, probe[0..n], '\n')) |nl| return at + nl + 1;
         at += n;
@@ -244,7 +247,11 @@ pub fn run(
     shared.mutex.unlock(io);
 
     for (threads[0..started]) |t| t.join();
+    started = 0; // Already joined; do not double-join in errdefer when returning `shared.err`.
+    if (shared.err) |err| return err;
 }
+
+pub const WorkerError = ReadError || error{OutOfMemory};
 
 const Slot = struct {
     in: std.ArrayList(u8) = .empty,
@@ -262,7 +269,25 @@ const Shared = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     stopped: bool = false,
+    err: ?WorkerError = null,
+
+    fn fail(self: *Shared, err: WorkerError) void {
+        self.mutex.lockUncancelable(io);
+        if (self.err == null) self.err = err;
+        self.stopped = true;
+        self.cond.broadcast(io);
+        self.mutex.unlock(io);
+    }
 };
+
+fn invokeWorkerProcess(comptime Worker: type, worker: *Worker, chunk: []const u8, out: *std.ArrayList(u8)) error{OutOfMemory}!void {
+    const Ret = @typeInfo(@TypeOf(Worker.process)).@"fn".return_type.?;
+    if (@typeInfo(Ret) == .error_union) {
+        try worker.process(chunk, out);
+    } else {
+        worker.process(chunk, out);
+    }
+}
 
 fn workerMain(
     comptime Worker: type,
@@ -289,14 +314,20 @@ fn workerMain(
 
         var got: usize = 0;
         while (got < len) {
-            const n = shared.source.readAt(start + got, slot.in.items[got..]);
+            const n = shared.source.readAt(start + got, slot.in.items[got..]) catch |err| {
+                shared.fail(err);
+                return;
+            };
             if (n == 0) break;
             got += n;
         }
         slot.in.items.len = got;
 
         slot.out.clearRetainingCapacity();
-        worker.process(slot.in.items, &slot.out);
+        invokeWorkerProcess(Worker, worker, slot.in.items, &slot.out) catch |err| {
+            shared.fail(err);
+            return;
+        };
 
         shared.mutex.lockUncancelable(io);
         slot.ready = true;
@@ -547,4 +578,45 @@ fn checkPoolAllocationFailure(allocator: std.mem.Allocator) !void {
 
 test "pool reserves oversized chunks before starting and cleans up on OOM" {
     try testing.checkAllAllocationFailures(testing.allocator, checkPoolAllocationFailure, .{});
+}
+
+test "parallel.run propagates worker OutOfMemory and source IoError" {
+    const FailingWorker = struct {
+        fail_on_call: usize = 0,
+        calls: usize = 0,
+        pub fn process(self: *@This(), _: []const u8, _: *std.ArrayList(u8)) error{OutOfMemory}!void {
+            const c = self.calls;
+            self.calls += 1;
+            if (c == self.fail_on_call) return error.OutOfMemory;
+        }
+        fn write(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+
+    const data: []const u8 = "aaaa\nbbbb\ncccc\ndddd\n";
+    var workers = [_]FailingWorker{ .{ .fail_on_call = 99 }, .{ .fail_on_call = 0 } };
+    var ctx: u8 = 0;
+    try testing.expectError(
+        error.OutOfMemory,
+        run(FailingWorker, testing.allocator, Source.fromSlice(&data), &.{ 0, 5, 10, 15, 20 }, &workers, &ctx, FailingWorker.write, .{ .chunk_bytes = 5 }),
+    );
+
+    const IoFailSrc = struct {
+        fn readAt(_: *anyopaque, _: u64, _: []u8) ReadError!usize {
+            return error.IoError;
+        }
+    };
+    const OkWorker = struct {
+        pub fn process(_: *@This(), _: []const u8, _: *std.ArrayList(u8)) void {}
+        fn write(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var ok_workers = [_]OkWorker{ .{}, .{} };
+    const bad_src = Source{ .ctx = &ctx, .size = 20, .read_at = IoFailSrc.readAt };
+    try testing.expectError(
+        error.IoError,
+        run(OkWorker, testing.allocator, bad_src, &.{ 0, 10, 20 }, &ok_workers, &ctx, OkWorker.write, .{ .chunk_bytes = 10 }),
+    );
 }

@@ -44,10 +44,20 @@ pub fn findActiveJournalPath(allocator: std.mem.Allocator, io: std.Io) Discovery
     return findFreshestJournal(allocator, io, .cwd(), &.{ persistent_root, volatile_root }, mid);
 }
 
+const CandidateMeta = struct {
+    online: bool,
+    tail_realtime: u64,
+};
+
+fn isBetterCandidate(cand: CandidateMeta, best: CandidateMeta) bool {
+    if (cand.online != best.online) return cand.online;
+    return cand.tail_realtime > best.tail_realtime;
+}
+
 /// The root-scanning half of `findActiveJournalPath`, split out so it can be
 /// driven against a temporary directory in tests instead of the real
 /// filesystem layout. `roots` are tried in order and act as the tiebreaker
-/// when tail timestamps are equal.
+/// when state and tail timestamps are equal.
 fn findFreshestJournal(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -57,7 +67,7 @@ fn findFreshestJournal(
 ) DiscoveryError![]u8 {
     var best_path: ?[]u8 = null;
     errdefer if (best_path) |p| allocator.free(p);
-    var best_realtime: u64 = 0;
+    var best_meta: CandidateMeta = .{ .online = false, .tail_realtime = 0 };
 
     for (roots) |root| {
         const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{
@@ -66,13 +76,15 @@ fn findFreshestJournal(
         var keep = false;
         defer if (!keep) allocator.free(candidate);
 
-        const rt = journalTailRealtime(io, dir, candidate) catch continue;
-        // Either no contender yet, or this file's tail is strictly newer —
-        // a tie leaves the earlier root (persistent) in place.
-        if (best_path == null or rt > best_realtime) {
+        const meta = journalCandidateMeta(io, dir, candidate) catch continue;
+        // Prefer an ONLINE (`state == 1`) journal over an offline/archived one
+        // so a freshly rotated empty `system.journal` (tail_entry_realtime == 0)
+        // still beats an older inactive root. Within the same state, pick the
+        // strictly newer tail timestamp; ties keep the earlier root.
+        if (best_path == null or isBetterCandidate(meta, best_meta)) {
             if (best_path) |old| allocator.free(old);
             best_path = candidate;
-            best_realtime = rt;
+            best_meta = meta;
             keep = true;
         }
     }
@@ -80,11 +92,10 @@ fn findFreshestJournal(
     return best_path orelse error.JournalDirNotFound;
 }
 
-/// Reads just enough of a journal file's header to extract the writer's
-/// `tail_entry_realtime` (the wall-clock microseconds of the most recent
-/// entry). Cheaper than opening a full `Reader` since we don't validate
-/// the rest of the file.
-fn journalTailRealtime(io: std.Io, dir: std.Io.Dir, path: []const u8) !u64 {
+/// Reads just enough of a journal file's header to extract its online state
+/// (`STATE_ONLINE == 1`) and `tail_entry_realtime`. Cheaper than opening a
+/// full `Reader` since we don't validate the rest of the file.
+fn journalCandidateMeta(io: std.Io, dir: std.Io.Dir, path: []const u8) !CandidateMeta {
     const f = dir.openFile(io, path, .{ .mode = .read_only }) catch return error.OpenFailed;
     defer f.close(io);
 
@@ -94,7 +105,10 @@ fn journalTailRealtime(io: std.Io, dir: std.Io.Dir, path: []const u8) !u64 {
 
     const hdr = std.mem.bytesAsValue(fmt.Header, &hdr_bytes).*;
     if (!std.mem.eql(u8, &hdr.signature, &fmt.signature_magic)) return error.BadMagic;
-    return hdr.tail_entry_realtime;
+    return .{
+        .online = hdr.state == 1,
+        .tail_realtime = hdr.tail_entry_realtime,
+    };
 }
 
 fn readMachineId(io: std.Io, buf: []u8) DiscoveryError![]const u8 {
@@ -364,4 +378,34 @@ test "findFreshestJournal rejects a file truncated below the header" {
 test "discovery returns NotLinux on macOS/BSD" {
     if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
     try testing.expectError(error.NotLinux, findActiveJournalPath(testing.allocator, debug_io));
+}
+
+test "findFreshestJournal prefers an ONLINE freshly rotated journal over an OFFLINE one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try stubRoots(tmp.dir);
+
+    // Persistent is OFFLINE (state=0) with an older non-zero timestamp.
+    try writeStubJournal(tmp.dir, "persistent/" ++ stub_mid ++ "/system.journal", 9_000, true);
+
+    // Volatile is ONLINE (state=1) right after rotation with 0 entries (rt=0).
+    var h: fmt.Header = std.mem.zeroes(fmt.Header);
+    h.signature = fmt.signature_magic;
+    h.header_size = @sizeOf(fmt.Header);
+    h.state = 1;
+    h.tail_entry_realtime = 0;
+    try tmp.dir.writeFile(debug_io, .{
+        .sub_path = "volatile/" ++ stub_mid ++ "/system.journal",
+        .data = std.mem.asBytes(&h),
+    });
+
+    const got = try findFreshestJournal(
+        testing.allocator,
+        debug_io,
+        tmp.dir,
+        &.{ "persistent", "volatile" },
+        stub_mid,
+    );
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("volatile/" ++ stub_mid ++ "/system.journal", got);
 }

@@ -25,6 +25,9 @@ const OpenFile = struct {
     /// size unchanged; only these bytes show the file is a different one.
     head: [head_bytes]u8 = undefined,
     head_len: u8 = 0,
+    /// Set after an oversized line exceeds `max_line_bytes`: subsequent bytes
+    /// are discarded until the terminating `\n` so `carry` is never poisoned.
+    discard_until_nl: bool = false,
 
     /// Records up to `head_bytes` from offset 0, never past what has been
     /// read, so the comparison is always against bytes that were there.
@@ -213,6 +216,13 @@ const BatchAggregator = struct {
         self.arena.deinit();
     }
 
+    fn reset(self: *BatchAggregator) void {
+        self.entries.clearRetainingCapacity();
+        self.order.clearRetainingCapacity();
+        self.key_scratch.clearRetainingCapacity();
+        _ = self.arena.reset(.{ .retain_with_limit = 64 * 1024 });
+    }
+
     /// Build the aggregation key for `line` using the aggregator's own
     /// scratch, then delegate to `add`. Removes the per-line malloc/free
     /// pair from the caller.
@@ -236,6 +246,7 @@ const BatchAggregator = struct {
             entry.count += 1;
             return;
         }
+        if (self.entries.count() >= reader.max_aggregate_keys) return;
 
         // Reserve capacity before spending arena bytes so an OOM in the
         // hash-map put can't leak the key/line dupes.
@@ -362,11 +373,20 @@ pub fn follow(
     }
     for (carries) |*c| c.* = .empty;
 
+    // Reuse a single aggregator across poll batches instead of allocating and
+    // freeing one on every iteration.
+    var shared_agg: ?BatchAggregator = if (args.aggregate)
+        try BatchAggregator.init(allocator)
+    else
+        null;
+    defer if (shared_agg) |*agg| agg.deinit();
+    const shared_agg_ptr: ?*BatchAggregator = if (shared_agg) |*agg| agg else null;
+
     while (true) {
         var any_read = false;
 
         for (files_buf[0..files_len], carries) |*f, *carry| {
-            if (followRotation(allocator, f, args, &filter_state, carry, read_buf) catch |err| blk: {
+            if (followRotation(allocator, f, args, &filter_state, carry, read_buf, shared_agg_ptr) catch |err| blk: {
                 logTailError("rotate", f.path, err);
                 break :blk false;
             }) any_read = true;
@@ -381,12 +401,13 @@ pub fn follow(
                 // carried from the content that is gone.
                 f.position = 0;
                 f.head_len = 0;
+                f.discard_until_nl = false;
                 carry.clearRetainingCapacity();
             } else if (f.position == stat.size) {
                 continue;
             }
 
-            const bytes_read = readAvailable(allocator, f, args, &filter_state, carry, read_buf) catch |err| {
+            const bytes_read = readAvailable(allocator, f, args, &filter_state, carry, read_buf, shared_agg_ptr) catch |err| {
                 logTailError("read", f.path, err);
                 continue;
             };
@@ -422,18 +443,20 @@ fn followRotation(
     filter_state: *formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
+    shared_agg: ?*BatchAggregator,
 ) !bool {
     const current = f.inode orelse return false;
     const st = std.Io.Dir.cwd().statFile(tail_io, f.path, .{}) catch return false;
     if (st.inode == current) return false;
 
-    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, true);
+    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, true, shared_agg);
     const fresh = try std.Io.Dir.cwd().openFile(tail_io, f.path, .{});
     f.fd.close(tail_io);
     f.fd = fresh;
     f.inode = st.inode;
     f.position = 0;
     f.head_len = 0;
+    f.discard_until_nl = false;
     return true;
 }
 
@@ -461,7 +484,7 @@ pub fn readLastNLines(
     const n: usize = if (args.num_lines == 0) 10 else args.num_lines;
 
     // With a filter on, "last n lines" has to mean n lines that survive it.
-    const filtered = filter_state.has_level_filter or filter_state.has_search_filter;
+    const filtered = filter_state.has_level_filter or filter_state.has_search_filter or filter_state.has_regex;
     const read_from = if (filtered)
         try findLastNMatchingStart(allocator, f, file_size, n, filter_state, read_buf)
     else
@@ -472,7 +495,7 @@ pub fn readLastNLines(
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
-    try readToEOFInternal(allocator, f, args, filter_state, &carry, read_buf, true);
+    try readToEOFInternal(allocator, f, args, filter_state, &carry, read_buf, true, null);
     return f.position;
 }
 
@@ -485,9 +508,10 @@ fn readAvailable(
     filter_state: *formats.FilterState,
     carry: *std.ArrayList(u8),
     buf: []u8,
+    shared_agg: ?*BatchAggregator,
 ) !usize {
     const start_pos = f.position;
-    try readToEOF(allocator, f, args, filter_state, carry, buf);
+    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, false, shared_agg);
     return f.position - start_pos;
 }
 
@@ -504,7 +528,7 @@ pub fn readToEOF(
     carry: *std.ArrayList(u8),
     buf: []u8,
 ) !void {
-    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, false);
+    try readToEOFInternal(allocator, f, args, filter_state, carry, buf, false, null);
 }
 
 fn readToEOFInternal(
@@ -515,15 +539,20 @@ fn readToEOFInternal(
     carry: *std.ArrayList(u8),
     buf: []u8,
     flush_final_line: bool,
+    shared_agg: ?*BatchAggregator,
 ) !void {
-    var aggregator: ?BatchAggregator = null;
-    defer if (aggregator) |*agg| agg.deinit();
+    var local_agg: ?BatchAggregator = null;
+    defer if (local_agg) |*agg| agg.deinit();
 
-    if (args.aggregate) {
-        aggregator = try BatchAggregator.init(allocator);
-    }
-
-    const agg_ptr: ?*BatchAggregator = if (aggregator) |*agg| agg else null;
+    const agg_ptr: ?*BatchAggregator = if (args.aggregate) blk: {
+        if (shared_agg) |agg| {
+            agg.reset();
+            break :blk agg;
+        }
+        local_agg = try BatchAggregator.init(allocator);
+        break :blk &local_agg.?;
+    } else null;
+    defer if (shared_agg) |agg| agg.reset();
 
     while (true) {
         const n = try readAt(f.fd, f.position, buf);
@@ -532,45 +561,72 @@ fn readToEOFInternal(
         f.position += n;
         var slice = buf[0..n];
 
+        // If an earlier chunk overflowed `max_line_bytes`, skip everything up
+        // to the terminating newline so the next valid line starts clean.
+        if (f.discard_until_nl) {
+            const nl = simd.findByte(slice, 0, '\n') orelse continue;
+            f.discard_until_nl = false;
+            slice = slice[nl + 1 ..];
+            if (slice.len == 0) continue;
+        }
+
         // A partial line from the last read is finished by this read's first
         // newline, and only that much is copied onto it — not the whole read,
         // which under a busy log is the entire stream copied twice.
         if (carry.items.len > 0) {
             const nl = simd.findByte(slice, 0, '\n') orelse {
-                try ensureLineCapacity(carry.items.len, slice.len);
+                if (carry.items.len + slice.len > max_line_bytes) {
+                    logTailError("read", f.path, error.LineTooLong);
+                    carry.clearRetainingCapacity();
+                    f.discard_until_nl = true;
+                    continue;
+                }
                 try carry.appendSlice(allocator, slice);
                 continue;
             };
-            try ensureLineCapacity(carry.items.len, nl);
-            try carry.appendSlice(allocator, slice[0..nl]);
-            filter_state.beginChunk(carry.items);
-            try processLine(allocator, args, filter_state, agg_ptr, carry.items);
-            carry.clearRetainingCapacity();
-            slice = slice[nl + 1 ..];
+            if (carry.items.len + nl > max_line_bytes) {
+                logTailError("read", f.path, error.LineTooLong);
+                carry.clearRetainingCapacity();
+                slice = slice[nl + 1 ..];
+            } else {
+                try carry.appendSlice(allocator, slice[0..nl]);
+                filter_state.beginChunk(carry.items);
+                try processLine(allocator, args, filter_state, agg_ptr, carry.items);
+                carry.clearRetainingCapacity();
+                slice = slice[nl + 1 ..];
+            }
         }
 
         filter_state.beginChunk(slice);
         var start: usize = 0;
         while (simd.findByte(slice, start, '\n')) |nl| {
             const line = slice[start..nl];
-            if (line.len > 0) {
+            if (line.len > max_line_bytes) {
+                logTailError("read", f.path, error.LineTooLong);
+            } else if (line.len > 0) {
                 try processLine(allocator, args, filter_state, agg_ptr, line);
             }
             start = nl + 1;
         }
 
         if (start < slice.len) {
-            try ensureLineCapacity(0, slice.len - start);
-            try carry.appendSlice(allocator, slice[start..]);
+            const rem = slice[start..];
+            if (rem.len > max_line_bytes) {
+                logTailError("read", f.path, error.LineTooLong);
+                f.discard_until_nl = true;
+            } else {
+                try carry.appendSlice(allocator, rem);
+            }
         }
     }
 
     if (flush_final_line and carry.items.len > 0) {
+        filter_state.beginChunk(carry.items);
         try processLine(allocator, args, filter_state, agg_ptr, carry.items);
         carry.clearRetainingCapacity();
     }
 
-    if (aggregator) |*agg| {
+    if (agg_ptr) |agg| {
         agg.printAll(filter_state);
     }
 }
@@ -931,7 +987,7 @@ test "readToEOFInternal can flush final line without trailing newline" {
 
     var read_buf: [4]u8 = undefined;
     var of = OpenFile{ .path = "unterminated.log", .fd = file, .position = 0 };
-    try readToEOFInternal(allocator, &of, args, &filter_state, &carry, &read_buf, true);
+    try readToEOFInternal(allocator, &of, args, &filter_state, &carry, &read_buf, true, null);
 
     try testing.expectEqual(@as(usize, 0), carry.items.len);
     try testing.expectEqual(stat.size, of.position);
@@ -1092,7 +1148,7 @@ test "followRotation: drains the old file, then switches to the new one" {
     var buf: [64]u8 = undefined;
 
     // No rotation yet.
-    try testing.expect(!try followRotation(allocator, &of, args, &filter_state, &carry, &buf));
+    try testing.expect(!try followRotation(allocator, &of, args, &filter_state, &carry, &buf, null));
 
     // Appended right before the rename, unterminated, then rotated.
     {
@@ -1103,7 +1159,7 @@ test "followRotation: drains the old file, then switches to the new one" {
     try tmp.dir.rename("rot.log", tmp.dir, "rot.log.1", tail_io);
     try tmp.dir.writeFile(tail_io, .{ .sub_path = "rot.log", .data = "new\n" });
 
-    try testing.expect(try followRotation(allocator, &of, args, &filter_state, &carry, &buf));
+    try testing.expect(try followRotation(allocator, &of, args, &filter_state, &carry, &buf, null));
     // The old file was read to its end and its last line flushed.
     try testing.expectEqual(@as(usize, 0), carry.items.len);
     try testing.expectEqual(@as(u64, 0), of.position);
@@ -1126,4 +1182,96 @@ test "OpenFile: a copytruncate refilled to the same size is noticed by its head"
     try tmp.dir.writeFile(tail_io, .{ .sub_path = "ct.log", .data = "seq=000000002 new\n" });
     try testing.expectEqual(@as(u64, 18), (try fd.stat(tail_io)).size);
     try testing.expect(of.headChanged());
+}
+
+test "readLastNLines uses filtered backfill for regex searches" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Place the regex match well above the last 2 raw lines.
+    try tmp.dir.writeFile(tail_io, .{
+        .sub_path = "rx.log",
+        .data = "2026-01-01 [ERROR] host=10.0.0.1 status=503\nno1\nno2\nno3\nno4\nno5\n",
+    });
+    const fd = try tmp.dir.openFile(tail_io, "rx.log", .{});
+    defer fd.close(tail_io);
+
+    var sink: std.ArrayList(u8) = .empty;
+    defer sink.deinit(testing.allocator);
+    var out = try formats.Out.init(testing.allocator, std.Io.File.stdout(), &formats.Theme.plain);
+    defer out.deinit();
+    out.sink = &sink;
+
+    var files_array = [_][]const u8{"rx.log"};
+    const args = makeSearchTailArgs(files_array[0..], 1, "5\\d\\d");
+    var filter_state = formats.FilterState.init(args, &out, null);
+    defer filter_state.deinit();
+    try testing.expect(filter_state.has_regex);
+
+    var read_buf: [256]u8 = undefined;
+    var of = OpenFile{ .path = "rx.log", .fd = fd, .position = 0 };
+    const stat = try fd.stat(tail_io);
+    _ = try readLastNLines(testing.allocator, &of, args, stat.size, &filter_state, &read_buf);
+    out.flush();
+    try testing.expect(std.mem.indexOf(u8, sink.items, "status=503") != null);
+}
+
+test "readToEOF recovers after an oversized line without poisoning carry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const oversized = try testing.allocator.alloc(u8, max_line_bytes + 64);
+    defer testing.allocator.free(oversized);
+    @memset(oversized, 'X');
+    const good = "2026-01-01 [ERROR] recovered after overflow\n";
+
+    {
+        const f = try tmp.dir.createFile(tail_io, "huge.log", .{});
+        defer f.close(tail_io);
+        try f.writeStreamingAll(tail_io, oversized);
+        try f.writeStreamingAll(tail_io, "\n");
+        try f.writeStreamingAll(tail_io, good);
+    }
+
+    const fd = try tmp.dir.openFile(tail_io, "huge.log", .{});
+    defer fd.close(tail_io);
+
+    var sink: std.ArrayList(u8) = .empty;
+    defer sink.deinit(testing.allocator);
+    var out = try formats.Out.init(testing.allocator, std.Io.File.stdout(), &formats.Theme.plain);
+    defer out.deinit();
+    out.sink = &sink;
+
+    var files_array = [_][]const u8{"huge.log"};
+    const args: flags.Args = .{ .files = files_array[0..], .tail_mode = true };
+    var filter_state = formats.FilterState.init(args, &out, null);
+    defer filter_state.deinit();
+
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(testing.allocator);
+    const read_buf = try testing.allocator.alloc(u8, READ_BUF_SIZE);
+    defer testing.allocator.free(read_buf);
+
+    var of = OpenFile{ .path = "huge.log", .fd = fd, .position = 0 };
+    try readToEOF(testing.allocator, &of, args, &filter_state, &carry, read_buf);
+    out.flush();
+
+    try testing.expectEqual(@as(usize, 0), carry.items.len);
+    try testing.expect(!of.discard_until_nl);
+    try testing.expect(std.mem.indexOf(u8, sink.items, "recovered after overflow") != null);
+}
+
+test "BatchAggregator.reset reuses state cleanly across batches without leaking" {
+    var agg = try BatchAggregator.init(testing.allocator);
+    defer agg.deinit();
+    var files_array = [_][]const u8{"x.log"};
+    var fs = formats.FilterState.init(.{ .files = files_array[0..], .tail_mode = true, .aggregate = true }, null, null);
+    defer fs.deinit();
+    const ck = fs.checkLine("2026-01-01 [INFO] hello").?;
+    for (0..10) |_| {
+        try agg.observe(.exact, ck.line, ck.info);
+        try agg.observe(.exact, ck.line, ck.info);
+        try testing.expectEqual(@as(usize, 1), agg.order.items.len);
+        agg.reset();
+        try testing.expectEqual(@as(usize, 0), agg.order.items.len);
+    }
 }

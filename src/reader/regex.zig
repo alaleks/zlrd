@@ -284,16 +284,108 @@ fn findAnywhere(pattern: []const u8, text: []const u8, from: usize) ?Match {
     return null;
 }
 
+/// Continuation chain for backtracking across group boundaries without heap
+/// allocation. Each frame lives on the call stack and describes what must
+/// match after the current group/branch succeeds.
+const Cont = union(enum) {
+    seq: struct {
+        pat: []const u8,
+        next: ?*const Cont,
+    },
+    rep_group: struct {
+        inner: []const u8,
+        min: usize,
+        max: usize,
+        count: usize,
+        start_tp: usize,
+        rest: []const u8,
+        next: ?*const Cont,
+    },
+};
+
+/// Upper bound on backtracking steps inside quantified/nested groups so
+/// pathological patterns like `(a+)+b` cannot stall the process.
+const max_group_steps: usize = 100_000;
+
 /// Match `pattern` starting at `text[start]`.
 /// Returns position after the match, or null on failure.
 fn matchFrom(pattern: []const u8, text: []const u8, start: usize) ?usize {
+    var steps: usize = 0;
+    return matchFromCont(pattern, null, text, start, &steps);
+}
+
+fn evalCont(cont: ?*const Cont, text: []const u8, tp: usize, steps: *usize) ?usize {
+    const c = cont orelse return tp;
+    return switch (c.*) {
+        .seq => |s| matchFromCont(s.pat, s.next, text, tp, steps),
+        .rep_group => |rg| {
+            const next_count = rg.count + 1;
+            // Zero-width guard: a repetition that consumed 0 bytes cannot
+            // repeat again, so finish directly with `rest`.
+            if (tp == rg.start_tp) {
+                if (next_count >= rg.min) {
+                    return matchFromCont(rg.rest, rg.next, text, tp, steps);
+                }
+                return null;
+            }
+            return matchRepeatGroup(rg.inner, rg.min, rg.max, next_count, rg.rest, rg.next, text, tp, steps);
+        },
+    };
+}
+
+fn matchBranches(inner: []const u8, cont: ?*const Cont, text: []const u8, tp: usize, steps: *usize) ?usize {
+    var branches = inner;
+    while (true) {
+        const pipe = topAlt(branches);
+        const branch = branches[0 .. pipe orelse branches.len];
+        if (matchFromCont(branch, cont, text, tp, steps)) |end| return end;
+        branches = branches[(pipe orelse return null) + 1 ..];
+    }
+}
+
+fn matchRepeatGroup(
+    inner: []const u8,
+    min: usize,
+    max: usize,
+    count: usize,
+    rest: []const u8,
+    cont: ?*const Cont,
+    text: []const u8,
+    tp: usize,
+    steps: *usize,
+) ?usize {
+    if (steps.* >= max_group_steps) return null;
+    steps.* += 1;
+
+    if (count < max) {
+        const next_cont: Cont = .{
+            .rep_group = .{
+                .inner = inner,
+                .min = min,
+                .max = max,
+                .count = count,
+                .start_tp = tp,
+                .rest = rest,
+                .next = cont,
+            },
+        };
+        if (matchBranches(inner, &next_cont, text, tp, steps)) |end| return end;
+    }
+
+    if (count >= min) {
+        return matchFromCont(rest, cont, text, tp, steps);
+    }
+    return null;
+}
+
+fn matchFromCont(pattern: []const u8, cont: ?*const Cont, text: []const u8, start: usize, steps: *usize) ?usize {
     var pp: usize = 0;
     var tp: usize = start;
 
     while (pp < pattern.len) {
         // $ end anchor — only special at the very end of this pattern segment
         if (pattern[pp] == '$' and pp + 1 == pattern.len) {
-            return if (tp == text.len) tp else null;
+            return if (tp == text.len) evalCont(cont, text, tp, steps) else null;
         }
 
         const alen = atomLen(pattern[pp..]) orelse return null;
@@ -301,29 +393,39 @@ fn matchFrom(pattern: []const u8, text: []const u8, start: usize) ?usize {
 
         if (qp < pattern.len) {
             switch (pattern[qp]) {
-                '*' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 0, std.math.maxInt(usize)),
-                '+' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 1, std.math.maxInt(usize)),
-                '?' => return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], text, tp, 0, 1),
+                '*' => {
+                    if (pattern[pp] == '(') {
+                        return matchRepeatGroup(pattern[pp + 1 .. qp - 1], 0, std.math.maxInt(usize), 0, pattern[qp + 1 ..], cont, text, tp, steps);
+                    }
+                    return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], cont, text, tp, 0, std.math.maxInt(usize), steps);
+                },
+                '+' => {
+                    if (pattern[pp] == '(') {
+                        return matchRepeatGroup(pattern[pp + 1 .. qp - 1], 1, std.math.maxInt(usize), 0, pattern[qp + 1 ..], cont, text, tp, steps);
+                    }
+                    return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], cont, text, tp, 1, std.math.maxInt(usize), steps);
+                },
+                '?' => {
+                    if (pattern[pp] == '(') {
+                        return matchRepeatGroup(pattern[pp + 1 .. qp - 1], 0, 1, 0, pattern[qp + 1 ..], cont, text, tp, steps);
+                    }
+                    return matchRepeat(pattern[pp..qp], pattern[qp + 1 ..], cont, text, tp, 0, 1, steps);
+                },
                 else => {},
             }
         }
 
-        // A group with alternatives: the branch that matches first is not
-        // necessarily the one the rest of the pattern can follow. `(err|
-        // error): ` against `error: x` took `err`, failed on `o`, and gave
-        // up — every branch has to be tried against the rest.
+        // Delegate every group — with or without `|` — through the continuation
+        // chain so internal quantifiers (`(.*)error`, `(\w+)ms`) and branches
+        // (`(err|error):`) backtrack against `pattern[qp..]`.
         if (pattern[pp] == '(') {
-            var branches = pattern[pp + 1 .. qp - 1];
-            if (topAlt(branches) != null) {
-                while (true) {
-                    const pipe = topAlt(branches);
-                    const branch = branches[0 .. pipe orelse branches.len];
-                    if (matchFrom(branch, text, tp)) |mid| {
-                        if (matchFrom(pattern[qp..], text, mid)) |end| return end;
-                    }
-                    branches = branches[(pipe orelse return null) + 1 ..];
-                }
-            }
+            const next_cont: Cont = .{
+                .seq = .{
+                    .pat = pattern[qp..],
+                    .next = cont,
+                },
+            };
+            return matchBranches(pattern[pp + 1 .. qp - 1], &next_cont, text, tp, steps);
         }
 
         const new_tp = matchAtom(pattern[pp..qp], text, tp) orelse return null;
@@ -331,43 +433,24 @@ fn matchFrom(pattern: []const u8, text: []const u8, start: usize) ?usize {
         pp = qp;
     }
 
-    return tp;
+    return evalCont(cont, text, tp, steps);
 }
 
-/// True when `atom_pat` consumes exactly one byte whenever it matches.
+/// Greedy repetition of a fixed-width `atom_pat` (not a group), at least `min`
+/// and at most `max` times, then match `rest` + `cont`.
 ///
-/// Every atom does except a group: `.`, a literal, a class, and an escape all
-/// advance by one. A group's width depends on what is inside it, so only it
-/// has to be re-walked to find out where a shorter repetition ends.
-fn isFixedWidthAtom(atom_pat: []const u8) bool {
-    return atom_pat.len > 0 and atom_pat[0] != '(';
-}
-
-/// Greedy repetition of `atom_pat`, at least `min` and at most `max` times,
-/// then match `rest`. `?` used to repeat without bound, so `ab?c` matched
-/// `abbbc`.
-///
-/// Backtracking gives up one repetition at a time, and the position after
-/// `count` of them used to be recovered by replaying the atom `count` times
-/// from `start`. That made one repetition quadratic in its own length, and
-/// `matchAnywhere` then multiplied it by every starting position: `.*` at the
-/// front of a pattern turned into cubic work in the length of the line.
-///
-/// It measured the way that sounds. `zlrd -s '.*zzz'` against a single 2 KB
-/// line took 4.8 seconds, and `-s 'x.*y'` 4.6 — not adversarial patterns, the
-/// ordinary ones. Under `--alert-regex` the same shape stalls the agent's
-/// watcher thread, which keeps answering `/metrics` while it has stopped
-/// reading logs entirely.
-///
-/// For an atom of fixed width the position after `count` repetitions is just
-/// arithmetic, which is what the replay was recomputing.
+/// Backtracking gives up one repetition at a time in O(1) arithmetic because
+/// every fixed-width atom consumes exactly one byte per match, keeping
+/// `.*zzz` linear rather than quadratic.
 fn matchRepeat(
     atom_pat: []const u8,
     rest: []const u8,
+    cont: ?*const Cont,
     text: []const u8,
     start: usize,
     min: usize,
     max: usize,
+    steps: *usize,
 ) ?usize {
     var count: usize = 0;
     var tp = start;
@@ -378,25 +461,14 @@ fn matchRepeat(
         count += 1;
     }
 
-    const fixed_width = isFixedWidthAtom(atom_pat);
-
     // Backtrack from count down to min
     while (true) {
         if (count >= min) {
-            if (matchFrom(rest, text, tp)) |end| return end;
+            if (matchFromCont(rest, cont, text, tp, steps)) |end| return end;
         }
         if (count == 0) return null;
         count -= 1;
-        if (fixed_width) {
-            tp = start + count;
-        } else {
-            // A group: replay it to find where `count` repetitions end.
-            tp = start;
-            var k: usize = 0;
-            while (k < count) : (k += 1) {
-                tp = matchAtom(atom_pat, text, tp) orelse return null;
-            }
-        }
+        tp = start + count;
     }
 }
 
@@ -408,17 +480,8 @@ fn matchAtom(atom_pat: []const u8, text: []const u8, tp: usize) ?usize {
         '.' => tp + 1,
         '\\' => if (atom_pat.len >= 2 and matchEscape(atom_pat[1], c)) tp + 1 else null,
         '[' => if (matchClass(atom_pat, c)) tp + 1 else null,
-        '(' => matchGroupFrom(atom_pat[1 .. atom_pat.len - 1], text, tp),
         else => if (std.ascii.toLower(c) == std.ascii.toLower(atom_pat[0])) tp + 1 else null,
     };
-}
-
-fn matchGroupFrom(inner: []const u8, text: []const u8, tp: usize) ?usize {
-    if (topAlt(inner)) |pipe| {
-        return matchFrom(inner[0..pipe], text, tp) orelse
-            matchFrom(inner[pipe + 1 ..], text, tp);
-    }
-    return matchFrom(inner, text, tp);
 }
 
 fn matchEscape(esc: u8, c: u8) bool {
@@ -825,4 +888,29 @@ test "a group with three or more alternatives matches every branch" {
     try std.testing.expect(re.isMatch("processed job 1234 in 5ms"));
     try std.testing.expect(!re.isMatch("processed job 999"));
     try std.testing.expect(Regex.compile("x(a|b|c)y").?.isMatch("xcy"));
+}
+
+test "quantified groups with 3+ alternatives match every branch" {
+    const re = Regex.compile("(info|warn|error)+").?;
+    try std.testing.expect(re.isMatch("info"));
+    try std.testing.expect(re.isMatch("warn"));
+    try std.testing.expect(re.isMatch("error"));
+    try std.testing.expect(re.isMatch("warnerror"));
+    try std.testing.expect(!re.isMatch("debug"));
+
+    const opt = Regex.compile("^(a|b|c)?$").?;
+    try std.testing.expect(opt.isMatch(""));
+    try std.testing.expect(opt.isMatch("a"));
+    try std.testing.expect(opt.isMatch("b"));
+    try std.testing.expect(opt.isMatch("c"));
+    try std.testing.expect(!opt.isMatch("d"));
+}
+
+test "groups with internal quantifiers or alternations backtrack for trailing pattern" {
+    try std.testing.expect(Regex.compile("(.*)error").?.isMatch("some error"));
+    try std.testing.expect(Regex.compile("(\\w+)ms").?.isMatch("500ms"));
+    try std.testing.expect(Regex.compile("([a-z]+)c").?.isMatch("abc"));
+    try std.testing.expect(Regex.compile("(err|error)?:").?.isMatch("error:"));
+    try std.testing.expect(Regex.compile("(a|ab)+c").?.isMatch("abc"));
+    try std.testing.expect(!Regex.compile("(a|ab)+c").?.isMatch("abd"));
 }

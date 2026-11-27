@@ -396,8 +396,10 @@ fn analyzeJsonInPlace(line: []const u8, info: *LineInfo) void {
         switch (target) {
             .level => {
                 if (info.level == null and value.len <= 16) {
-                    info.level = flags.parseLevelInsensitive(value);
-                    info.level_pos = .{ .start = value_start, .end = value_end };
+                    if (flags.parseLevelInsensitive(value)) |lvl| {
+                        info.level = lvl;
+                        info.level_pos = .{ .start = value_start, .end = value_end };
+                    }
                 }
             },
             .time_like => {
@@ -599,6 +601,8 @@ pub const FilterState = struct {
     chunk_may_have_ansi: bool = true,
     /// Sink used by `printIfMatch` / `printChecked`. Null for filter-only use.
     out: ?*Out = null,
+    /// Optional level counter updated by callers like `gzip.readGzip`.
+    counter: ?*LevelCounter = null,
     /// Cutoff for `--since`, set by the caller once the anchor is known.
     /// Null when no relative window was asked for.
     since_cut: ?civil.Cutoff = null,
@@ -1146,7 +1150,7 @@ fn sortedSinceStart(source: parallel.Source, cut: *const civil.Cutoff) u64 {
     while (low < high) {
         const mid = low + (high - low) / 2;
         const want: usize = @intCast(@min(source.size - mid, buf.len));
-        const n = source.readAt(mid, buf[0..want]);
+        const n = source.readAt(mid, buf[0..want]) catch return 0;
         if (n != want) return 0;
         const start = if (mid == low) 0 else (simd.findByte(buf[0..n], 0, '\n') orelse return 0) + 1;
         if (mid + start >= high) {
@@ -1262,9 +1266,10 @@ const ChunkWorker = struct {
         self.out.deinit();
     }
 
-    pub fn process(self: *ChunkWorker, chunk: []const u8, dst: *std.ArrayList(u8)) void {
+    pub fn process(self: *ChunkWorker, chunk: []const u8, dst: *std.ArrayList(u8)) error{OutOfMemory}!void {
         self.out.sink = dst;
         self.out.len = 0;
+        self.out.broken = false;
         var start: usize = 0;
         while (start < chunk.len) {
             const boundary = findLineEnd(chunk, start);
@@ -1275,11 +1280,13 @@ const ChunkWorker = struct {
                 if (self.filter_state.checkLine(line)) |ck| {
                     if (ck.info.level) |lvl| self.counter.add(lvl);
                     self.filter_state.printChecked(ck.line, ck.info);
+                    if (self.out.broken) return error.OutOfMemory;
                 }
             }
             start = nl + 1;
         }
         self.out.flush();
+        if (self.out.broken) return error.OutOfMemory;
     }
 };
 
@@ -1309,8 +1316,19 @@ fn writeChunkToOut(ctx: *anyopaque, bytes: []const u8) bool {
     return !out.broken;
 }
 
-/// Scans `file` across threads. Returns false when the pool could not be set
-/// up, in which case the caller runs the serial path and nothing is lost.
+const ParallelSink = struct {
+    out: *Out,
+    wrote_any: bool = false,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) bool {
+        const self: *ParallelSink = @ptrCast(@alignCast(ctx));
+        if (bytes.len > 0) self.wrote_any = true;
+        return writeChunkToOut(self.out, bytes);
+    }
+};
+
+/// Scans `file` across threads. Returns false when the file isn't worth
+/// splitting; propagates allocation, I/O, and worker errors to the caller.
 fn readParallel(
     allocator: std.mem.Allocator,
     file: std.Io.File,
@@ -1322,13 +1340,31 @@ fn readParallel(
     chunk_bytes: usize,
     start_offset: u64,
 ) !bool {
-    const worker_count = parallel.suggestedWorkers(size - start_offset, chunk_bytes, parallel_max_workers);
+    var wrote_any = false;
+    return readParallelTracked(allocator, file, size, args, counter, out, since_cut, chunk_bytes, start_offset, &wrote_any);
+}
+
+fn readParallelTracked(
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    size: u64,
+    args: flags.Args,
+    counter: *LevelCounter,
+    out: *Out,
+    since_cut: ?civil.Cutoff,
+    chunk_bytes: usize,
+    start_offset: u64,
+    wrote_any: *bool,
+) !bool {
+    if (start_offset >= size) return false;
+    const span = size - start_offset;
+    const worker_count = parallel.suggestedWorkers(span, chunk_bytes, parallel_max_workers);
     if (worker_count < 2) return false;
 
     var file_ctx = FileSource{ .file = file, .base = start_offset };
     const source = parallel.Source{
         .ctx = &file_ctx,
-        .size = size - start_offset,
+        .size = span,
         .read_at = FileSource.readAt,
     };
 
@@ -1346,7 +1382,9 @@ fn readParallel(
     }
     for (workers) |*w| w.rebind();
 
-    try parallel.run(ChunkWorker, allocator, source, bounds, workers, out, writeChunkToOut, .{
+    var sink = ParallelSink{ .out = out };
+    defer wrote_any.* = sink.wrote_any;
+    try parallel.run(ChunkWorker, allocator, source, bounds, workers, &sink, ParallelSink.write, .{
         .chunk_bytes = chunk_bytes,
         .max_line_bytes = max_line_bytes,
     });
@@ -1364,9 +1402,9 @@ const FileSource = struct {
     file: std.Io.File,
     base: u64 = 0,
 
-    fn readAt(ctx: *anyopaque, pos: u64, dst: []u8) usize {
+    fn readAt(ctx: *anyopaque, pos: u64, dst: []u8) parallel.ReadError!usize {
         const self: *FileSource = @ptrCast(@alignCast(ctx));
-        return self.file.readPositional(debug_io, &.{dst}, self.base + pos) catch 0;
+        return self.file.readPositional(debug_io, &.{dst}, self.base + pos) catch return error.IoError;
     }
 };
 
@@ -1386,18 +1424,25 @@ pub fn readStreaming(
 
     var start_offset: u64 = 0;
     if (opened) |file| {
+        // Sample length once so a concurrent truncation cannot make
+        // `start_offset > size` and underflow `size - start_offset`.
+        const file_size = file.length(debug_io) catch 0;
         if (args.assume_sorted_timestamps and !args.tail_mode) {
             if (since_cut) |cut| {
                 var ctx = FileSource{ .file = file };
-                start_offset = sortedSinceStart(.{ .ctx = &ctx, .size = file.length(debug_io) catch 0, .read_at = FileSource.readAt }, &cut);
+                start_offset = sortedSinceStart(.{ .ctx = &ctx, .size = file_size, .read_at = FileSource.readAt }, &cut);
             }
         }
-        if (parallelEligible(args, path, file.length(debug_io) catch 0)) {
-            const size = file.length(debug_io) catch 0;
-            // A pool that cannot be built is not an error: the serial path is
-            // still right, just slower, and a failed allocation here says the
-            // machine is in no state to run eight of them anyway.
-            if (readParallel(allocator, file, size, args, counter, out, since_cut, parallel_chunk_bytes, start_offset) catch false) return;
+        if (start_offset < file_size and parallelEligible(args, path, file_size - start_offset)) {
+            // Fall back to the serial reader only if pool setup fails before
+            // anything is emitted; mid-stream I/O or worker OOM errors must
+            // propagate rather than duplicating already-printed chunks.
+            var wrote_any = false;
+            const handled = readParallelTracked(allocator, file, file_size, args, counter, out, since_cut, parallel_chunk_bytes, start_offset, &wrote_any) catch |err| blk: {
+                if (!wrote_any and err != error.IoError) break :blk false;
+                return err;
+            };
+            if (handled) return;
         }
     }
     var expander: ?JsonExpander = if (wantsJsonExpansion(args, out.theme))
@@ -1412,6 +1457,7 @@ pub fn readStreaming(
     defer filter_state.deinit();
 
     if (gzip.isGzip(path)) {
+        filter_state.counter = counter;
         try gzip.readGzip(allocator, path, args, &filter_state, buildAggregateKeyForLine);
         return;
     }
@@ -4352,7 +4398,7 @@ test "worker output writes directly without a staging allocation" {
     var dst: std.ArrayList(u8) = .empty;
     defer dst.deinit(std.testing.allocator);
     try dst.ensureTotalCapacity(std.testing.allocator, 1024);
-    worker.process("hello\nworld\n", &dst);
+    try worker.process("hello\nworld\n", &dst);
     try std.testing.expectEqualStrings("hello\n\nworld\n\n", dst.items);
     try std.testing.expect(!worker.out.broken);
     try std.testing.expectEqual(@as(usize, 0), worker.out.len);
@@ -4484,7 +4530,7 @@ test "parallel combined scan strips ANSI and preserves adjacent plain lines" {
     worker.rebind();
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(a);
-    worker.process("plain\n#033[31mred#033[0m\ntail", &got);
+    try worker.process("plain\n#033[31mred#033[0m\ntail", &got);
     var expected: std.ArrayList(u8) = .empty;
     defer expected.deinit(a);
     var out = try Out.init(a, std.Io.File.stdout(), &Theme.plain);
@@ -4548,4 +4594,109 @@ test "sorted since output matches full scan in serial and parallel modes" {
     try std.testing.expect(outputs[0].items.len > 0);
     try std.testing.expectEqualStrings(outputs[0].items, outputs[1].items);
     if (outputs[2].items.len > 0) try std.testing.expectEqualStrings(outputs[0].items, outputs[2].items);
+}
+
+test "JSON lines with unrecognized level strings do not panic in plain or colored printers" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{\"level\":\"verbose\",\"msg\":\"hi\"}",
+        "{\"level\":\"\",\"msg\":\"empty\"}",
+        "{\"level\":\"30\",\"msg\":\"pino numeric\"}",
+        "{\"level\":\"audit\",\"msg\":\"custom\"}",
+    };
+    const themes = [_]Theme{
+        Theme.plain,
+        Theme.forMode(.truecolor, theme_mod.Glyphs.unicode, .dark),
+    };
+    for (themes) |th| {
+        for (cases) |line| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(a);
+            var out = try Out.init(a, std.Io.File.stdout(), &th);
+            defer out.deinit();
+            out.sink = &buf;
+            var fs = FilterState.init(.{ .files = &.{} }, &out, null);
+            defer fs.deinit();
+            fs.printIfMatch(line);
+            out.flush();
+            try std.testing.expect(buf.items.len > 0);
+            try std.testing.expect(std.mem.indexOf(u8, buf.items, "msg") != null);
+        }
+    }
+}
+
+test "readParallel guards start_offset >= size without underflow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "small", .data = "hello\n" });
+    const file = try tmp.dir.openFile(debug_io, "small", .{});
+    defer file.close(debug_io);
+
+    var out = try Out.init(std.testing.allocator, std.Io.File.stdout(), &Theme.plain);
+    defer out.deinit();
+    var counter: LevelCounter = .{};
+    try std.testing.expect(!try readParallel(
+        std.testing.allocator,
+        file,
+        6,
+        .{ .files = &.{} },
+        &counter,
+        &out,
+        null,
+        512,
+        1024,
+    ));
+}
+
+test "ChunkWorker.process propagates OutOfMemory when output buffer cannot grow" {
+    var empty: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&empty);
+    var worker = try ChunkWorker.init(failing.allocator(), .{ .files = &.{} }, &Theme.plain, null);
+    defer worker.deinit();
+    worker.rebind();
+    var dst: std.ArrayList(u8) = .empty;
+    try std.testing.expectError(error.OutOfMemory, worker.process("hello\n", &dst));
+}
+
+test "readStreaming on gzip updates LevelCounter and buffers [xN] prefix without ANSI leaks" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "2026-01-01 [ERROR] db timeout\n2026-01-01 [ERROR] db timeout\n2026-01-01 [INFO] ok\n";
+    var gz: std.ArrayList(u8) = .empty;
+    defer gz.deinit(a);
+    try gz.appendSlice(a, &.{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01 });
+    var le: [2]u8 = undefined;
+    std.mem.writeInt(u16, &le, @intCast(payload.len), .little);
+    try gz.appendSlice(a, &le);
+    std.mem.writeInt(u16, &le, ~@as(u16, @intCast(payload.len)), .little);
+    try gz.appendSlice(a, &le);
+    try gz.appendSlice(a, payload);
+    var crc = std.hash.Crc32.init();
+    crc.update(payload);
+    var trailer: [8]u8 = undefined;
+    std.mem.writeInt(u32, trailer[0..4], crc.final(), .little);
+    std.mem.writeInt(u32, trailer[4..8], @truncate(payload.len), .little);
+    try gz.appendSlice(a, &trailer);
+
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "agg.log.gz", .data = gz.items });
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/agg.log.gz", .{tmp.sub_path});
+
+    var sink: std.ArrayList(u8) = .empty;
+    defer sink.deinit(a);
+    var out = try Out.init(a, std.Io.File.stdout(), &Theme.plain);
+    defer out.deinit();
+    out.sink = &sink;
+
+    var counter: LevelCounter = .{};
+    try readStreaming(a, path, .{ .files = &.{}, .aggregate = true, .aggregate_mode = .exact }, &counter, &out, null);
+    out.flush();
+
+    try std.testing.expectEqual(@as(usize, 3), counter.total);
+    try std.testing.expectEqual(@as(usize, 2), counter.counts[@backingInt(flags.Level.Error)]);
+    try std.testing.expectEqual(@as(usize, 1), counter.counts[@backingInt(flags.Level.Info)]);
+    try std.testing.expect(std.mem.indexOf(u8, sink.items, "\x1b[") == null);
+    try std.testing.expect(std.mem.startsWith(u8, sink.items, "[x2] 2026-01-01 ["));
 }

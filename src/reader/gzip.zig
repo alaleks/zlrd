@@ -29,11 +29,18 @@ const Entry = struct {
     sample_line: []const u8,
 };
 
+/// Upper bound for distinct aggregation keys retained across one gzip scan.
+/// Matches `reader.max_aggregate_keys` so `-a` cannot OOM on high-cardinality archives.
+pub const max_aggregate_keys: usize = 100_000;
+
 /// Errors specific to gzip line streaming.
 pub const GzipReadError = error{
     LineTooLong,
     MissingAggregateKeyBuilder,
     MissingAggregator,
+    WrongGzipChecksum,
+    WrongGzipSize,
+    TruncatedStream,
 };
 
 /// One aggregated output entry kept for the current gzip read.
@@ -67,6 +74,7 @@ const BatchAggregator = struct {
             entry.count += 1;
             return;
         }
+        if (self.entries.count() >= max_aggregate_keys) return;
 
         // Reserve capacity before spending arena bytes so an OOM in the
         // hash-map put can't leak the key/line dupes.
@@ -88,18 +96,46 @@ const BatchAggregator = struct {
 
     fn printAll(self: *BatchAggregator, filter_state: anytype) void {
         for (self.order.items) |key| {
+            if (outBroken(filter_state)) break;
             const entry = self.entries.get(key).?;
 
             if (entry.count > 1 and !outputJsonEnabled(filter_state)) {
-                var buf: [128]u8 = undefined;
-                const prefix = std.fmt.bufPrint(&buf, "\x1b[2m[x{d}] \x1b[0m", .{entry.count}) catch "[x?] ";
-                std.Io.File.stdout().writeStreamingAll(debug_io, prefix) catch {};
+                writeCountPrefix(filter_state, entry.count);
             }
 
             filter_state.printIfMatch(entry.sample_line);
         }
     }
 };
+
+fn outBroken(filter_state: anytype) bool {
+    const Child = @typeInfo(@TypeOf(filter_state)).pointer.child;
+    if (comptime @hasField(Child, "out")) {
+        if (filter_state.out) |o| return o.broken;
+    }
+    return false;
+}
+
+fn writeCountPrefix(filter_state: anytype, count: usize) void {
+    const Child = @typeInfo(@TypeOf(filter_state)).pointer.child;
+    if (comptime @hasField(Child, "out")) {
+        if (filter_state.out) |o| {
+            o.write(o.theme.palette.dim);
+            o.print("[x{d}] ", .{count});
+            o.write(o.theme.palette.reset);
+        }
+    }
+}
+
+fn recordLevel(filter_state: anytype, checked: anytype) void {
+    const Child = @typeInfo(@TypeOf(filter_state)).pointer.child;
+    const CheckedT = @TypeOf(checked);
+    if (comptime @hasField(Child, "counter") and @typeInfo(CheckedT) == .@"struct" and @hasField(CheckedT, "info")) {
+        if (filter_state.counter) |counter| {
+            if (checked.info.level) |lvl| counter.add(lvl);
+        }
+    }
+}
 
 fn outputJsonEnabled(filter_state: anytype) bool {
     const T = @TypeOf(filter_state);
@@ -141,12 +177,6 @@ pub fn readGzip(
     var file_reader = file.reader(debug_io, &file_buf);
 
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompress: std.compress.flate.Decompress = .init(
-        &file_reader.interface,
-        .gzip,
-        &decompress_buf,
-    );
-    const decompress_reader = &decompress.reader;
 
     var carry = try std.ArrayList(u8).initCapacity(allocator, 4096);
     defer carry.deinit(allocator);
@@ -165,20 +195,59 @@ pub fn readGzip(
     const chunk = try allocator.alloc(u8, chunk_size);
     defer allocator.free(chunk);
 
+    // Loop over RFC 1952 concatenated gzip members until true underlying EOF.
     while (true) {
-        const n = try decompress_reader.readSliceShort(chunk);
-        if (n == 0) break;
-
-        try processChunk(
-            allocator,
-            &carry,
-            chunk[0..n],
-            args,
-            filter_state,
-            agg_ptr,
-            key_builder,
+        var decompress: std.compress.flate.Decompress = .init(
+            &file_reader.interface,
+            .gzip,
+            &decompress_buf,
         );
+        const decompress_reader = &decompress.reader;
+        var hasher = std.compress.flate.Container.Hasher.init(.gzip);
+
+        while (true) {
+            if (outBroken(filter_state)) return;
+            const n = decompress_reader.readSliceShort(chunk) catch |err| switch (err) {
+                error.ReadFailed => {
+                    if (decompress.err) |derr| {
+                        if (derr == error.EndOfStream) return GzipReadError.TruncatedStream;
+                        return derr;
+                    }
+                    if (file_reader.err) |ferr| return ferr;
+                    return GzipReadError.TruncatedStream;
+                },
+            };
+            if (n == 0) break;
+            hasher.update(chunk[0..n]);
+
+            try processChunk(
+                allocator,
+                &carry,
+                chunk[0..n],
+                args,
+                filter_state,
+                agg_ptr,
+                key_builder,
+            );
+        }
+
+        if (decompress.err) |err| return err;
+        if (decompress.state != .end) return GzipReadError.TruncatedStream;
+        if (hasher.gzip.crc.final() != decompress.container_metadata.gzip.crc) {
+            return GzipReadError.WrongGzipChecksum;
+        }
+        if (hasher.gzip.count != decompress.container_metadata.gzip.count) {
+            return GzipReadError.WrongGzipSize;
+        }
+
+        // Check whether another concatenated gzip member follows.
+        _ = file_reader.interface.peekByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
     }
+
+    if (outBroken(filter_state)) return;
 
     try flushFinalCarry(
         allocator,
@@ -276,12 +345,21 @@ fn processLine(
     key_builder: ?AggregateKeyBuilder,
 ) !void {
     if (!args.aggregate) {
-        filter_state.printIfMatch(line);
+        const Child = @typeInfo(@TypeOf(filter_state)).pointer.child;
+        if (comptime @hasDecl(Child, "printChecked")) {
+            if (filter_state.checkLine(line)) |ck| {
+                recordLevel(filter_state, ck);
+                filter_state.printChecked(ck.line, ck.info);
+            }
+        } else {
+            filter_state.printIfMatch(line);
+        }
         return;
     }
 
     _ = allocator;
     if (filter_state.checkLine(line)) |result| {
+        recordLevel(filter_state, result);
         const builder = key_builder orelse return GzipReadError.MissingAggregateKeyBuilder;
         const agg = aggregator orelse return GzipReadError.MissingAggregator;
 
@@ -975,4 +1053,87 @@ test "processChunk: a line split across chunks is joined, the rest stays in plac
     try testing.expectEqualStrings("partial", sink.printed_lines.items[1]);
     try testing.expectEqualStrings("next", sink.printed_lines.items[2]);
     try testing.expectEqualStrings("remain", sink.printed_lines.items[3]);
+}
+
+/// Encodes `payload` (<= 65535 bytes) as a valid single-member RFC 1952 gzip
+/// stream using a stored DEFLATE block.
+fn appendStoredGzipMember(allocator: std.mem.Allocator, out: *std.ArrayList(u8), payload: []const u8) !void {
+    try out.appendSlice(allocator, &.{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff });
+    const len16: u16 = @intCast(payload.len);
+    const nlen16: u16 = ~len16;
+    try out.append(allocator, 0x01); // BFINAL=1, BTYPE=00 (stored)
+    var le: [2]u8 = undefined;
+    std.mem.writeInt(u16, &le, len16, .little);
+    try out.appendSlice(allocator, &le);
+    std.mem.writeInt(u16, &le, nlen16, .little);
+    try out.appendSlice(allocator, &le);
+    try out.appendSlice(allocator, payload);
+
+    var crc = std.hash.Crc32.init();
+    crc.update(payload);
+    var trailer: [8]u8 = undefined;
+    std.mem.writeInt(u32, trailer[0..4], crc.final(), .little);
+    std.mem.writeInt(u32, trailer[4..8], @truncate(payload.len), .little);
+    try out.appendSlice(allocator, &trailer);
+}
+
+test "readGzip reads concatenated multi-member gzip files completely" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var gz: std.ArrayList(u8) = .empty;
+    defer gz.deinit(testing.allocator);
+    try appendStoredGzipMember(testing.allocator, &gz, "member1-line1\nmember1-part");
+    try appendStoredGzipMember(testing.allocator, &gz, "-joined\nmember2-line2\n");
+
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "multi.log.gz", .data = gz.items });
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/multi.log.gz", .{tmp.sub_path});
+
+    var sink = try CollectingFilterState.init(testing.allocator);
+    defer sink.deinit();
+
+    try readGzip(testing.allocator, path, makeArgs(false, .exact), &sink, null);
+    try testing.expectEqual(@as(usize, 3), sink.printed_lines.items.len);
+    try testing.expectEqualStrings("member1-line1", sink.printed_lines.items[0]);
+    try testing.expectEqualStrings("member1-part-joined", sink.printed_lines.items[1]);
+    try testing.expectEqualStrings("member2-line2", sink.printed_lines.items[2]);
+}
+
+test "readGzip rejects corrupted CRC32, wrong ISIZE, and truncated streams" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var gz: std.ArrayList(u8) = .empty;
+    defer gz.deinit(testing.allocator);
+    try appendStoredGzipMember(testing.allocator, &gz, "hello world\n");
+
+    var path_buf: [128]u8 = undefined;
+
+    // Flip a bit in CRC32 (last 8..-4 bytes).
+    var bad_crc = try testing.allocator.dupe(u8, gz.items);
+    defer testing.allocator.free(bad_crc);
+    bad_crc[bad_crc.len - 8] ^= 0x01;
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "bad_crc.gz", .data = bad_crc });
+    const p1 = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/bad_crc.gz", .{tmp.sub_path});
+    var s1 = try CollectingFilterState.init(testing.allocator);
+    defer s1.deinit();
+    try testing.expectError(GzipReadError.WrongGzipChecksum, readGzip(testing.allocator, p1, makeArgs(false, .exact), &s1, null));
+
+    // Flip a bit in ISIZE (last 4 bytes).
+    var bad_sz = try testing.allocator.dupe(u8, gz.items);
+    defer testing.allocator.free(bad_sz);
+    bad_sz[bad_sz.len - 1] ^= 0x01;
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "bad_sz.gz", .data = bad_sz });
+    const p2 = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/bad_sz.gz", .{tmp.sub_path});
+    var s2 = try CollectingFilterState.init(testing.allocator);
+    defer s2.deinit();
+    try testing.expectError(GzipReadError.WrongGzipSize, readGzip(testing.allocator, p2, makeArgs(false, .exact), &s2, null));
+
+    // Truncate before the footer finishes.
+    try tmp.dir.writeFile(debug_io, .{ .sub_path = "trunc.gz", .data = gz.items[0 .. gz.items.len - 4] });
+    const p3 = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/trunc.gz", .{tmp.sub_path});
+    var s3 = try CollectingFilterState.init(testing.allocator);
+    defer s3.deinit();
+    try testing.expectError(GzipReadError.TruncatedStream, readGzip(testing.allocator, p3, makeArgs(false, .exact), &s3, null));
 }

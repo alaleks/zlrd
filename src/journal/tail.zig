@@ -117,19 +117,24 @@ pub const Watcher = struct {
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = std.posix.poll(&pfd, @intCast(self.opts.poll_interval_ms)) catch return .stop;
+            const timeout_ms: i32 = @intCast(@min(self.opts.poll_interval_ms, std.math.maxInt(i32)));
+            const ready = std.posix.poll(&pfd, timeout_ms) catch return .stop;
             if (ready == 0) continue;
             // POLLHUP/POLLERR mean the fd is unusable — exit instead of
             // spinning on a dead descriptor.
             if ((pfd[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) return .stop;
             if ((pfd[0].revents & std.posix.POLL.IN) == 0) continue;
 
-            const n = std.posix.read(@intCast(self.inotify_fd), &buf) catch return .stop;
+            const n = std.posix.read(@intCast(self.inotify_fd), &buf) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return .stop,
+            };
             if (n == 0) continue;
 
             // Walk the event packet. Any DELETE/MOVE wins over a plain
             // MODIFY — rotation needs the caller's full attention.
             var reason: WakeReason = .modified;
+            var check_path = false;
             var off: usize = 0;
             const hdr_sz = @sizeOf(linux.inotify_event);
             while (off + hdr_sz <= n) {
@@ -140,13 +145,33 @@ pub const Watcher = struct {
                 // The watch is gone (file deleted, or the fs unmounted).
                 // Staying here would just spin on poll timeouts forever.
                 if ((mask & (linux.IN.IGNORED | linux.IN.UNMOUNT)) != 0) reason = .deleted;
-                // The kernel dropped events we never saw. We don't know what
-                // was missed, so report the recoverable one and let the
-                // caller re-read from its parked position.
-                if ((mask & linux.IN.Q_OVERFLOW) != 0 and reason == .modified) {
-                    log.warn("inotify queue overflow watching {s}", .{self.opts.path});
+                // On Linux, unlinking or atomically replacing a file while
+                // another FD (our Reader) keeps its inode open suppresses
+                // `IN_DELETE_SELF` and only delivers `IN_ATTRIB` (link count
+                // dropped to 0). Queue overflow can also drop `IN_MOVE_SELF`.
+                // Re-stat the path to catch both without deadlocking.
+                if ((mask & linux.IN.ATTRIB) != 0) check_path = true;
+                if ((mask & linux.IN.Q_OVERFLOW) != 0) {
+                    check_path = true;
+                    if (reason == .modified) {
+                        log.warn("inotify queue overflow watching {s}", .{self.opts.path});
+                    }
                 }
                 off += hdr_sz + ev_ptr.len;
+            }
+            if (reason == .modified and check_path) {
+                const st = self.opts.dir.statFile(self.io, self.opts.path, .{}) catch return .deleted;
+                if (self.last_inode) |prev| {
+                    if (st.inode != prev) {
+                        self.observe(st);
+                        return .rotated;
+                    }
+                }
+                if (st.size < self.last_size) {
+                    self.observe(st);
+                    return .rotated;
+                }
+                self.observe(st);
             }
             return reason;
         }

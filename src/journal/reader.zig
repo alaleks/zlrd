@@ -247,6 +247,9 @@ pub const Reader = struct {
         }
 
         const fill: usize = @intCast(@min(@as(u64, self.window.len), self.file_size - pos));
+        // Invalidate before reading so a partial-read error cannot leave the
+        // old window range pointing at overwritten bytes.
+        self.window_len = 0;
         const n = self.file.readPositionalAll(self.io, self.window[0..fill], pos) catch return error.IoError;
         self.window_pos = pos;
         self.window_len = n;
@@ -435,6 +438,10 @@ pub const Iterator = struct {
     fn loadArray(self: *Iterator) Error!void {
         var head_buf: [@sizeOf(fmt.EntryArrayHead)]u8 = undefined;
         try self.reader.readAt(self.array_offset, &head_buf);
+        // Fresh links come from the OS page cache; drop the speculative read
+        // window so newly written objects inside a pre-allocated arena cannot
+        // be served as stale zeros from an earlier fill.
+        self.reader.window_len = 0;
         const head = std.mem.bytesAsValue(fmt.EntryArrayHead, &head_buf).*;
 
         if (head.object.type != @backingInt(fmt.ObjectType.entry_array)) return error.InvalidObjectType;
@@ -491,7 +498,13 @@ pub const Iterator = struct {
         std.debug.assert(count > 0);
         const pos = self.array_offset + @sizeOf(fmt.EntryArrayHead) + index * self.array_item_sz;
         const len: usize = @intCast(count * self.array_item_sz);
+        // Invalidate both caches: the item window before writing into it (in
+        // case `readAt` fails after a partial write), and `reader.window` so
+        // entry/data objects linked by these newly read slots cannot hit stale
+        // zeros cached from a pre-allocated tail.
+        self.item_window_count = 0;
         try self.reader.readAt(pos, self.item_window[0..len]);
+        self.reader.window_len = 0;
         self.item_window_array = self.array_offset;
         self.item_window_first = index;
         self.item_window_count = count;
@@ -2699,4 +2712,61 @@ test "rejected compressed fields do not consume entry arena storage" {
         _ = scratch.reset(.retain_capacity);
         try testing.expect((try it.readDataField(entry_allocator.allocator(), scratch.allocator(), d, false)) == null);
     }
+}
+
+test "live append across item_window refill does not hit stale pre-allocated zeros in Reader.window" {
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    // Build an entry array with 65 slots (> 64-item non-compact window) where
+    // slots 0..63 point to `e0` and slot 64 starts empty (0).
+    const d0 = try b.writeData("MESSAGE=first");
+    const e0 = try b.writeEntry(1, 100, &.{d0});
+    var slots: [65]u64 = @splat(0);
+    for (slots[0..64]) |*s| s.* = e0;
+    const arr = try b.writeEntryArray(&slots);
+    b.patchHeaderEntryArray(arr);
+
+    // Pre-allocate 8 KiB of trailing zero arena space (like journald's fallocate)
+    // so reading `e0` caches those trailing zeros inside `Reader.window`.
+    const tail_off = b.bytes.items.len;
+    try b.bytes.appendNTimes(testing.allocator, 0, 8192);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "prealloc.journal");
+
+    var r = try Reader.open(debug_io, tmp.dir, "prealloc.journal");
+    defer r.deinit();
+    var it = r.iterator();
+
+    // Drain slots 0..63: fills Reader.window across `e0` and into the zeros at `tail_off`.
+    for (0..64) |_| {
+        var e = (try it.next(testing.allocator)).?;
+        defer e.deinit();
+        try testing.expectEqualStrings("first", e.get("MESSAGE").?);
+    }
+
+    // Concurrently append entry #64 + its DATA into the pre-allocated zero region
+    // and link slot 64 on disk, WITHOUT calling `refresh()`.
+    b.bytes.items.len = tail_off;
+    const d64 = try b.writeData("MESSAGE=live_after_window");
+    const e64 = try b.writeEntry(65, 200, &.{d64});
+    const new_bytes = b.bytes.items[tail_off..];
+    {
+        const w = try tmp.dir.openFile(debug_io, "prealloc.journal", .{ .mode = .read_write });
+        defer w.close(debug_io);
+        try w.writePositionalAll(debug_io, new_bytes, tail_off);
+        var slot64: [8]u8 = undefined;
+        std.mem.writeInt(u64, &slot64, e64, .little);
+        try w.writePositionalAll(debug_io, &slot64, arr + @sizeOf(fmt.EntryArrayHead) + 64 * 8);
+    }
+
+    // Slot 64 triggers `fillItemWindow`, which must invalidate `Reader.window`
+    // so reading `e64`/`d64` sees the newly written bytes instead of stale zeros.
+    var e_live = (try it.next(testing.allocator)).?;
+    defer e_live.deinit();
+    try testing.expectEqual(@as(u64, 65), e_live.seqnum);
+    try testing.expectEqualStrings("live_after_window", e_live.get("MESSAGE").?);
 }

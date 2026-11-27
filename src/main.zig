@@ -357,9 +357,9 @@ fn processFiles(
     th: *const reader.Theme,
 ) !void {
     if (parsed_args.tail_mode) {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        try reader.readLogs(arena.allocator(), parsed_args, th, null);
+        // Tail runs indefinitely; passing a forever-lived ArenaAllocator would
+        // retain every batch allocation until OOM.
+        try reader.readLogs(allocator, parsed_args, th, null);
         return;
     }
 

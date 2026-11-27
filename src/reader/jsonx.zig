@@ -65,6 +65,10 @@ pub fn validate(src: []const u8, limits: Limits) ?usize {
     if (src[0] != '{' and src[0] != '[') return null;
 
     const scan_len = @min(src.len, limits.max_bytes);
+    // Stack of expected closing delimiters (`}` or `]`), bounded by `max_depth`
+    // (u8 <= 255). Rejecting mismatched closers and `:` directly inside `[...]`
+    // prevents malformed inputs from trapping `Writer.container`.
+    var expected_close: [256]u8 = undefined;
     var depth: u8 = 0;
     var i: usize = 0;
     var in_string = false;
@@ -89,10 +93,11 @@ pub fn validate(src: []const u8, limits: Limits) ?usize {
             '"' => in_string = true,
             '{', '[' => {
                 if (depth == limits.max_depth) return null;
+                expected_close[depth] = if (c == '{') '}' else ']';
                 depth += 1;
             },
             '}', ']' => {
-                if (depth == 0) return null;
+                if (depth == 0 or expected_close[depth - 1] != c) return null;
                 depth -= 1;
                 if (depth == 0) {
                     const len = i + 1;
@@ -100,7 +105,10 @@ pub fn validate(src: []const u8, limits: Limits) ?usize {
                     return len;
                 }
             },
-            ':' => pairs += 1,
+            ':' => {
+                if (depth == 0 or expected_close[depth - 1] != '}') return null;
+                pairs += 1;
+            },
             ',', ' ', '\t', '\r', '\n' => {},
             '-', '+', '.', '0'...'9' => {},
             'a'...'z', 'A'...'Z' => {}, // true / false / null (and slop)
@@ -326,6 +334,7 @@ fn Writer(comptime Out: type) type {
             var first = true;
 
             while (i < src.len and src[i] != close) {
+                const prev = i;
                 if (!first) {
                     self.punct(",");
                     if (flat) self.out.write(" ");
@@ -353,6 +362,9 @@ fn Writer(comptime Out: type) type {
                 i = self.value(src, i, depth + 1, value_col);
                 i = skipWs(src, i);
                 if (i < src.len and src[i] == ',') i = skipWs(src, i + 1);
+                // Guarantee termination even if called directly on malformed
+                // input without running `validate` first.
+                if (i <= prev) break;
             }
 
             if (!flat and !first) self.newline(depth);
@@ -720,5 +732,22 @@ test "writeBlock terminates on every prefix of a valid document" {
         defer sink.deinit();
         const th = theme.Theme.plain;
         writeBlock(&sink, &th, full[0..i], .{});
+    }
+}
+
+test "validate rejects mismatched delimiters and colons inside arrays, and writeBlock terminates" {
+    const malformed = [_][]const u8{
+        "{\"a\":[1:2,34]}",
+        "{\"a\":[1,2,3}}",
+        "[a:1,b:2,c:3]",
+        "{\"a\":{1,2,3]]",
+    };
+    const th = theme.Theme.plain;
+    for (malformed) |src| {
+        try testing.expectEqual(@as(?usize, null), validate(src, .{}));
+        // Even if called directly bypassing `validate`, `writeBlock` must never hang.
+        var sink = TestSink{};
+        defer sink.deinit();
+        writeBlock(&sink, &th, src, .{});
     }
 }

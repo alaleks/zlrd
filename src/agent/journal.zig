@@ -292,7 +292,12 @@ pub const JournalSource = struct {
     /// Logged once, so a run of long entries does not flood the log.
     overflow_logged: bool = false,
     stop_flag: std.atomic.Value(bool),
-    child: ?std.process.Child = null,
+    /// Guards `child_pid` publication between `spawnAndRead` and `requestStop`.
+    /// Only `spawnAndRead` owns the `std.process.Child` handle and closes/reaps
+    /// it; `requestStop` only signals the PID so it can never close `stdout`
+    /// while the worker is reading from it or double-wait after `kill`.
+    child_mu: std.Io.Mutex = .init,
+    child_pid: ?std.process.Child.Id = null,
     /// Crashes for this `--journal-unit` binding, across every unit its
     /// pattern matches. Kept here rather than per tracker: the store keys
     /// counts by binding name, and two instances of `worker@*.service` each
@@ -337,16 +342,16 @@ pub const JournalSource = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.trackers.deinit(self.allocator);
-        if (self.child) |*c| {
-            c.kill(self.io);
-            _ = c.wait(self.io) catch {};
-            self.child = null;
-        }
     }
 
     pub fn requestStop(self: *JournalSource) void {
-        self.stop_flag.store(true, .monotonic);
-        if (self.child) |*c| c.kill(self.io);
+        self.stop_flag.store(true, .release);
+        self.child_mu.lockUncancelable(self.io);
+        const pid = self.child_pid;
+        self.child_mu.unlock(self.io);
+        if (comptime builtin.os.tag != .windows) {
+            if (pid) |p| std.posix.kill(p, .TERM) catch {};
+        }
     }
 
     /// Blocks until `requestStop` is called or the data source ends. Prefers
@@ -376,17 +381,24 @@ pub const JournalSource = struct {
         var path = try self.allocator.dupe(u8, initial_path);
         defer self.allocator.free(path);
 
-        while (!self.stop_flag.load(.monotonic)) {
-            const continue_tail = self.tailOneFile(path) catch |err| {
+        var seek_to_end = true;
+        while (!self.stop_flag.load(.acquire)) {
+            const continue_tail = self.tailOneFile(path, seek_to_end) catch |err| {
                 log.warn("native tail of {s} failed: {t}; falling back to journalctl", .{ path, err });
                 try self.spawnAndRead();
                 return;
             };
             if (!continue_tail) return;
+            // After rotation, read the freshly created file from its start so
+            // entries written before we opened it are not skipped.
+            seek_to_end = false;
 
-            // Rotation: rediscover the current `system.journal` and loop.
-            const fresh = native.source.findActiveJournalPath(self.allocator, self.io) catch |err| {
-                log.warn("journal source '{s}' lost active file after rotation: {t}", .{ self.name, err });
+            // Rotation: journald renames `system.journal` aside before creating
+            // and initializing the new one, so retry briefly before giving up.
+            const fresh = self.rediscoverActiveJournal() orelse {
+                if (self.stop_flag.load(.acquire)) return;
+                log.warn("journal source '{s}' lost active file after rotation; falling back to journalctl", .{self.name});
+                try self.spawnAndRead();
                 return;
             };
             self.allocator.free(path);
@@ -395,19 +407,39 @@ pub const JournalSource = struct {
         }
     }
 
+    fn rediscoverActiveJournal(self: *JournalSource) ?[]u8 {
+        var attempt: usize = 0;
+        while (attempt < 20 and !self.stop_flag.load(.acquire)) : (attempt += 1) {
+            if (native.source.findActiveJournalPath(self.allocator, self.io)) |fresh| {
+                return fresh;
+            } else |_| {}
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .awake) catch return null;
+        }
+        return null;
+    }
+
+    fn drainNativeEntries(self: *JournalSource, it: *native.Iterator, scratch: *std.heap.ArenaAllocator) !void {
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            const entry = try it.next(scratch.allocator()) orelse break;
+            var e = entry;
+            defer e.deinit();
+            self.handleNativeEntry(&e);
+        }
+    }
+
     /// Tails `path` until rotation or shutdown. Returns true if rotation
     /// happened (caller should rediscover and retry), false if the loop
     /// exited cleanly (stop requested).
-    fn tailOneFile(self: *JournalSource, path: []const u8) !bool {
+    fn tailOneFile(self: *JournalSource, path: []const u8, seek_to_end: bool) !bool {
         var r = try native.Reader.open(self.io, std.Io.Dir.cwd(), path);
         defer r.deinit();
 
         var it = r.iterator();
-        // Bulk-skip existing entries without resolving each entry's fields.
-        // `seekToEnd` walks just the entry-array chain headers (no data
-        // payload reads, no LZ4 decode, no per-entry arena), so even a
-        // multi-GB journal is past in tens of milliseconds.
-        try it.seekToEnd();
+        // Bulk-skip existing entries on initial attach without resolving each
+        // entry's fields. On post-rotation reopens we read from offset 0 so
+        // early entries in the new file are never missed.
+        if (seek_to_end) try it.seekToEnd();
 
         // The five fields `handleNativeEntry` reads. A journald entry carries
         // roughly twenty-five, and resolving the rest costs an arena bump
@@ -438,23 +470,44 @@ pub const JournalSource = struct {
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
 
-        while (!self.stop_flag.load(.monotonic)) {
+        // Close the open-vs-watch TOCTOU window: if journald rotated `path`
+        // between `Reader.open` and `Watcher.init`, drain what the old inode
+        // still has and tell the caller to reopen the replacement file.
+        if (r.file.stat(self.io)) |fd_stat| {
+            if (watcher.last_inode) |watch_inode| {
+                if (fd_stat.inode != watch_inode) {
+                    if (it.refresh()) |_| {
+                        self.drainNativeEntries(&it, &scratch) catch {};
+                    } else |_| {}
+                    return true;
+                }
+            }
+        } else |_| {}
+
+        // After rotation, drain any entries already written before we attached
+        // the watcher rather than waiting for the next modification event.
+        if (!seek_to_end) {
+            try self.drainNativeEntries(&it, &scratch);
+        }
+
+        while (!self.stop_flag.load(.acquire)) {
             switch (watcher.waitForChange(&self.stop_flag)) {
                 .stop => return false,
-                .rotated, .deleted => return true,
+                .rotated, .deleted => {
+                    // Drain final entries written to the archived inode right
+                    // before rotation while our FD still points to it.
+                    if (it.refresh()) |_| {
+                        self.drainNativeEntries(&it, &scratch) catch {};
+                    } else |_| {}
+                    return true;
+                },
                 .modified => {},
             }
             it.refresh() catch |err| {
                 log.warn("journal source '{s}' refresh failed: {t}", .{ self.name, err });
                 continue;
             };
-            while (true) {
-                _ = scratch.reset(.retain_capacity);
-                const entry = try it.next(scratch.allocator()) orelse break;
-                var e = entry;
-                defer e.deinit();
-                self.handleNativeEntry(&e);
-            }
+            try self.drainNativeEntries(&it, &scratch);
         }
         return false;
     }
@@ -551,7 +604,8 @@ pub const JournalSource = struct {
             "--since",
             "now",
         };
-        const child = std.process.spawn(self.io, .{
+        if (self.stop_flag.load(.acquire)) return;
+        var child = std.process.spawn(self.io, .{
             .argv = &argv,
             .stdout = .pipe,
             .stderr = .ignore,
@@ -560,7 +614,20 @@ pub const JournalSource = struct {
             log.warn("spawn journalctl failed for '{s}': {t}", .{ self.name, err });
             return;
         };
-        self.child = child;
+        defer {
+            self.child_mu.lockUncancelable(self.io);
+            self.child_pid = null;
+            self.child_mu.unlock(self.io);
+            // `Child.kill` kills (if still alive), reaps, and closes stdio fds
+            // idempotently — never follow it with `Child.wait`.
+            child.kill(self.io);
+        }
+        {
+            self.child_mu.lockUncancelable(self.io);
+            defer self.child_mu.unlock(self.io);
+            if (self.stop_flag.load(.acquire)) return;
+            self.child_pid = child.id;
+        }
         const stdout = child.stdout orelse {
             log.warn("journalctl stdout pipe missing", .{});
             return;
@@ -570,7 +637,7 @@ pub const JournalSource = struct {
         var carry: std.ArrayList(u8) = .empty;
         defer carry.deinit(self.allocator);
 
-        while (!self.stop_flag.load(.monotonic)) {
+        while (!self.stop_flag.load(.acquire)) {
             const n = stdout.readStreaming(self.io, &.{&buf}) catch |err| {
                 if (err == error.EndOfStream) break;
                 log.warn("read from journalctl failed: {t}", .{err});
@@ -615,6 +682,7 @@ pub const JournalSource = struct {
                 carry.clearRetainingCapacity();
             } else {
                 self.noteOverflow();
+                self.line_overflow = false; // the newline is right here
                 carry.clearRetainingCapacity();
             }
             i = nl + 1;
@@ -1209,4 +1277,32 @@ test "a pid in the text wins over nothing, _PID wins over the text" {
     defer freeRecords(rs);
     try testing.expectEqual(@as(usize, 1), rs.len);
     try testing.expectEqual(@as(i64, 34), field(rs[0], "pid").integer);
+}
+
+test "processChunk: split newline-terminated overflow does not drop the next valid entry" {
+    var h: Harness = undefined;
+    try h.init("api.service");
+    defer h.deinit();
+
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(testing.allocator);
+
+    // Chunk 1 fits in max_line_bytes with no newline; chunk 2 pushes the total
+    // over max_line_bytes AND terminates the oversized line with `\n`, followed
+    // immediately by a valid crash entry.
+    const part1 = try testing.allocator.alloc(u8, max_line_bytes - 16);
+    defer testing.allocator.free(part1);
+    @memset(part1, 'A');
+    try h.src.processChunk(&carry, part1);
+
+    const part2 = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n" ++
+        "{\"_SYSTEMD_UNIT\":\"api.service\",\"MESSAGE\":\"panic: survived overflow\",\"_PID\":\"99\"}\n" ++
+        "{\"SYSLOG_IDENTIFIER\":\"systemd\",\"UNIT\":\"api.service\",\"MESSAGE\":\"api.service: Failed with result 'exit-code'.\"}\n";
+    try h.src.processChunk(&carry, part2);
+
+    try testing.expect(!h.src.line_overflow);
+    const rs = try h.records();
+    defer freeRecords(rs);
+    try testing.expectEqual(@as(usize, 1), rs.len);
+    try testing.expectEqual(@as(i64, 99), field(rs[0], "pid").integer);
 }
