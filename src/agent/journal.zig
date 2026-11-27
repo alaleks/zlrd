@@ -491,7 +491,14 @@ pub const JournalSource = struct {
         }
 
         while (!self.stop_flag.load(.acquire)) {
-            switch (watcher.waitForChange(&self.stop_flag)) {
+            const wake = if (self.hasPendingTraces())
+                watcher.waitForChangeTimeout(&self.stop_flag, @intCast(service.default_trace_flush_ms)) orelse {
+                    self.tickAll(std.Io.Timestamp.now(self.io, .real).toMilliseconds());
+                    continue;
+                }
+            else
+                watcher.waitForChange(&self.stop_flag);
+            switch (wake) {
                 .stop => return false,
                 .rotated, .deleted => {
                     // Drain final entries written to the archived inode right
@@ -508,6 +515,14 @@ pub const JournalSource = struct {
                 continue;
             };
             try self.drainNativeEntries(&it, &scratch);
+        }
+        return false;
+    }
+
+    fn hasPendingTraces(self: *const JournalSource) bool {
+        var it = self.trackers.valueIterator();
+        while (it.next()) |t| {
+            if (t.*.state == .crash_collecting) return true;
         }
         return false;
     }
@@ -638,6 +653,20 @@ pub const JournalSource = struct {
         defer carry.deinit(self.allocator);
 
         while (!self.stop_flag.load(.acquire)) {
+            if (comptime builtin.os.tag != .windows) {
+                if (self.hasPendingTraces()) {
+                    var pfd = [_]std.posix.pollfd{.{
+                        .fd = stdout.handle,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    const ready = std.posix.poll(&pfd, @intCast(service.default_trace_flush_ms)) catch 1;
+                    if (ready == 0) {
+                        self.tickAll(std.Io.Timestamp.now(self.io, .real).toMilliseconds());
+                        continue;
+                    }
+                }
+            }
             const n = stdout.readStreaming(self.io, &.{&buf}) catch |err| {
                 if (err == error.EndOfStream) break;
                 log.warn("read from journalctl failed: {t}", .{err});

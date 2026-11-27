@@ -99,13 +99,18 @@ pub fn computeBoundaries(
 
     var probe: [probe_bytes]u8 = undefined;
     var split: u64 = chunk_bytes;
-    while (split < source.size) : (split += chunk_bytes) {
+    while (split < source.size) {
         if (try lineStartAtOrAfter(source, split, max_line_bytes, &probe)) |b| {
             // Zero-length chunks help nobody, and a boundary that lands on
             // the end of the file is the end of the file.
             if (b > bounds.items[bounds.items.len - 1] and b < source.size) {
                 try bounds.append(allocator, b);
             }
+            split = @max(split + chunk_bytes, b);
+        } else {
+            // `lineStartAtOrAfter` proved there is no `\n` in `[split, split + max_line_bytes)`,
+            // so jump past the already-scanned span rather than re-reading it.
+            split += @max(chunk_bytes, max_line_bytes);
         }
     }
 

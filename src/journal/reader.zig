@@ -697,8 +697,11 @@ pub const Iterator = struct {
         if (payload_len == 0) return error.InvalidField;
         if (payload_len > max_data_payload_bytes) return error.PayloadTooLarge;
 
-        // Bytes of the payload the speculative read already captured.
-        const probed = if (got.len > payload_start) got[payload_start..] else got[got.len..];
+        // Bytes of the payload the speculative read already captured, clamped
+        // to `payload_len` so an object missing `=` cannot scan into adjacent
+        // objects during the early field-filter check below.
+        const probed_all = if (got.len > payload_start) got[payload_start..] else got[got.len..];
+        const probed = probed_all[0..@min(probed_all.len, payload_len)];
 
         const shared = head.n_entries > 1;
 
@@ -2769,4 +2772,28 @@ test "live append across item_window refill does not hit stale pre-allocated zer
     defer e_live.deinit();
     try testing.expectEqual(@as(u64, 65), e_live.seqnum);
     try testing.expectEqualStrings("live_after_window", e_live.get("MESSAGE").?);
+}
+
+test "readDataField with field_filter does not scan '=' past payload_len into adjacent object" {
+    var b = SyntheticBuilder.init(testing.allocator);
+    defer b.deinit();
+    try b.writeHeader(0);
+
+    // First DATA object is corrupt (no '='), followed immediately by a valid
+    // DATA object containing '=' well within the 512-byte speculative probe.
+    const bad = try b.writeData("CORRUPT");
+    _ = try b.writeData("PRIORITY=6");
+    const e = try b.writeEntry(1, 100, &.{bad});
+    const arr = try b.writeEntryArray(&.{e});
+    b.patchHeaderEntryArray(arr);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try b.write(tmp.dir, "bleed.journal");
+
+    var r = try Reader.open(debug_io, tmp.dir, "bleed.journal");
+    defer r.deinit();
+    var it = r.iterator();
+    it.setFieldFilter(&.{"MESSAGE"});
+    try testing.expectError(error.InvalidField, it.next(testing.allocator));
 }

@@ -146,14 +146,17 @@ fn findLastNMatchingStart(
             const got = try readAt(f.fd, pos, scan_buf[0..want]);
             if (got == 0) break;
             const chunk = scan_buf[0..got];
+            filter_state.beginChunk(chunk);
 
             var seg_start: usize = 0;
             while (simd.findByte(chunk, seg_start, '\n')) |nl| {
                 // Fast path: a line contained entirely in this chunk needs no
                 // copy. Only a line split across chunks goes through `carry`.
-                const line = if (carry.items.len == 0) chunk[seg_start..nl] else blk: {
+                const used_carry = carry.items.len > 0;
+                const line = if (!used_carry) chunk[seg_start..nl] else blk: {
                     try ensureLineCapacity(carry.items.len, nl - seg_start);
                     try carry.appendSlice(allocator, chunk[seg_start..nl]);
+                    filter_state.beginChunk(carry.items);
                     break :blk carry.items;
                 };
                 if (line.len > 0 and filter_state.checkLine(line) != null) {
@@ -161,7 +164,10 @@ fn findLastNMatchingStart(
                     head = (head + 1) % n;
                     matches += 1;
                 }
-                carry.clearRetainingCapacity();
+                if (used_carry) {
+                    carry.clearRetainingCapacity();
+                    filter_state.beginChunk(chunk[nl + 1 ..]);
+                }
                 seg_start = nl + 1;
                 line_off = pos + seg_start;
             }
@@ -175,10 +181,13 @@ fn findLastNMatchingStart(
 
         // A final line with no trailing newline still counts — `readLastNLines`
         // prints it too, via `flush_final_line`.
-        if (carry.items.len > 0 and filter_state.checkLine(carry.items) != null) {
-            ring[head] = line_off;
-            head = (head + 1) % n;
-            matches += 1;
+        if (carry.items.len > 0) {
+            filter_state.beginChunk(carry.items);
+            if (filter_state.checkLine(carry.items) != null) {
+                ring[head] = line_off;
+                head = (head + 1) % n;
+                matches += 1;
+            }
         }
 
         if (matches >= n) return ring[head];
@@ -415,7 +424,7 @@ pub fn follow(
             if (bytes_read > 0) any_read = true;
         }
 
-        if (any_read) {
+        if (any_read or out.len > 0) {
             out.flush();
             // Downstream went away (`| head`, pager quit). Stop rather than
             // formatting output nobody will read until we are killed.
@@ -451,9 +460,13 @@ fn followRotation(
 
     try readToEOFInternal(allocator, f, args, filter_state, carry, buf, true, shared_agg);
     const fresh = try std.Io.Dir.cwd().openFile(tail_io, f.path, .{});
+    errdefer fresh.close(tail_io);
+    // Stat the opened FD itself so a second rotation during drain cannot leave
+    // `f.inode` holding the stale pre-drain inode.
+    const fresh_stat = try fresh.stat(tail_io);
     f.fd.close(tail_io);
     f.fd = fresh;
-    f.inode = st.inode;
+    f.inode = fresh_stat.inode;
     f.position = 0;
     f.head_len = 0;
     f.discard_until_nl = false;

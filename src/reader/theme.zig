@@ -456,8 +456,9 @@ fn detectMode(env: Env) Mode {
     }
 
     const term = env.term orelse {
-        // No TERM at all: on Windows that is normal and VT is available;
-        // elsewhere it means we know nothing, so stay conservative.
+        // CI log viewers (GitHub Actions, GitLab) render truecolor even when
+        // TERM is unset, and Windows VT consoles support truecolor directly.
+        if (env.ci) return .truecolor;
         return if (builtin.os.tag == .windows) .truecolor else .ansi16;
     };
 
@@ -474,17 +475,29 @@ fn detectMode(env: Env) Mode {
     return .ansi16;
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 fn detectGlyphs(env: Env) Glyphs {
     if (env.wt_session) return Glyphs.unicode;
     // A UTF-8 locale is the portable signal that box-drawing will render.
     if (env.lang) |l| {
-        if (std.mem.indexOf(u8, l, "UTF-8") != null or
-            std.mem.indexOf(u8, l, "utf8") != null or
-            std.mem.indexOf(u8, l, "UTF8") != null) return Glyphs.unicode;
+        if (containsIgnoreCase(l, "utf-8") or containsIgnoreCase(l, "utf8")) return Glyphs.unicode;
     }
     // macOS terminals are UTF-8 unconditionally even with LANG unset.
     if (builtin.os.tag == .macos) return Glyphs.unicode;
     return Glyphs.ascii;
+}
+
+fn nonEmptyEnv(val: ?[]const u8) ?[]const u8 {
+    const s = val orelse return null;
+    return if (s.len > 0) s else null;
 }
 
 /// Gathers `Env` from the process environment map handed to `main`.
@@ -496,7 +509,7 @@ pub fn fromMap(map: *const std.process.Environ.Map, is_tty: bool) Env {
         .colorterm = map.get("COLORTERM"),
         .wt_session = map.get("WT_SESSION") != null,
         .ci = map.get("CI") != null,
-        .lang = map.get("LC_ALL") orelse map.get("LC_CTYPE") orelse map.get("LANG"),
+        .lang = nonEmptyEnv(map.get("LC_ALL")) orelse nonEmptyEnv(map.get("LC_CTYPE")) orelse nonEmptyEnv(map.get("LANG")),
         .is_tty = is_tty,
         .colorfgbg = map.get("COLORFGBG"),
         .zlrd_theme = map.get("ZLRD_THEME"),
@@ -813,4 +826,18 @@ test "foreground colours stay distinguishable within a palette" {
             }
         }
     }
+}
+
+test "CI without TERM resolves to truecolor and lowercase utf-8 / empty LC_ALL resolve unicode" {
+    try testing.expectEqual(Mode.truecolor, resolve(.{ .ci = true, .term = null }, .always, .auto).mode);
+    try testing.expectEqualStrings("│", resolve(.{ .is_tty = true, .lang = "C.utf-8" }, .auto, .auto).glyphs.bar);
+    try testing.expectEqualStrings("│", resolve(.{ .is_tty = true, .lang = "en_US.utf-8" }, .auto, .auto).glyphs.bar);
+
+    var map = std.process.Environ.Map.init(testing.allocator);
+    defer map.deinit();
+    try map.put("LC_ALL", "");
+    try map.put("LC_CTYPE", "");
+    try map.put("LANG", "en_US.utf-8");
+    const env = fromMap(&map, true);
+    try testing.expectEqualStrings("en_US.utf-8", env.lang.?);
 }

@@ -72,6 +72,10 @@ pub fn validate(src: []const u8, limits: Limits) ?usize {
     var depth: u8 = 0;
     var i: usize = 0;
     var in_string = false;
+    // True right after `{` or after `,` inside an object: the next
+    // non-whitespace token must be a quoted key (or `}` for an empty object).
+    // Rejects Go structs / JS maps like `{host: web01, port: 8080}`.
+    var expect_key = false;
     // A structural `:` is what separates a real object from `{}` or a
     // brace-wrapped fragment of prose.
     var pairs: usize = 0;
@@ -89,12 +93,28 @@ pub fn validate(src: []const u8, limits: Limits) ?usize {
             if (c < 0x20) return null;
             continue;
         }
+        if (expect_key) {
+            switch (c) {
+                ' ', '\t', '\r', '\n' => continue,
+                '"' => {
+                    in_string = true;
+                    expect_key = false;
+                    continue;
+                },
+                '}' => {
+                    // Valid for empty `{}`; fall through to closing check.
+                    expect_key = false;
+                },
+                else => return null,
+            }
+        }
         switch (c) {
             '"' => in_string = true,
             '{', '[' => {
                 if (depth == limits.max_depth) return null;
                 expected_close[depth] = if (c == '{') '}' else ']';
                 depth += 1;
+                expect_key = (c == '{');
             },
             '}', ']' => {
                 if (depth == 0 or expected_close[depth - 1] != c) return null;
@@ -109,7 +129,10 @@ pub fn validate(src: []const u8, limits: Limits) ?usize {
                 if (depth == 0 or expected_close[depth - 1] != '}') return null;
                 pairs += 1;
             },
-            ',', ' ', '\t', '\r', '\n' => {},
+            ',' => {
+                if (depth > 0 and expected_close[depth - 1] == '}') expect_key = true;
+            },
+            ' ', '\t', '\r', '\n' => {},
             '-', '+', '.', '0'...'9' => {},
             'a'...'z', 'A'...'Z' => {}, // true / false / null (and slop)
             else => return null,
@@ -750,4 +773,10 @@ test "validate rejects mismatched delimiters and colons inside arrays, and write
         defer sink.deinit();
         writeBlock(&sink, &th, src, .{});
     }
+}
+
+test "validate rejects unquoted-key Go structs and JS object literals" {
+    try testing.expectEqual(@as(?usize, null), validate("{host: web01, port: 8080}", .{}));
+    try testing.expectEqual(@as(?usize, null), validate("{\"host\":\"web01\", port: 8080}", .{}));
+    try testing.expectEqual(@as(?Span, null), find("INFO cfg={host: web01, port: 8080}", 0, .{}));
 }

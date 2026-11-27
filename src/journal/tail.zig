@@ -101,15 +101,27 @@ pub const Watcher = struct {
     /// `.deleted` when the file moved or disappeared (caller should reopen),
     /// `.stop` when shut down.
     pub fn waitForChange(self: *Watcher, stop_flag: *StopFlag) WakeReason {
-        if (builtin.os.tag == .linux and self.inotify_fd >= 0) {
-            return self.waitInotify(stop_flag);
-        }
-        return self.waitPolling(stop_flag);
+        return self.waitForChangeInner(stop_flag, null).?;
     }
 
-    fn waitInotify(self: *Watcher, stop_flag: *StopFlag) WakeReason {
+    /// Like `waitForChange`, but returns `null` if no change arrives within
+    /// `timeout_ms` milliseconds so callers can run periodic timers (such as
+    /// flushing pending crash traces when a journal goes quiet).
+    pub fn waitForChangeTimeout(self: *Watcher, stop_flag: *StopFlag, timeout_ms: u32) ?WakeReason {
+        return self.waitForChangeInner(stop_flag, timeout_ms);
+    }
+
+    fn waitForChangeInner(self: *Watcher, stop_flag: *StopFlag, max_wait_ms: ?u32) ?WakeReason {
+        if (builtin.os.tag == .linux and self.inotify_fd >= 0) {
+            return self.waitInotify(stop_flag, max_wait_ms);
+        }
+        return self.waitPolling(stop_flag, max_wait_ms);
+    }
+
+    fn waitInotify(self: *Watcher, stop_flag: *StopFlag, max_wait_ms: ?u32) ?WakeReason {
         const linux = std.os.linux;
         var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
+        var remaining_ms = max_wait_ms;
         while (!stop_flag.load(.acquire)) {
             // poll() with a timeout lets the loop honor stop_flag.
             var pfd = [_]std.posix.pollfd{.{
@@ -117,9 +129,16 @@ pub const Watcher = struct {
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const timeout_ms: i32 = @intCast(@min(self.opts.poll_interval_ms, std.math.maxInt(i32)));
+            const wait_ms: u32 = if (remaining_ms) |rem| @min(rem, self.opts.poll_interval_ms) else self.opts.poll_interval_ms;
+            const timeout_ms: i32 = @intCast(@min(wait_ms, std.math.maxInt(i32)));
             const ready = std.posix.poll(&pfd, timeout_ms) catch return .stop;
-            if (ready == 0) continue;
+            if (ready == 0) {
+                if (remaining_ms) |*rem| {
+                    if (rem.* <= wait_ms) return null;
+                    rem.* -= wait_ms;
+                }
+                continue;
+            }
             // POLLHUP/POLLERR mean the fd is unusable — exit instead of
             // spinning on a dead descriptor.
             if ((pfd[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) return .stop;
@@ -178,7 +197,8 @@ pub const Watcher = struct {
         return .stop;
     }
 
-    fn waitPolling(self: *Watcher, stop_flag: *StopFlag) WakeReason {
+    fn waitPolling(self: *Watcher, stop_flag: *StopFlag, max_wait_ms: ?u32) ?WakeReason {
+        var remaining_ms = max_wait_ms;
         while (!stop_flag.load(.acquire)) {
             if (self.opts.dir.statFile(self.io, self.opts.path, .{})) |st| {
                 // The path now resolves to a different file — journald
@@ -206,7 +226,12 @@ pub const Watcher = struct {
                 // reopen against the freshly-rotated file.
                 return .deleted;
             }
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(self.opts.poll_interval_ms), .awake) catch return .stop;
+            const step_ms: u32 = if (remaining_ms) |rem| @min(rem, self.opts.poll_interval_ms) else self.opts.poll_interval_ms;
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(step_ms), .awake) catch return .stop;
+            if (remaining_ms) |*rem| {
+                if (rem.* <= step_ms) return null;
+                rem.* -= step_ms;
+            }
         }
         return .stop;
     }
@@ -493,4 +518,16 @@ test "Watcher.init falls back to polling for a relative path" {
     defer w.deinit();
     try testing.expectEqual(@as(i32, -1), w.inotify_fd);
     try testing.expectEqual(@as(u64, 3), w.last_size);
+}
+
+test "Watcher.waitForChangeTimeout returns null when file stays quiet" {
+    const tio = debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{ .sub_path = "quiet.dat", .data = "abc" });
+
+    var w = Watcher.init(tio, .{ .dir = tmp.dir, .path = "quiet.dat", .poll_interval_ms = 10 });
+    defer w.deinit();
+    var stop = StopFlag.init(false);
+    try testing.expectEqual(@as(?WakeReason, null), w.waitForChangeTimeout(&stop, 25));
 }

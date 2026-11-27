@@ -45,7 +45,7 @@ pub const Cutoff = struct {
 /// date a log can carry.
 fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
     const y = y_in - @intFromBool(m <= 2);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const era = @divFloor(y, 400);
     const yoe = y - era * 400; // [0, 399]
     const doy = @divTrunc(153 * (m + (if (m > 2) @as(i64, -3) else 9)) + 2, 5) + d - 1;
     const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
@@ -55,7 +55,7 @@ fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
 /// Inverse of `daysFromCivil`.
 fn civilFromDays(z_in: i64) struct { y: i64, m: i64, d: i64 } {
     const z = z_in + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const era = @divFloor(z, 146097);
     const doe = z - era * 146097; // [0, 146096]
     const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
     const y = yoe + era * 400;
@@ -109,10 +109,13 @@ pub fn fromSeconds(secs: i64) Cutoff {
     const rem = secs - days * 86_400;
     const c = civilFromDays(days);
 
-    var out: Cutoff = .{ .date = undefined, .time = undefined };
     // Years outside four digits cannot be compared against a log's own
-    // `YYYY-MM-DD` anyway, so they clamp rather than corrupt the layout.
-    const y: u64 = @intCast(std.math.clamp(c.y, 0, 9999));
+    // `YYYY-MM-DD` anyway, so clamp the whole timestamp to the range bounds.
+    if (c.y < 0) return .{ .date = "0000-01-01".*, .time = "00:00:00".* };
+    if (c.y > 9999) return .{ .date = "9999-12-31".*, .time = "23:59:59".* };
+
+    var out: Cutoff = .{ .date = undefined, .time = undefined };
+    const y: u64 = @intCast(c.y);
     _ = std.fmt.bufPrint(&out.date, "{d:0>4}-{d:0>2}-{d:0>2}", .{
         y,
         @as(u64, @intCast(c.m)),
@@ -242,4 +245,30 @@ test "a line without a timestamp is kept" {
     // shred the very records the filter was opened to read.
     try testing.expect(atOrAfter(null, null, &cut));
     try testing.expect(atOrAfter("bad", null, &cut));
+}
+
+test "daysFromCivil and civilFromDays round-trip across year 0 and negative eras" {
+    const cases = [_]struct { y: i64, m: i64, d: i64 }{
+        .{ .y = 0, .m = 2, .d = 28 },
+        .{ .y = 0, .m = 2, .d = 29 },
+        .{ .y = 0, .m = 3, .d = 1 },
+        .{ .y = -1, .m = 12, .d = 31 },
+        .{ .y = -100, .m = 1, .d = 1 },
+        .{ .y = -401, .m = 6, .d = 15 },
+    };
+    for (cases) |want| {
+        const got = civilFromDays(daysFromCivil(want.y, want.m, want.d));
+        try testing.expectEqual(want.y, got.y);
+        try testing.expectEqual(want.m, got.m);
+        try testing.expectEqual(want.d, got.d);
+    }
+
+    // Clamping outside [0000, 9999] produces exact boundary timestamps, never Feb 30.
+    const lo = fromSeconds(daysFromCivil(-100, 6, 15) * 86_400 + 3600);
+    try testing.expectEqualStrings("0000-01-01", &lo.date);
+    try testing.expectEqualStrings("00:00:00", &lo.time);
+
+    const hi = fromSeconds(daysFromCivil(10050, 6, 15) * 86_400 + 3600);
+    try testing.expectEqualStrings("9999-12-31", &hi.date);
+    try testing.expectEqualStrings("23:59:59", &hi.time);
 }

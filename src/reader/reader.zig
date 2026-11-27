@@ -553,29 +553,39 @@ pub const JsonExpander = struct {
         return protox.escapedPrefixLen(value, start);
     }
 
+    /// Returns true if `value` is a valid escaped nested JSON or protobuf
+    /// payload under this expander's limits. Used before latching `nested` in
+    /// `printJsonStyled` so a non-payload string cannot shadow a real one.
+    pub fn canExpandEscaped(self: *JsonExpander, value: []const u8) bool {
+        if (jsonx.looksLikeNestedObject(value, self.limits)) {
+            if (jsonx.unescape(self.scratch, value)) |decoded| {
+                if (jsonx.validate(decoded, self.limits) != null) return true;
+            }
+        }
+        if (protox.looksLikeBinary(value)) {
+            if (protox.unescapeBytes(self.scratch, value)) |raw| {
+                if (protox.find(raw, self.proto_limits) != null) return true;
+            }
+        }
+        return false;
+    }
+
     /// Expands a payload carried as an escaped string value of a JSON log
-    /// line — nested JSON, or protobuf wire bytes.
-    ///
-    /// JSON is tried first: it is the cheaper check and the unambiguous one.
-    /// Protobuf only gets a look when the value failed to be JSON, and then
-    /// only after a second un-escape pass, because the two need different
-    /// byte semantics for `\uXXXX` (see `protox.unescapeBytes`). Both passes
-    /// reuse the same scratch, so the fallback costs no memory.
-    ///
-    /// Silently does nothing when the value turns out to be neither — the
-    /// compact line already showed it verbatim.
-    pub fn expandEscaped(self: *JsonExpander, out: *Out, value: []const u8) void {
+    /// line — nested JSON, or protobuf wire bytes. Returns true when a block
+    /// was emitted, false when the value turned out to be neither.
+    pub fn expandEscaped(self: *JsonExpander, out: *Out, value: []const u8) bool {
         if (jsonx.unescape(self.scratch, value)) |decoded| {
             if (jsonx.validate(decoded, self.limits) != null) {
                 jsonx.writeBlock(out, out.theme, decoded, self.limits);
-                return;
+                return true;
             }
         }
 
-        if (!protox.looksLikeBinary(value)) return;
-        const raw = protox.unescapeBytes(self.scratch, value) orelse return;
-        const start = protox.find(raw, self.proto_limits) orelse return;
+        if (!protox.looksLikeBinary(value)) return false;
+        const raw = protox.unescapeBytes(self.scratch, value) orelse return false;
+        const start = protox.find(raw, self.proto_limits) orelse return false;
         protox.writeBlock(out, out.theme, raw[start..], self.proto_limits);
+        return true;
     }
 };
 
@@ -938,6 +948,16 @@ fn extractDate(line: []const u8) ?[]const u8 {
         if (isValidDateString(s)) return s;
     }
 
+    // Logfmt records carry dates in `time=`, `timestamp=`, or `date=` fields
+    // (e.g. `time=2026-09-03T10:00:00Z level=error msg=...`).
+    if (simd.findByte(line, 0, '=') != null) {
+        inline for (.{ "time", "timestamp", "date" }) |field| {
+            if (extractLogfmtField(line, field)) |v| {
+                if (v.len >= 10 and isValidDateString(v[0..10])) return v[0..10];
+            }
+        }
+    }
+
     return null;
 }
 
@@ -1123,7 +1143,7 @@ pub fn sinceCutoff(files: []const []const u8, window_ms: u64) ?civil.Cutoff {
         const n = file.readPositional(debug_io, &.{buf[0..want]}, pos) catch continue;
         if (n == 0) continue;
 
-        if (newestInChunk(buf[0..n])) |found| {
+        if (newestInChunk(buf[0..n], pos == 0)) |found| {
             const better = if (best_date) |bd| blk: {
                 const order = std.mem.order(u8, &found.date, &bd);
                 if (order == .gt) break :blk true;
@@ -1183,14 +1203,20 @@ const AnchorStamp = struct { date: [10]u8, time: [8]u8 };
 /// Walks backwards because the newest record is at the end, and stops at the
 /// first hit — a log is written in order, so scanning the rest to confirm
 /// would cost a full pass to learn nothing.
-fn newestInChunk(chunk: []const u8) ?AnchorStamp {
+fn newestInChunk(chunk: []const u8, starts_at_zero: bool) ?AnchorStamp {
+    var strip_buf: [filter_strip_buf_size]u8 = undefined;
     var end = chunk.len;
     while (end > 0) {
         // The first line of the chunk may be a fragment of a longer one, so
         // it is only considered when the chunk starts the file.
         const start = if (std.mem.lastIndexOfScalar(u8, chunk[0..end], '\n')) |nl| nl + 1 else 0;
-        const line = std.mem.trimEnd(u8, chunk[start..end], "\r");
-        if (line.len > 0) {
+        if (start == 0 and !starts_at_zero) return null;
+        const raw = std.mem.trimEnd(u8, chunk[start..end], "\r");
+        if (raw.len > 0) {
+            const line = if (simd.findByte(raw, 0, '#') != null)
+                simd.stripLiteralAnsi(&strip_buf, raw)
+            else
+                raw;
             const info = analyzeLine(line, true);
             if (info.date) |d| {
                 if (info.time) |t| {
@@ -1198,7 +1224,12 @@ fn newestInChunk(chunk: []const u8) ?AnchorStamp {
                         var stamp: AnchorStamp = .{ .date = undefined, .time = "00:00:00".* };
                         @memcpy(&stamp.date, d[0..10]);
                         @memcpy(stamp.time[0..@min(t.len, 8)], t[0..@min(t.len, 8)]);
-                        return stamp;
+                        // Reject impossible digit runs like `9999-99-99 99:99:99`
+                        // that match the positional shape check but fail calendar
+                        // conversion and would otherwise disable `--since`.
+                        if (civil.toSeconds(&stamp.date, &stamp.time) != null) {
+                            return stamp;
+                        }
                     }
                 }
             }
@@ -1862,8 +1893,14 @@ fn extractLogfmtField(line: []const u8, comptime key: []const u8) ?[]const u8 {
         while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
         if (i >= line.len) return null;
 
-        const field_start = i;
         const eq = simd.findByte(line, i, '=') orelse return null;
+        // Skip any bare whitespace-delimited tokens preceding `key=` (such as
+        // a syslog/timestamp prefix) so `field_key` is only the token before `=`.
+        var field_start = i;
+        var k = i;
+        while (k < eq) : (k += 1) {
+            if (line[k] == ' ' or line[k] == '\t') field_start = k + 1;
+        }
         const field_key = line[field_start..eq];
 
         i = eq + 1;
@@ -2325,11 +2362,12 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
 
             // A value worth expanding below the line: nested JSON, or bytes
             // that only a JSON encoder could have produced — the `\u00XX`
-            // runs of an embedded protobuf payload.
-            if (!is_key and expand != null and nested == null and
-                (jsonx.looksLikeNestedObject(str, .{}) or protox.looksLikeBinary(str)))
-            {
-                nested = str;
+            // runs of an embedded protobuf payload. Validate before claiming
+            // `nested` so a false-positive string does not shadow a real one.
+            if (!is_key and nested == null) {
+                if (expand) |x| {
+                    if (x.canExpandEscaped(str)) nested = str;
+                }
             }
 
             i = end + 1;
@@ -2378,11 +2416,12 @@ fn printJsonStyled(out: *Out, line: []const u8, info: LineInfo, search_matches: 
     out.write("\n");
     if (nested) |value| {
         if (expand) |x| {
-            x.expandEscaped(out, value);
-            // Blank line after an expanded block, so the next record doesn't
-            // butt up against the gutter. Unexpanded JSON output keeps its
-            // compact one-line-per-record shape.
-            out.write("\n");
+            if (x.expandEscaped(out, value)) {
+                // Blank line after an expanded block, so the next record doesn't
+                // butt up against the gutter. Unexpanded JSON output keeps its
+                // compact one-line-per-record shape.
+                out.write("\n");
+            }
         }
     }
 }
@@ -3830,7 +3869,7 @@ test "newestInChunk takes the last stamped line, not the last line" {
         "2026-09-03T10:44:05Z ERR boom\n" ++
         "\tgoroutine 1 [running]:\n" ++
         "\tmain.crash()\n";
-    const got = newestInChunk(chunk) orelse return error.NoAnchor;
+    const got = newestInChunk(chunk, true) orelse return error.NoAnchor;
     try std.testing.expectEqualStrings("2026-09-03", &got.date);
     try std.testing.expectEqualStrings("10:44:05", &got.time);
 }
@@ -3839,12 +3878,15 @@ test "newestInChunk ignores a leading fragment of a longer line" {
     // A chunk read from the middle of a file starts mid-line; that fragment
     // is the one line whose parse cannot be trusted.
     const chunk = "45Z INF fragment\n2026-09-03T10:44:05Z INF whole\n";
-    const got = newestInChunk(chunk) orelse return error.NoAnchor;
+    const got = newestInChunk(chunk, false) orelse return error.NoAnchor;
     try std.testing.expectEqualStrings("10:44:05", &got.time);
+    // When only the leading fragment carries a timestamp and starts_at_zero is
+    // false, it must be ignored rather than trusted.
+    try std.testing.expectEqual(@as(?AnchorStamp, null), newestInChunk("2026-09-03T10:44:05Z INF frag\nno stamp\n", false));
 }
 
 test "newestInChunk reports nothing when no line carries a date" {
-    try std.testing.expectEqual(@as(?AnchorStamp, null), newestInChunk("no stamps here\nnor here\n"));
+    try std.testing.expectEqual(@as(?AnchorStamp, null), newestInChunk("no stamps here\nnor here\n", true));
 }
 
 test "--since keeps the window and drops what precedes it" {
@@ -4699,4 +4741,59 @@ test "readStreaming on gzip updates LevelCounter and buffers [xN] prefix without
     try std.testing.expectEqual(@as(usize, 1), counter.counts[@backingInt(flags.Level.Info)]);
     try std.testing.expect(std.mem.indexOf(u8, sink.items, "\x1b[") == null);
     try std.testing.expect(std.mem.startsWith(u8, sink.items, "[x2] 2026-01-01 ["));
+}
+
+test "newestInChunk strips literal ANSI and skips impossible dates" {
+    const chunk =
+        "#033[90m2026-09-03T10:44:05Z#033[0m INF valid\n" ++
+        "9999-99-99 99:99:99 ERR impossible\n";
+    const got = newestInChunk(chunk, true) orelse return error.NoAnchor;
+    try std.testing.expectEqualStrings("2026-09-03", &got.date);
+    try std.testing.expectEqualStrings("10:44:05", &got.time);
+}
+
+test "extractDate and extractLogfmtField handle logfmt records and bare prefixes" {
+    try std.testing.expectEqualStrings("2026-09-03", extractDate("time=2026-09-03T10:00:00Z level=error msg=\"req 0\"").?);
+    try std.testing.expectEqualStrings(
+        "connection failed",
+        extractLogfmtField("2026-09-03 10:00:00 msg=\"connection failed\" level=error", "msg").?,
+    );
+}
+
+test "printJsonStyled avoids spurious blank lines and does not let fake braces shadow real embedded JSON" {
+    const a = std.testing.allocator;
+    const th = Theme.forMode(.truecolor, theme_mod.Glyphs.unicode, .dark);
+
+    // Unexpandable `{not_valid_json}` must not emit a trailing blank line.
+    {
+        var sink: std.ArrayList(u8) = .empty;
+        defer sink.deinit(a);
+        var out = try Out.init(a, std.Io.File.stdout(), &th);
+        defer out.deinit();
+        out.sink = &sink;
+        var exp = try JsonExpander.init(a, .{});
+        defer exp.deinit();
+        var fs = FilterState.init(.{ .files = &.{} }, &out, &exp);
+        defer fs.deinit();
+        fs.printIfMatch("{\"level\":\"info\",\"msg\":\"{not_valid_json_at_all}\"}");
+        out.flush();
+        try std.testing.expect(!std.mem.endsWith(u8, sink.items, "\n\n"));
+    }
+
+    // Fake braces in `msg` must not prevent valid nested JSON in `body` from expanding.
+    {
+        var sink: std.ArrayList(u8) = .empty;
+        defer sink.deinit(a);
+        var out = try Out.init(a, std.Io.File.stdout(), &th);
+        defer out.deinit();
+        out.sink = &sink;
+        var exp = try JsonExpander.init(a, .{});
+        defer exp.deinit();
+        var fs = FilterState.init(.{ .files = &.{} }, &out, &exp);
+        defer fs.deinit();
+        fs.printIfMatch("{\"level\":\"info\",\"msg\":\"{not_valid_json_at_all}\",\"body\":\"{\\\"code\\\":503,\\\"detail\\\":\\\"down\\\"}\"}");
+        out.flush();
+        try std.testing.expect(std.mem.indexOf(u8, sink.items, "│") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sink.items, "\"detail\"") != null);
+    }
 }

@@ -383,6 +383,12 @@ fn matchFromCont(pattern: []const u8, cont: ?*const Cont, text: []const u8, star
     var tp: usize = start;
 
     while (pp < pattern.len) {
+        // ^ start anchor (works inside groups such as `(^err|warn)` as well as at pattern[0])
+        if (pattern[pp] == '^') {
+            if (tp != 0) return null;
+            pp += 1;
+            continue;
+        }
         // $ end anchor — only special at the very end of this pattern segment
         if (pattern[pp] == '$' and pp + 1 == pattern.len) {
             return if (tp == text.len) evalCont(cont, text, tp, steps) else null;
@@ -503,10 +509,13 @@ fn matchClass(class_pat: []const u8, c: u8) bool {
     var i: usize = 1;
     const negate = i < class_pat.len and class_pat[i] == '^';
     if (negate) i += 1;
-    if (i < class_pat.len and class_pat[i] == ']') i += 1; // ] as first char is literal
 
     var found = false;
-    while (i < class_pat.len and class_pat[i] != ']') {
+    // A `]` immediately after `[` or `[^` is a literal member of the class, not
+    // the closing bracket.
+    var first = true;
+    while (i < class_pat.len and (first or class_pat[i] != ']')) {
+        first = false;
         if (class_pat[i] == '\\' and i + 1 < class_pat.len) {
             if (matchEscape(class_pat[i + 1], c)) found = true;
             i += 2;
@@ -541,10 +550,24 @@ fn atomLen(pattern: []const u8) ?usize {
         },
         '(' => blk: {
             var depth: usize = 1;
+            var in_class = false;
             var i: usize = 1;
             while (i < pattern.len and depth > 0) : (i += 1) {
+                if (in_class) {
+                    if (pattern[i] == '\\') {
+                        i += 1;
+                        continue;
+                    }
+                    if (pattern[i] == ']') in_class = false;
+                    continue;
+                }
                 switch (pattern[i]) {
                     '\\' => i += 1,
+                    '[' => {
+                        in_class = true;
+                        if (i + 1 < pattern.len and pattern[i + 1] == '^') i += 1;
+                        if (i + 1 < pattern.len and pattern[i + 1] == ']') i += 1;
+                    },
                     '(' => depth += 1,
                     ')' => depth -= 1,
                     else => {},
@@ -574,7 +597,11 @@ fn topAlt(pattern: []const u8) ?usize {
         }
         switch (pattern[i]) {
             '\\' => i += 1,
-            '[' => in_class = true,
+            '[' => {
+                in_class = true;
+                if (i + 1 < pattern.len and pattern[i + 1] == '^') i += 1;
+                if (i + 1 < pattern.len and pattern[i + 1] == ']') i += 1;
+            },
             '(' => depth += 1,
             ')' => {
                 if (depth > 0) depth -= 1;
@@ -913,4 +940,33 @@ test "groups with internal quantifiers or alternations backtrack for trailing pa
     try std.testing.expect(Regex.compile("(err|error)?:").?.isMatch("error:"));
     try std.testing.expect(Regex.compile("(a|ab)+c").?.isMatch("abc"));
     try std.testing.expect(!Regex.compile("(a|ab)+c").?.isMatch("abd"));
+}
+
+test "nullable groups at end of text, bracket classes inside groups, leading ], and grouped ^" {
+    // Nullable groups at end of input and `+`-quantified nullable groups
+    try std.testing.expect(Regex.compile("foo(a*)").?.isMatch("foo"));
+    try std.testing.expect(Regex.compile("foo(a?)").?.isMatch("foo"));
+    try std.testing.expect(Regex.compile("^(a*)$").?.isMatch(""));
+    try std.testing.expect(Regex.compile("error($)").?.isMatch("error"));
+    try std.testing.expect(Regex.compile("(a*)+").?.isMatch("b"));
+    try std.testing.expect(Regex.compile("(a*)+").?.isMatch(""));
+
+    // Parentheses inside character classes within groups
+    try std.testing.expect(Regex.compile("([)])").?.isMatch(")"));
+    try std.testing.expect(Regex.compile("([a-z)]+)").?.isMatch("a)"));
+    try std.testing.expect(Regex.compile("([(]a)").?.isMatch("(a"));
+
+    // Literal leading `]` in character classes and with `|`
+    try std.testing.expect(Regex.compile("[]a]").?.isMatch("]"));
+    try std.testing.expect(Regex.compile("[]]").?.isMatch("]"));
+    try std.testing.expect(!Regex.compile("[^]a]").?.isMatch("]"));
+    try std.testing.expect(Regex.compile("[^]a]").?.isMatch("b"));
+    try std.testing.expect(Regex.compile("[]|]").?.isMatch("|"));
+    try std.testing.expect(Regex.compile("[^]|]").?.isMatch("a"));
+
+    // `^` anchor inside groups
+    try std.testing.expect(Regex.compile("(^error)").?.isMatch("error"));
+    try std.testing.expect(!Regex.compile("(^error)").?.isMatch("^error"));
+    try std.testing.expect(Regex.compile("(^err|warn)").?.isMatch("err"));
+    try std.testing.expect(!Regex.compile("(^err|warn)").?.isMatch("x err"));
 }

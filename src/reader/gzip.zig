@@ -325,6 +325,7 @@ fn flushFinalCarry(
 ) !void {
     if (carry.items.len == 0) return;
 
+    beginChunk(filter_state, carry.items);
     try processLine(
         allocator,
         carry.items,
